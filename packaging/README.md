@@ -23,5 +23,8 @@ tay toggle        # 呼出/收起
 - 二进制 + systemd 单元 + desktop 文件都在本目录,按各发行版
   规范放置即可(`/usr/bin`、`/usr/lib/systemd/user/`、
   `/usr/share/applications/`)。
-- Flatpak:portal 全链路(GLOBALShortcuts)需在沙箱内验证,
-  见 DESIGN §9 M4 验收;manifest 待补。
+- Flatpak:manifest 见 org.tay.Tay.json(portal 权限已声明:
+  Desktop + GlobalShortcuts)。注意:沙箱内 $XDG_RUNTIME_DIR 与宿主机
+  不同,宿主机的 `tay` CLI 无法直接连沙箱 daemon 的 IPC socket ——
+  沙箱场景请用沙箱内的 `tay`(或 portal 热键)。全链路验证见
+  DESIGN §9 M4 验收。

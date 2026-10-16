@@ -1,0 +1,40 @@
+{
+    "app-id": "org.tay.Tay",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "25.08",
+    "sdk": "org.freedesktop.Sdk",
+    "sdk-extensions": ["org.freedesktop.Sdk.Extension.rust-stable"],
+    "command": "tayd",
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "env": {
+            "CARGO_HOME": "/run/build/tay/cargo"
+        }
+    },
+    "finish-args": [
+        "--socket=wayland",
+        "--device=dri",
+        "--talk-name=org.freedesktop.portal.Desktop",
+        "--talk-name=org.freedesktop.portal.GlobalShortcuts",
+        "--own-name=org.tay.Tay",
+        "--filesystem=~/.config/tay:ro"
+    ],
+    "modules": [
+        {
+            "name": "tay",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo build --release --locked",
+                "install -Dm755 target/release/tayd /app/bin/tayd",
+                "install -Dm755 target/release/tay /app/bin/tay",
+                "install -Dm644 packaging/tay.desktop /app/share/applications/org.tay.Tay.desktop"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": ".."
+                }
+            ]
+        }
+    ]
+}
