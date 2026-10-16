@@ -20,5 +20,6 @@ zbus.workspace = true
 async-io.workspace = true
 futures-lite = "2"
 polling = "3"
+regex = "1"
 log.workspace = true
 env_logger.workspace = true

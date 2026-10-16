@@ -63,6 +63,14 @@ pub struct Badge {
     pub color: Rgb,
 }
 
+/// 单元格覆盖层(QuickSelect 标签:替换字符 + 底色块)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    pub row: usize,
+    pub col: usize,
+    pub text: String,
+}
+
 /// 终端网格快照。
 pub struct Grid {
     pub cols: usize,
@@ -75,6 +83,8 @@ pub struct Grid {
     pub preedit: Option<Preedit>,
     /// 行尾徽章(行号 = 显示行)。
     pub badges: Vec<Badge>,
+    /// 单元格覆盖层(QuickSelect 标签)。
+    pub overlays: Vec<Overlay>,
 }
 
 #[repr(C)]
@@ -462,7 +472,30 @@ impl Renderer {
         };
 
         for row in 0..grid.rows {
-            for col in 0..grid.cols {
+            // 行字符缓冲(宽字符占位格跳过),overlay 直接替换字符。
+            let mut row_chars: Vec<char> = grid.cells[row * grid.cols..(row + 1) * grid.cols]
+                .iter()
+                .filter(|c| !c.wide_spacer)
+                .map(|c| c.c)
+                .collect();
+            let row_overlays: Vec<&Overlay> =
+                grid.overlays.iter().filter(|o| o.row == row).collect();
+            if !row_overlays.is_empty() {
+                let base_cols = row_chars.len();
+                for o in &row_overlays {
+                    for (i, ch) in o.text.chars().enumerate() {
+                        let pos = o.col + i;
+                        if pos < base_cols {
+                            row_chars[pos] = ch;
+                        }
+                    }
+                }
+            }
+            let mut col = 0; // 当前字符序号(同时是列号,宽字符占 2 列在 M3 不精确处理)
+            for cell in &grid.cells[row * grid.cols..(row + 1) * grid.cols] {
+                if cell.wide_spacer {
+                    continue;
+                }
                 // 预编辑文本插在光标格之后(光标保持可见)。
                 if grid.preedit.as_ref().is_some_and(|p| p.row == row && p.col == col) {
                     push_run(&mut spans, &mut cur);
@@ -473,7 +506,7 @@ impl Renderer {
                         .underline(UnderlineStyle::Single);
                     spans.push((pre.text.clone(), AttrsOwned::new(&attrs)));
                 }
-                let cell = &grid.cells[row * grid.cols + col];
+                let cell = cell;
                 if cell.wide_spacer {
                     continue;
                 }
@@ -484,13 +517,15 @@ impl Renderer {
                     cell.fg
                 };
                 let attrs = attrs_for(&family, fg, cell.bold, cell.italic, cell.underline);
+                let ch = row_chars.get(col).copied().unwrap_or(cell.c);
                 match &mut cur {
-                    Some((text, a)) if *a == AttrsOwned::new(&attrs) => text.push(cell.c),
+                    Some((text, a)) if *a == AttrsOwned::new(&attrs) => text.push(ch),
                     _ => {
                         push_run(&mut spans, &mut cur);
-                        cur = Some((cell.c.to_string(), AttrsOwned::new(&attrs)));
+                        cur = Some((ch.to_string(), AttrsOwned::new(&attrs)));
                     },
                 }
+                col += 1;
             }
             push_run(&mut spans, &mut cur);
 
@@ -580,6 +615,19 @@ impl Renderer {
                     color: to_linear(Rgb::new(0x39, 0x5e, 0x9c), self.srgb),
                 });
             }
+        }
+
+        // QuickSelect overlay 底色块(覆盖单元格底色)。
+        for o in &grid.overlays {
+            self.quads.push(Quad {
+                rect: [
+                    o.col as f32 * cw + pad,
+                    o.row as f32 * ch + pad,
+                    o.text.chars().count() as f32 * cw,
+                    ch,
+                ],
+                color: to_linear(Rgb::new(0x00, 0x8b, 0x74), self.srgb),
+            });
         }
 
         // 光标。

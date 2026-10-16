@@ -163,6 +163,8 @@ pub struct TayApp {
 
     // —— M1:呼出状态 ——
     vis: Vis,
+    // —— M3:QuickSelect ——
+    quick: Option<QuickState>,
     /// 等待 set_size 后的 configure(避免 wgpu swapchain 二次重建)。
     sizing: bool,
     layer_h: i32,
@@ -182,10 +184,23 @@ pub struct TayApp {
     bench_times: Vec<f32>,
     exec: Option<String>,
     exec_sent: bool,
+    quickselect_at_start: bool,
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
+}
+
+struct QuickState {
+    matches: Vec<crate::quickselect::Match>,
+    typed: String,
+}
+
+impl QuickState {
+    /// 已输入前缀能唯一指向的标签。
+    fn resolve(&self) -> Option<&crate::quickselect::Match> {
+        self.matches.iter().find(|m| m.label == self.typed)
+    }
 }
 
 impl TayApp {
@@ -194,6 +209,7 @@ impl TayApp {
         shot: Option<(String, u32)>,
         bench: Option<u32>,
         exec: Option<String>,
+        quickselect_at_start: bool,
         ipc_listener: Option<std::os::unix::net::UnixListener>,
         ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
         ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
@@ -222,6 +238,7 @@ impl TayApp {
             dragging: false,
             scroll_px: 0.0,
             vis: Vis::Hidden,
+            quick: None,
             sizing: false,
             layer_h: 480,
             shown_once: false,
@@ -238,6 +255,7 @@ impl TayApp {
             bench_times: Vec::new(),
             exec,
             exec_sent: false,
+            quickselect_at_start,
         }
     }
 
@@ -503,6 +521,18 @@ impl TayApp {
             })
             .collect();
 
+        // QuickSelect 覆盖层。
+        let overlays = self
+            .quick
+            .as_ref()
+            .map(|q| {
+                q.matches
+                    .iter()
+                    .map(|m| tay_render::Overlay { row: m.row, col: m.col, text: m.label.clone() })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         tay_render::Grid {
             cols,
             rows,
@@ -512,6 +542,7 @@ impl TayApp {
             selection,
             preedit: self.preedit.clone(),
             badges,
+            overlays,
         }
     }
 
@@ -585,6 +616,15 @@ impl TayApp {
         if let Some(at) = self.show_at.take() {
             self.shown_once = true;
             log::info!("热呼出 {}ms", at.elapsed().as_millis());
+        }
+
+        // TAY_QUICKSELECT:第 12 帧自动触发(验证用)。
+        if self.quickselect_at_start && self.frames == 12 {
+            self.quickselect_at_start = false;
+            let grid = self.build_grid();
+            let matches = crate::quickselect::build(&grid);
+            log::info!("QuickSelect: {} 个匹配项", matches.len());
+            self.quick = Some(QuickState { matches, typed: String::new() });
         }
 
         // TAY_EXEC:第 10 帧执行命令(等 shell 就绪)。
@@ -731,6 +771,56 @@ impl Handler for TayApp {
 
             WEvent::Keyboard { key, pressed, mods } => {
                 if !pressed {
+                    return;
+                }
+                // QuickSelect 激活:消费按键(标签 / Esc 取消)。
+                if self.quick.is_some() {
+                    match key.key {
+                        KeyKind::Named(tay_window::NamedKey::Escape) => {
+                            self.quick = None;
+                            ctx.request_redraw();
+                            return;
+                        },
+                        KeyKind::Char(c) if c.is_ascii_lowercase() => {
+                            let fire = {
+                                let q = self.quick.as_mut().unwrap();
+                                q.typed.push(c);
+                                // 前缀无匹配 → 取消。
+                                let any_prefix = q.matches.iter().any(|m| m.label.starts_with(&q.typed));
+                                if !any_prefix {
+                                    self.quick = None;
+                                    return;
+                                }
+                                q.resolve().is_some()
+                            };
+                            if fire {
+                                let q = self.quick.take().unwrap();
+                                if let Some(m) = q.resolve() {
+                                    crate::quickselect::activate(m);
+                                }
+                            }
+                            ctx.request_redraw();
+                            return;
+                        },
+                        _ => {
+                            // 其他按键取消。
+                            self.quick = None;
+                            ctx.request_redraw();
+                            return;
+                        },
+                    }
+                }
+                // 触发 QuickSelect:Ctrl+Shift+F。
+                if mods.ctrl && mods.shift && matches!(key.key, KeyKind::Char('f') | KeyKind::Char('F')) {
+                    let grid = self.build_grid();
+                    let matches = crate::quickselect::build(&grid);
+                    if matches.is_empty() {
+                        log::info!("QuickSelect: 无匹配项");
+                    } else {
+                        log::info!("QuickSelect: {} 个匹配项,按键选择", matches.len());
+                        self.quick = Some(QuickState { matches, typed: String::new() });
+                    }
+                    ctx.request_redraw();
                     return;
                 }
                 // 剪贴板/命令块快捷键:Ctrl+Shift+字母与方向键。

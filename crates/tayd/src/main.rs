@@ -5,12 +5,14 @@
 //! - `TAY_BENCH=帧数` — 启动后灌入 3000 行输出,统计帧时间后退出
 //! - `TAY_EXEC=命令` — 启动后自动执行(端到端验证输入→PTY→输出→渲染链路)
 //! - `TAY_START_VISIBLE=1` — 启动即呼出(覆盖配置 start_hidden,截图验证用)
+//! - `TAY_QUICKSELECT=1` — 第 10 帧自动触发 QuickSelect(截图验证用)
 
 mod app;
 mod hotkey;
 mod ipc;
 mod keys;
 mod ptyloop;
+mod quickselect;
 
 use alacritty_terminal::tty;
 
@@ -42,6 +44,7 @@ fn main() {
     });
     let bench_frames = std::env::var("TAY_BENCH").ok().and_then(|v| v.parse::<u32>().ok());
     let exec = std::env::var("TAY_EXEC").ok();
+    let quickselect = std::env::var("TAY_QUICKSELECT").is_ok_and(|v| v == "1");
 
     // 跨线程唤醒通道(PTY/IPC/热键 → 事件循环)。
     let (wake_tx, wake_rx) = std::sync::mpsc::channel();
@@ -64,6 +67,7 @@ fn main() {
         shot,
         bench_frames,
         exec,
+        quickselect,
         ipc_listener,
         ipc_tx,
         ipc_rx,

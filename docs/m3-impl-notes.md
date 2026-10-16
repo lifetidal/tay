@@ -17,9 +17,18 @@ M3 = 体验差异化(§9):OSC 133 命令块、QuickSelect、搜索/复制模式�
   复制上一条命令的输出(bounds_to_string)。
 - fish 4.9 实测:A/B/C/D 全序列捕获;`ls /nonexistent` → `✗ 2` 徽章 ✓。
 
+## 已完成:QuickSelect(§8.3)
+
+- Ctrl+Shift+F 触发:扫描可见网格,匹配 URL / git SHA / 路径 三类
+  (regex,同排重叠去重),分配 a-z、aa-zz 标签
+- 渲染:overlay 层(tay-render)—— 标签字符替换 + teal 底色块
+- 按键:按标签字母即完成(复制到剪贴板;URL 额外 xdg-open);
+  Esc / 无效前缀取消
+- 验证:TAY_QUICKSELECT 环境变量自动触发,8 匹配项截图确认
+
 ## 遗留
 
 - 命令块折叠(设计 §8.4;渲染级折叠,较重,后续)
-- QuickSelect、搜索/复制模式、主题热重载
+- 搜索/复制模式(vi 模式接线 + 增量搜索)、主题热重载
 - 性能:OSC 扫描在 PTY 读取路径上,3000 行滚动 1030fps(vs 之前 1123fps,
   ~10% 开销,可接受;后续可按「只在非 133 上下文跳过」优化)

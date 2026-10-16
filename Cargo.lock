@@ -2073,6 +2073,7 @@ dependencies = [
  "futures-lite",
  "log",
  "polling",
+ "regex",
  "tay-config",
  "tay-render",
  "tay-window",
