@@ -131,6 +131,7 @@ fn run<U>(
             .unwrap_or(Duration::from_millis(500))
             .min(Duration::from_millis(500));
 
+        eprintln!("[dbg] ptyloop iter");
         events.clear();
         if let Err(e) = poller.wait(&mut events, Some(timeout)) {
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -271,7 +272,18 @@ struct StreamScanner {
     osc: Vec<u8>,
     /// ESC _ 收集中(APC)。
     apc: Vec<u8>,
+    /// ESC P 收集中(DCS/sixel)。
+    dcs: Vec<u8>,
+    /// StEsc 的来源(APC 或 DCS)。
+    esc_origin: EscOrigin,
     state: ScanState,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum EscOrigin {
+    Apc,
+    #[default]
+    Dcs,
 }
 
 #[derive(Default, PartialEq)]
@@ -280,6 +292,7 @@ enum ScanState {
     Text,
     Osc,
     Apc,
+    Dcs,
     /// ST(ESC \)的 ESC 已见。
     StEsc,
 }
@@ -306,6 +319,12 @@ impl StreamScanner {
                                 i += 2;
                                 continue;
                             },
+                            b'P' => {
+                                self.state = ScanState::Dcs;
+                                self.dcs.clear();
+                                i += 2;
+                                continue;
+                            },
                             _ => {},
                         }
                     }
@@ -329,49 +348,109 @@ impl StreamScanner {
                 ScanState::Apc => {
                     if c == 0x1b {
                         self.state = ScanState::StEsc;
+                        self.esc_origin = EscOrigin::Apc;
                         i += 1;
                     } else {
                         self.apc.push(c);
                         i += 1;
                     }
                 },
+                ScanState::Dcs => {
+                    if c == 0x1b {
+                        self.state = ScanState::StEsc;
+                        self.esc_origin = EscOrigin::Dcs;
+                        i += 1;
+                    } else {
+                        self.dcs.push(c);
+                        i += 1;
+                    }
+                },
                 ScanState::StEsc => {
                     if c == b'\\' {
-                        // APC 结束。
-                        log::debug!("APC 结束: {:?}", String::from_utf8_lossy(&self.apc[..self.apc.len().min(40)]));
-                        match crate::kitty::parse_apc(&self.apc) {
-                            crate::kitty::Apc::Kitty(img) => {
-                                self.flush_text(&mut out);
-                                out.push(StreamEvent::Kitty(img));
-                            },
-                            crate::kitty::Apc::Passthrough(bytes) => {
-                                // 未知 APC:原样给终端(终端自行忽略)。
-                                self.text.extend_from_slice(b"\x1b_");
-                                self.text.extend_from_slice(&bytes);
-                                self.text.extend_from_slice(b"\x1b\\");
-                            },
-                            crate::kitty::Apc::Invalid => {},
+                        // APC / DCS 结束。
+                        match self.esc_origin {
+                            EscOrigin::Apc => self.finish_apc(&mut out),
+                            EscOrigin::Dcs => self.finish_dcs(&mut out),
                         }
                         self.state = ScanState::Text;
                         i += 1;
                     } else {
-                        // 不是 ST:ESC 属于 APC 内容。
-                        self.apc.push(0x1b);
-                        self.apc.push(c);
-                        self.state = ScanState::Apc;
+                        // 不是 ST:ESC 属于内容。
+                        match self.esc_origin {
+                            EscOrigin::Apc => {
+                                self.apc.push(0x1b);
+                                self.apc.push(c);
+                                self.state = ScanState::Apc;
+                            },
+                            EscOrigin::Dcs => {
+                                self.dcs.push(0x1b);
+                                self.dcs.push(c);
+                                self.state = ScanState::Dcs;
+                            },
+                        }
                         i += 1;
                     }
                 },
             }
         }
         // 防呆。
-        if self.osc.len() > 512 || self.apc.len() > 64 * 1024 * 1024 {
+        if self.osc.len() > 512 || self.apc.len() > 64 * 1024 * 1024 || self.dcs.len() > 64 * 1024 * 1024 {
             self.state = ScanState::Text;
             self.osc.clear();
             self.apc.clear();
+            self.dcs.clear();
         }
         self.flush_text(&mut out);
         out
+    }
+
+    fn finish_apc(&mut self, out: &mut Vec<StreamEvent>) {
+        match crate::kitty::parse_apc(&self.apc) {
+            crate::kitty::Apc::Kitty(img) => {
+                self.flush_text(out);
+                out.push(StreamEvent::Kitty(img));
+            },
+            crate::kitty::Apc::Passthrough(bytes) => {
+                // 未知 APC:原样给终端(终端自行忽略)。
+                self.text.extend_from_slice(b"\x1b_");
+                self.text.extend_from_slice(&bytes);
+                self.text.extend_from_slice(b"\x1b\\");
+            },
+            crate::kitty::Apc::Invalid => {},
+        }
+    }
+
+    /// DCS:sixel 图像(其余 DCS 原样转发)。
+    /// 判定靠解码成败:成功 = sixel,失败 = 别的 DCS(如 DECRQSS)。
+    fn finish_dcs(&mut self, out: &mut Vec<StreamEvent>) {
+        // 重建完整序列给 icy_sixel(参数可出现在 q 之前)。
+        let mut seq = b"\x1bP".to_vec();
+        seq.extend_from_slice(&self.dcs);
+        seq.extend_from_slice(b"\x1b\\");
+        if let Ok(img) = icy_sixel::SixelImage::decode(&seq) {
+            let (w, h) = img.dimensions();
+            if w > 0 && h > 0 && !img.pixels.is_empty() {
+                self.flush_text(out);
+                out.push(StreamEvent::Kitty(crate::kitty::KittyImage {
+                    id: crate::kitty::fnv1a(&img.pixels) as u32,
+                    w: w as u32,
+                    h: h as u32,
+                    cols: None,
+                    rows: None,
+                    rgba: img.pixels.clone(),
+                    z: 0,
+                    cursor_after: false,
+                    delete: false,
+                    place_after: false,
+                    target: None,
+                }));
+                return;
+            }
+        }
+        // 非 sixel DCS:转发。
+        self.text.extend_from_slice(b"\x1bP");
+        self.text.extend_from_slice(&self.dcs);
+        self.text.extend_from_slice(b"\x1b\\");
     }
 
     fn flush_text(&mut self, out: &mut Vec<StreamEvent>) {
@@ -385,8 +464,11 @@ impl StreamScanner {
         self.text.extend_from_slice(b"\x1b]");
         self.text.extend_from_slice(&self.osc);
         self.text.push(0x07);
-        // 同时解析 133 命令块标记。
-        if let Some(m) = Self::parse_osc133(&self.osc) {
+        // 同时解析 133 命令块 / 1337 iTerm2 图像。
+        if let Some(img) = crate::kitty::parse_iterm2(&self.osc) {
+            self.flush_text(out);
+            out.push(StreamEvent::Kitty(img));
+        } else if let Some(m) = Self::parse_osc133(&self.osc) {
             self.flush_text(out);
             out.push(m);
         }
@@ -468,6 +550,31 @@ mod tests {
         let evs = sc.scan(b"\x1b_Xother\x1b\\");
         assert_eq!(evs.len(), 1);
         assert!(matches!(&evs[0], StreamEvent::Text(t) if t == b"\x1b_Xother\x1b\\"));
+    }
+
+    #[test]
+    fn sixel_dcs_decodes() {
+        // 用 icy_sixel 编码 2×2 红色方块(输出自带完整 DCS 包装)。
+        let rgba = [255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+        let data = icy_sixel::sixel_encode_default(&rgba, 2, 2).expect("编码");
+        let reference = icy_sixel::SixelImage::decode(data.as_bytes()).expect("参考解码");
+        let mut sc = StreamScanner::default();
+        let evs = sc.scan(data.as_bytes());
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Kitty(_))), "应有图像事件: {evs:?}");
+        for ev in evs {
+            if let StreamEvent::Kitty(img) = ev {
+                assert_eq!((img.w as usize, img.h as usize), reference.dimensions());
+                assert_eq!(img.rgba, reference.pixels);
+            }
+        }
+    }
+
+    #[test]
+    fn non_sixel_dcs_passthrough() {
+        let mut sc = StreamScanner::default();
+        let evs = sc.scan(b"\x1bP1$r0 q\x1b\\");
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Text(t) if t.starts_with(b"\x1bP"))));
+        assert!(!evs.iter().any(|e| matches!(e, StreamEvent::Kitty(_))));
     }
 
     #[test]

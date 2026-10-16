@@ -12,7 +12,6 @@ repository = "https://github.com/tay-term/tay"
 tay-config = { path = "crates/tay-config" }
 tay-window = { path = "crates/tay-window" }
 tay-render = { path = "crates/tay-render" }
-tay = { path = "crates/tay" }
 
 alacritty_terminal = "0.26"
 glyphon = "0.12"

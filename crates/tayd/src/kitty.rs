@@ -187,6 +187,75 @@ pub fn parse_apc(content: &[u8]) -> Apc {
     })
 }
 
+/// iTerm2 inline 图像(OSC 1337;File=inline=1):返回载体图像。
+pub fn parse_iterm2(content: &[u8]) -> Option<KittyImage> {
+    let s = String::from_utf8_lossy(content);
+    let mut parts = s.split(';');
+    if parts.next()? != "1337" {
+        return None;
+    }
+    let file_part = parts.next()?;
+    if !file_part.starts_with("File=") {
+        return None;
+    }
+    let attrs = &file_part[5..];
+    let (args, b64) = attrs.split_once(':')?;
+    let mut inline = false;
+    let mut w = 0u32;
+    let mut h = 0u32;
+    for kv in args.split(':') {
+        let (k, v) = match kv.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (kv, ""),
+        };
+        match k {
+            "inline" => inline = v == "1",
+            "width" => {
+                w = v.strip_suffix("px").and_then(|n| n.parse().ok()).unwrap_or(0);
+            },
+            "height" => {
+                h = v.strip_suffix("px").and_then(|n| n.parse().ok()).unwrap_or(0);
+            },
+            _ => {},
+        }
+    }
+    if !inline {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    let img = image::load_from_memory(&decoded).ok()?.to_rgba8();
+    let (iw, ih) = img.dimensions();
+    if w == 0 {
+        w = iw;
+    }
+    if h == 0 {
+        h = ih;
+    }
+    Some(KittyImage {
+        id: fnv1a(&img.as_raw()[..]) as u32,
+        w,
+        h,
+        cols: None,
+        rows: None,
+        rgba: img.into_raw(),
+        z: 0,
+        cursor_after: false,
+        delete: false,
+        place_after: false,
+        target: None,
+    })
+}
+
+/// FNV-1a(图像 id)。
+pub fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +302,20 @@ mod tests {
     fn invalid_kitty() {
         assert!(matches!(parse_apc(b"Ga=q"), Apc::Invalid));
         assert!(matches!(parse_apc(b"Gf=100,s=1,v=1;###notbase64###"), Apc::Invalid));
+    }
+
+    #[test]
+    fn iterm2_inline() {
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let content = format!("1337;File=inline=1:{}", png_b64);
+        let img = parse_iterm2(content.as_bytes()).expect("应解析成功");
+        assert_eq!(img.rgba.len(), 4);
+        assert!(!img.cursor_after);
+    }
+
+    #[test]
+    fn iterm2_non_inline_ignored() {
+        let content = "1337;File=name=Zm9v:abcd";
+        assert!(parse_iterm2(content.as_bytes()).is_none());
     }
 }

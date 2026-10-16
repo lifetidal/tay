@@ -26,3 +26,4 @@ base64 = "0.22"
 image = { workspace = true, features = ["png"] }
 log.workspace = true
 env_logger.workspace = true
+icy_sixel = "0.7.0"
