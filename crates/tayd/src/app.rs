@@ -9,7 +9,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::event_loop::{EventLoop as TermEventLoop, EventLoopSender, Msg};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
@@ -20,6 +19,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vte::ansi::{Color, CursorShape as ACursorShape, NamedColor};
 
+use crate::ptyloop::{BlockEvent, Msg, TermSender};
 use tay_config::{Config, Rgb};
 use tay_render::wgpu;
 use tay_window::{
@@ -104,7 +104,7 @@ fn resolve(c: Color, colors: &TermColors, cfg: &Config) -> Rgb {
 struct Listener {
     tx: mpsc::Sender<Event>,
     wake: mpsc::Sender<()>,
-    sender: Arc<Mutex<Option<EventLoopSender>>>,
+    sender: Arc<Mutex<Option<TermSender>>>,
 }
 
 impl Listener {
@@ -146,9 +146,13 @@ pub struct TayApp {
     instance: Option<wgpu::Instance>,
     renderer: Option<tay_render::Renderer>,
     term: Option<Arc<FairMutex<Term<Listener>>>>,
-    sender: Option<EventLoopSender>,
+    sender: Option<TermSender>,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
+    blocks_tx: mpsc::Sender<BlockEvent>,
+    blocks_rx: mpsc::Receiver<BlockEvent>,
+    /// 命令块(最新在尾):prompt 网格行号 + 退出码。
+    blocks: Vec<(i32, Option<i32>)>,
 
     dims: Option<(usize, usize)>,
     preedit: Option<tay_render::Preedit>,
@@ -198,6 +202,7 @@ impl TayApp {
         wake: mpsc::Sender<()>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
+        let (blocks_tx, blocks_rx) = mpsc::channel();
         Self {
             config,
             shot,
@@ -208,6 +213,9 @@ impl TayApp {
             sender: None,
             tx,
             rx,
+            blocks_tx,
+            blocks_rx,
+            blocks: Vec::new(),
             dims: None,
             preedit: None,
             sel: None,
@@ -363,11 +371,9 @@ impl TayApp {
                 ..Default::default()
             };
             let pty = tty::new(&opts, ws, 0).map_err(|e| format!("创建 PTY 失败: {e}"))?;
-            let term_loop = TermEventLoop::new(term.clone(), listener.clone(), pty, false, false)
-                .map_err(|e| format!("终端事件循环创建失败: {e}"))?;
-            let sender = term_loop.channel();
+            let sender = crate::ptyloop::spawn(term.clone(), listener.clone(), pty, self.blocks_tx.clone())
+                .map_err(|e| format!("PTY 事件循环创建失败: {e}"))?;
             *listener.sender.lock().unwrap() = Some(sender.clone());
-            term_loop.spawn();
             self.sender = Some(sender);
             self.term = Some(term);
 
@@ -476,6 +482,27 @@ impl TayApp {
             start: to_display(s.start),
             end: to_display(s.end),
         });
+        // OSC 133 徽章:非零退出码显示在对应提示符行尾。
+        let badges = self
+            .blocks
+            .iter()
+            .filter_map(|(line, code)| {
+                let code = (*code)?;
+                if code == 0 {
+                    return None;
+                }
+                let row = (line + off) as usize;
+                if row >= rows {
+                    return None;
+                }
+                Some(tay_render::Badge {
+                    row,
+                    text: format!(" ✗ {code} "),
+                    color: Rgb::new(0xff, 0x5f, 0x5f),
+                })
+            })
+            .collect();
+
         tay_render::Grid {
             cols,
             rows,
@@ -484,6 +511,48 @@ impl TayApp {
             cursor_shape,
             selection,
             preedit: self.preedit.clone(),
+            badges,
+        }
+    }
+
+    /// 跳转到上一条/下一条提示符(DESIGN §8.4「跳转到上一条提示符」)。
+    fn jump_prompt(&mut self, dir: i32) {
+        let Some(term) = &self.term else { return };
+        let top = -(term.lock().grid().display_offset() as i32);
+        let target = if dir < 0 {
+            self.blocks.iter().rev().map(|b| b.0).find(|l| *l < top)
+        } else {
+            self.blocks.iter().map(|b| b.0).find(|l| *l > top)
+        };
+        if let Some(line) = target {
+            term.lock().scroll_to_point(Point::new(Line(line), Column(0)));
+        }
+    }
+
+    /// 复制上一条命令的输出(§8.4「按块复制」)。
+    fn copy_command_output(&mut self) {
+        let Some(term) = self.term.as_ref() else { return };
+        let n = self.blocks.len();
+        if n < 2 {
+            return;
+        }
+        let (from_line, _) = self.blocks[n - 2];
+        let (to_line, _) = self.blocks[n - 1];
+        if to_line - from_line <= 1 {
+            return;
+        }
+        let term = term.lock();
+        let cols = term.grid().columns().saturating_sub(1);
+        let text = term.bounds_to_string(
+            Point::new(Line(from_line + 1), Column(0)),
+            Point::new(Line(to_line - 1), Column(cols)),
+        );
+        if !text.is_empty() {
+            let len = text.len();
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(text);
+                log::info!("已复制上一条命令的输出({len} 字节)");
+            }
         }
     }
 
@@ -523,7 +592,7 @@ impl TayApp {
             self.exec_sent = true;
             if let (Some(sender), Some(cmd)) = (&self.sender, &self.exec) {
                 log::info!("执行: {cmd}");
-                let _ = sender.send(Msg::Input(format!("{cmd}\n").into_bytes().into()));
+                let _ = sender.send(Msg::Input(format!("{cmd}\n").into_bytes()));
             }
         }
 
@@ -534,7 +603,7 @@ impl TayApp {
                 log::info!("基准:灌入 3000 行输出");
                 if let Some(sender) = &self.sender {
                     let cmd = "i=0; while [ $i -lt 3000 ]; do echo $i; i=$((i+1)); done\n";
-                    let _ = sender.send(Msg::Input(cmd.as_bytes().to_vec().into()));
+                    let _ = sender.send(Msg::Input(cmd.as_bytes().to_vec()));
                 }
                 let _ = bench;
             }
@@ -664,7 +733,7 @@ impl Handler for TayApp {
                 if !pressed {
                     return;
                 }
-                // 剪贴板快捷键:Ctrl+Shift+C/V(keysym 是字符)。
+                // 剪贴板/命令块快捷键:Ctrl+Shift+字母与方向键。
                 if mods.ctrl && mods.shift {
                     match key.key {
                         KeyKind::Char('c') | KeyKind::Char('C') => {
@@ -675,10 +744,25 @@ impl Handler for TayApp {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 if let Ok(text) = cb.get_text() {
                                     if let Some(sender) = &self.sender {
-                                        let _ = sender.send(Msg::Input(text.into_bytes().into()));
+                                        let _ = sender.send(Msg::Input(text.into_bytes()));
                                     }
                                 }
                             }
+                            return;
+                        },
+                        // 命令块:跳转提示符 / 复制上一条命令输出。
+                        KeyKind::Named(tay_window::NamedKey::ArrowUp) => {
+                            self.jump_prompt(-1);
+                            ctx.request_redraw();
+                            return;
+                        },
+                        KeyKind::Named(tay_window::NamedKey::ArrowDown) => {
+                            self.jump_prompt(1);
+                            ctx.request_redraw();
+                            return;
+                        },
+                        KeyKind::Char('o') | KeyKind::Char('O') => {
+                            self.copy_command_output();
                             return;
                         },
                         _ => {},
@@ -690,7 +774,7 @@ impl Handler for TayApp {
                     .is_some_and(|t| t.lock().mode().contains(TermMode::APP_CURSOR));
                 if let Some(bytes) = crate::keys::translate(&key, mods, app_cursor) {
                     if let Some(sender) = &self.sender {
-                        let _ = sender.send(Msg::Input(bytes.into()));
+                        let _ = sender.send(Msg::Input(bytes));
                     }
                 }
                 let pos = self.cursor_pos();
@@ -701,7 +785,7 @@ impl Handler for TayApp {
             WEvent::Ime(ime) => match ime {
                 ImeEvent::Commit(text) => {
                     if let Some(sender) = &self.sender {
-                        let _ = sender.send(Msg::Input(text.into_bytes().into()));
+                        let _ = sender.send(Msg::Input(text.into_bytes()));
                     }
                     self.preedit = None;
                     ctx.request_redraw();
@@ -794,6 +878,9 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::Hide => self.hide(ctx),
                         crate::ipc::IpcCommand::Quit => {
                             log::info!("收到 quit");
+                            if let Some(sender) = &self.sender {
+                                let _ = sender.send(Msg::Shutdown);
+                            }
                             ctx.exit();
                         },
                     }
@@ -801,6 +888,22 @@ impl Handler for TayApp {
                 // portal 热键。
                 while self.hotkey_rx.try_recv().is_ok() {
                     self.toggle(ctx);
+                }
+                // OSC 133 命令块标记。
+                while let Ok(ev) = self.blocks_rx.try_recv() {
+                    match ev {
+                        BlockEvent::PromptStart(line) => {
+                            self.blocks.push((line, None));
+                            if self.blocks.len() > 200 {
+                                self.blocks.drain(..self.blocks.len() - 200);
+                            }
+                        },
+                        BlockEvent::Exit { code } => {
+                            if let Some(last) = self.blocks.last_mut() {
+                                last.1 = Some(code);
+                            }
+                        },
+                    }
                 }
             },
 

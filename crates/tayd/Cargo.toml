@@ -19,5 +19,6 @@ ashpd.workspace = true
 zbus.workspace = true
 async-io.workspace = true
 futures-lite = "2"
+polling = "3"
 log.workspace = true
 env_logger.workspace = true

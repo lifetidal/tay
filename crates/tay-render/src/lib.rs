@@ -55,6 +55,14 @@ pub struct Preedit {
     pub cursor_bytes: Option<(usize, usize)>,
 }
 
+/// 行尾徽章(OSC 133 退出码等)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Badge {
+    pub row: usize,
+    pub text: String,
+    pub color: Rgb,
+}
+
 /// 终端网格快照。
 pub struct Grid {
     pub cols: usize,
@@ -65,6 +73,8 @@ pub struct Grid {
     pub cursor_shape: CursorShape,
     pub selection: Option<SelectionRange>,
     pub preedit: Option<Preedit>,
+    /// 行尾徽章(行号 = 显示行)。
+    pub badges: Vec<Badge>,
 }
 
 #[repr(C)]
@@ -483,6 +493,30 @@ impl Renderer {
                 }
             }
             push_run(&mut spans, &mut cur);
+
+            // 行尾徽章:替换行末字符(通常是提示符行尾的空格)。
+            if let Some(badge) = grid.badges.iter().find(|b| b.row == row) {
+                let need = badge.text.chars().count();
+                let mut to_drop = need;
+                while to_drop > 0 {
+                    let Some((text, _)) = spans.last_mut() else { break };
+                    let d = text.chars().count().min(to_drop);
+                    let keep = text.chars().count() - d;
+                    *text = text.chars().take(keep).collect();
+                    to_drop -= d;
+                    if text.is_empty() {
+                        spans.pop();
+                    }
+                }
+                if to_drop == 0 {
+                    let attrs = Attrs::new()
+                        .family(Family::Name(&family))
+                        .color(Color::rgb(badge.color.0, badge.color.1, badge.color.2))
+                        .weight(Weight::BOLD);
+                    spans.push((badge.text.clone(), AttrsOwned::new(&attrs)));
+                }
+            }
+
             if row + 1 < grid.rows {
                 spans.push(("\n".into(), AttrsOwned::new(&default_attrs)));
             }

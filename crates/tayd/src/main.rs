@@ -10,6 +10,7 @@ mod app;
 mod hotkey;
 mod ipc;
 mod keys;
+mod ptyloop;
 
 use alacritty_terminal::tty;
 
@@ -22,6 +23,9 @@ fn main() {
     let mut config = tay_config::Config::load();
     if std::env::var("TAY_START_VISIBLE").is_ok_and(|v| v == "1") {
         config.start_hidden = false;
+    }
+    if let Ok(shell) = std::env::var("TAY_SHELL") {
+        config.shell = shell;
     }
     log::info!(
         "tayd 启动:shell={} 字体={} {}pt 隐藏启动={}",

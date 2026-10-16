@@ -1,0 +1,25 @@
+# M3 实施笔记(进行中,2026-10-16)
+
+M3 = 体验差异化(§9):OSC 133 命令块、QuickSelect、搜索/复制模式、主题热重载。
+
+## 已完成:OSC 133 命令块(fish 零配置)
+
+- **关键决策:自研 PTY 事件循环**(crates/tayd/src/ptyloop.rs,~230 行)替换
+  alacritty_terminal::event_loop::EventLoop。原因:原版事件循环把 PTY 字节
+  直接喂给 vte parser,前端看不到输出流,无法消费 OSC 133;且 unix Pty 的
+  signals 字段私有,无法透明包装。自研后行为等价(poll PTY + 唤醒管道、
+  DEC 2026 同步超时、子进程退出通知),读取路径归前端。
+- OSC 133 解析:字节级状态机(跨 read 分块、BEL/ST 双终止、非 133 OSC
+  忽略),单测 4 个。A → 记录光标网格行;B/C 忽略;D → 退出码。
+- 渲染:非零退出码在对应提示符行尾画红色 `✗ N` 徽章(替换行尾空格,
+  tay-render 行尾 splice)。
+- 快捷键:Ctrl+Shift+↑/↓ 跳转提示符(scroll_to_point);Ctrl+Shift+O
+  复制上一条命令的输出(bounds_to_string)。
+- fish 4.9 实测:A/B/C/D 全序列捕获;`ls /nonexistent` → `✗ 2` 徽章 ✓。
+
+## 遗留
+
+- 命令块折叠(设计 §8.4;渲染级折叠,较重,后续)
+- QuickSelect、搜索/复制模式、主题热重载
+- 性能:OSC 扫描在 PTY 读取路径上,3000 行滚动 1030fps(vs 之前 1123fps,
+  ~10% 开销,可接受;后续可按「只在非 133 上下文跳过」优化)
