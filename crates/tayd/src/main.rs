@@ -7,6 +7,7 @@
 //! - `TAY_START_VISIBLE=1` — 启动即呼出(覆盖配置 start_hidden,截图验证用)
 //! - `TAY_QUICKSELECT=1` — 第 10 帧自动触发 QuickSelect(截图验证用)
 //! - `TAY_VI=1` — 第 12 帧自动进入 vi 复制模式(截图验证用)
+//! - `TAY_FOLD=1` — 第 14 帧自动折叠第一条命令的输出(截图验证用)
 
 mod app;
 mod hotkey;
@@ -47,6 +48,7 @@ fn main() {
     let exec = std::env::var("TAY_EXEC").ok();
     let quickselect = std::env::var("TAY_QUICKSELECT").is_ok_and(|v| v == "1");
     let vi_at_start = std::env::var("TAY_VI").is_ok_and(|v| v == "1");
+    let fold_at_start = std::env::var("TAY_FOLD").is_ok_and(|v| v == "1");
 
     // 跨线程唤醒通道(PTY/IPC/热键 → 事件循环)。
     let (wake_tx, wake_rx) = std::sync::mpsc::channel();
@@ -97,6 +99,7 @@ fn main() {
         exec,
         quickselect,
         vi_at_start,
+        fold_at_start,
         ipc_listener,
         ipc_tx,
         ipc_rx,

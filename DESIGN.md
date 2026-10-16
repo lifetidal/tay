@@ -206,7 +206,7 @@ Wayland 上「全局热键」和「窗口定位」都没有统一答案,必须�
 | **M0 内核就绪** ✅ | alacritty_terminal + winit + wgpu/glyphon 渲染出可用终端 | fish 全功能、CJK 输入、连字、150fps 滚动 —— **实测 avg 0.75ms/帧 ≈ 1339fps**(2026-10-16,KDE Wayland + AMD) |
 | **M1 下拉成形(Wayland 独占)** ✅ | SCTK + wlr-layer-shell 手写窗口层(替换 winit)、daemon/IPC/CLI、portal 热键、margin 动画、失焦隐藏 | **热呼出 16ms/1ms**(验收 <50ms);`tay toggle` 全链路;滚动 1123fps 无退化 —— 2026-10-16 实测。X11 路线暂缓(用户决策),winit 版保留于 git 历史 |
 | **M2 Wayland 覆盖** | layer-shell(wlroots/KDE)+ GlobalShortcuts portal + GNOME 扩展伴侣 | 在 sway、Hyprland、KDE、GNOME 上全部一键呼出 |
-| **M3 体验差异化** ✅ | OSC 133 命令块(徽章/跳转/按块复制,fish 零配置)、QuickSelect(URL/路径/sha)、vi 复制模式 + 增量搜索、主题热重载 | 全部验收;命令块折叠列为后续增强 |
+| **M3 体验差异化** ✅ | OSC 133 命令块(徽章/跳转/按块复制/折叠,fish 零配置)、QuickSelect、vi 复制模式 + 增量搜索、主题热重载 | 全部验收,2026-10-16 实测 |
 | **M4 生态** | 图像协议、打包(Flathub/AUR/nixpkgs/COPR)、配置文件向导 | Flatpak 沙箱下 portal 全链路可用 |
 
 ## 10. 风险与对策

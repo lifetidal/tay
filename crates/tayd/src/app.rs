@@ -169,6 +169,10 @@ pub struct TayApp {
     quick: Option<QuickState>,
     vi_search_query: Option<String>,
     vi_search: Option<(RegexSearch, String)>,
+    /// 折叠的命令块(提示符网格行号)。
+    folded: std::collections::BTreeSet<i32>,
+    /// 显示行 → 网格行映射(-1 = 折叠标记行)。
+    row_map: Vec<i32>,
     /// 等待 set_size 后的 configure(避免 wgpu swapchain 二次重建)。
     sizing: bool,
     layer_h: i32,
@@ -190,6 +194,7 @@ pub struct TayApp {
     exec_sent: bool,
     quickselect_at_start: bool,
     vi_at_start: bool,
+    fold_at_start: bool,
     config_mtime: Option<std::time::SystemTime>,
 }
 
@@ -217,6 +222,7 @@ impl TayApp {
         exec: Option<String>,
         quickselect_at_start: bool,
         vi_at_start: bool,
+        fold_at_start: bool,
         ipc_listener: Option<std::os::unix::net::UnixListener>,
         ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
         ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
@@ -248,6 +254,8 @@ impl TayApp {
             quick: None,
             vi_search_query: None,
             vi_search: None,
+            folded: Default::default(),
+            row_map: Vec::new(),
             sizing: false,
             layer_h: 480,
             shown_once: false,
@@ -266,6 +274,7 @@ impl TayApp {
             exec_sent: false,
             quickselect_at_start,
             vi_at_start,
+            fold_at_start,
             config_mtime: None,
         }
     }
@@ -450,6 +459,11 @@ impl TayApp {
         }
     }
 
+    /// 显示行 → 网格行(折叠感知;标记行 = -1)。
+    fn grid_line_at_display(&self, row: usize) -> i32 {
+        self.row_map.get(row).copied().unwrap_or(-1)
+    }
+
     fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         let (cw, ch) = self.renderer.as_ref()?.cell_size();
         let (cols, rows) = self.dims?;
@@ -463,8 +477,8 @@ impl TayApp {
         }
     }
 
-    /// 从 alacritty_terminal 快照构建渲染网格。
-    fn build_grid(&self) -> tay_render::Grid {
+    /// 从 alacritty_terminal 快照构建渲染网格(含命令块折叠重映射)。
+    fn build_grid(&mut self) -> tay_render::Grid {
         let (cols, rows) = self.dims.unwrap_or((80, 24));
         let term = self.term.as_ref().expect("term 未初始化").lock();
         let content = term.renderable_content();
@@ -477,17 +491,70 @@ impl TayApp {
             underline: false,
             wide_spacer: false,
         };
-        let mut cells = vec![blank; cols * rows];
+        // —— 折叠重映射:可见网格行 → 显示行 ——
+        let off = content.display_offset as i32;
+        let first = -off;
+        let last = first + rows as i32 - 1;
+        // 折叠区间(相邻提示符之间的输出行)。
+        let mut ranges: Vec<(i32, i32)> = Vec::new();
+        for w in self.blocks.windows(2) {
+            if self.folded.contains(&w[0].0) {
+                let a = w[0].0 + 1;
+                let b = w[1].0 - 1;
+                if a <= b {
+                    ranges.push((a, b));
+                }
+            }
+        }
+        // 显示行 → 网格行。
+        let mut map: Vec<(i32, bool, String)> = Vec::new();
+        let mut line = first;
+        while line <= last {
+            if let Some((a, b)) = ranges.iter().find(|(a, b)| line >= *a && line <= *b) {
+                let n = b - a + 1;
+                map.push((*a, true, format!("⋯ {n} 行已折叠")));
+                line = b + 1;
+            } else {
+                map.push((line, false, String::new()));
+                line += 1;
+            }
+        }
+        self.row_map = map.iter().map(|(l, _, _)| *l).collect();
+        let marker_fg = Rgb::new(0xc0, 0xa0, 0x40);
+        let mut cells = vec![blank; rows * cols];
+        let mut grid_line_to_row: std::collections::HashMap<i32, usize> = Default::default();
+        for (row, (gl, is_marker, text)) in map.iter().enumerate() {
+            if *is_marker {
+                for c in 0..cols {
+                    cells[row * cols + c] = tay_render::Cell {
+                        c: ' ',
+                        fg: marker_fg,
+                        bg: Rgb::new(0x18, 0x1a, 0x20),
+                        bold: false,
+                        italic: false,
+                        underline: false,
+                        wide_spacer: false,
+                    };
+                }
+                for (i, ch) in text.chars().enumerate() {
+                    if i < cols {
+                        cells[row * cols + i].c = ch;
+                    }
+                }
+            } else {
+                grid_line_to_row.insert(*gl, row);
+            }
+        }
         for idx in content.display_iter {
             let p = idx.point;
             if p.column.0 >= cols {
                 continue;
             }
-            let line = p.line.0;
-            if line < 0 || line as usize >= rows {
+            let Some(&row) = grid_line_to_row.get(&p.line.0) else { continue };
+            if row >= rows {
                 continue;
             }
-            let i = line as usize * cols + p.column.0;
+            let i = row * cols + p.column.0;
             cells[i] = tay_render::Cell {
                 c: idx.cell.c,
                 fg: resolve(idx.cell.fg, content.colors, &self.config),
@@ -504,12 +571,21 @@ impl TayApp {
             ACursorShape::Beam => tay_render::CursorShape::Beam,
             ACursorShape::Hidden => tay_render::CursorShape::Hidden,
         };
-        let off = content.display_offset as i32;
-        let to_display = |p: Point| {
-            (
-                p.column.0.min(cols - 1),
-                (p.line.0 + off).clamp(0, rows as i32 - 1) as usize,
-            )
+        // 光标/选区经映射(折叠区间内的行落到标记行)。
+        let to_display = |p: Point| -> (usize, usize) {
+            let mut row = 0usize;
+            let mut found = false;
+            for (i, (gl, is_marker, _)) in map.iter().enumerate() {
+                if p.line.0 == *gl || (*is_marker && p.line.0 > *gl) {
+                    row = i;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                row = map.len().saturating_sub(1);
+            }
+            (p.column.0.min(cols - 1), row.min(rows - 1))
         };
         let selection = content.selection.map(|s| tay_render::SelectionRange {
             start: to_display(s.start),
@@ -524,10 +600,7 @@ impl TayApp {
                 if code == 0 {
                     return None;
                 }
-                let row = (line + off) as usize;
-                if row >= rows {
-                    return None;
-                }
+                let Some(&row) = grid_line_to_row.get(line) else { return None };
                 Some(tay_render::Badge {
                     row,
                     text: format!(" ✗ {code} "),
@@ -568,6 +641,51 @@ impl TayApp {
             badges,
             overlays,
         }
+    }
+
+    /// 折叠/展开光标所在命令块(Ctrl+Shift+H)。
+    fn toggle_fold_at_cursor(&mut self, ctx: &mut Ctx<'_>) {
+        let Some(term) = &self.term else { return };
+        let line = term.lock().renderable_content().cursor.point.line.0;
+        self.toggle_fold_line(line, ctx);
+    }
+
+    /// 折叠/展开包含网格行 `line` 的命令块。
+    fn toggle_fold_line(&mut self, line: i32, ctx: &mut Ctx<'_>) {
+        let target = self
+            .blocks
+            .windows(2)
+            .find(|w| line > w[0].0 && line < w[1].0)
+            .map(|w| w[0].0);
+        let Some(prompt) = target else { return };
+        if self.folded.contains(&prompt) {
+            self.folded.remove(&prompt);
+            log::info!("展开命令块 @ {prompt}");
+        } else {
+            self.folded.insert(prompt);
+            log::info!("折叠命令块 @ {prompt}");
+        }
+        // 折叠改变布局:关闭 QuickSelect 与选区。
+        self.quick = None;
+        self.sel = None;
+        ctx.request_redraw();
+    }
+
+    /// 点击是否落在退出码徽章上(是则返回该块的提示符网格行)。
+    fn badge_line_at(&self, display_row: usize, col: usize) -> Option<i32> {
+        let grid_line = *self.row_map.get(display_row)?;
+        if grid_line < 0 {
+            return None;
+        }
+        self.blocks
+            .iter()
+            .any(|(p, code)| *p == grid_line && code.is_some_and(|c| c != 0))
+            .then(|| {
+                let cols = self.dims.map(|(c, _)| c).unwrap_or(80);
+                let badge_start = cols.saturating_sub(8);
+                (col >= badge_start).then_some(grid_line)
+            })
+            .flatten()
     }
 
     /// vi 复制模式切换(Ctrl+Shift+Space)。
@@ -736,10 +854,14 @@ impl TayApp {
         let Some(term) = self.term.as_ref() else { return };
         let text = if let Some((start, end)) = self.sel {
             let (s, e) = (start.min(end), start.max(end));
+            let l0 = self.grid_line_at_display(s.1);
+            let l1 = self.grid_line_at_display(e.1);
+            if l0 < 0 || l1 < 0 {
+                return;
+            }
             let term = term.lock();
-            let off = term.grid().display_offset() as i32;
-            let start = Point::new(Line(s.1 as i32 - off), Column(s.0));
-            let end = Point::new(Line(e.1 as i32 - off), Column(e.0));
+            let start = Point::new(Line(l0), Column(s.0));
+            let end = Point::new(Line(l1), Column(e.0));
             Some(term.bounds_to_string(start, end))
         } else {
             term.lock().selection_to_string()
@@ -760,6 +882,15 @@ impl TayApp {
         if let Some(at) = self.show_at.take() {
             self.shown_once = true;
             log::info!("热呼出 {}ms", at.elapsed().as_millis());
+        }
+
+        // TAY_FOLD:第 14 帧自动折叠第一条命令输出(验证用)。
+        if self.fold_at_start && self.frames == 14 {
+            self.fold_at_start = false;
+            if let Some((line, _)) = self.blocks.first().copied() {
+                self.folded.insert(line);
+                log::info!("折叠验证:块 @ {line}");
+            }
         }
 
         // TAY_VI:第 13 帧自动进入 vi 模式(验证用)。
@@ -963,6 +1094,11 @@ impl Handler for TayApp {
                         },
                     }
                 }
+                // 命令块折叠:Ctrl+Shift+H。
+                if mods.ctrl && mods.shift && matches!(key.key, KeyKind::Char('h') | KeyKind::Char('H')) {
+                    self.toggle_fold_at_cursor(ctx);
+                    return;
+                }
                 // vi 复制模式:Ctrl+Shift+Space 切换;vi 内按键走动作。
                 if mods.ctrl && mods.shift
                     && matches!(key.key, KeyKind::Char(' '))
@@ -1064,6 +1200,13 @@ impl Handler for TayApp {
             WEvent::PointerButton { button, pressed, x, y } => {
                 if button == MouseButtonIdx::Left {
                     if pressed {
+                        // 点击徽章 → 折叠/展开该块。
+                        if let Some(cell) = self.cell_at(x, y) {
+                            if let Some(line) = self.badge_line_at(cell.1, cell.0) {
+                                self.toggle_fold_line(line, ctx);
+                                return;
+                            }
+                        }
                         self.dragging = true;
                         let cell = self.cell_at(x, y).unwrap_or((0, 0));
                         self.sel = Some((cell, cell));
@@ -1173,6 +1316,8 @@ impl Handler for TayApp {
                             self.blocks.push((line, None));
                             if self.blocks.len() > 200 {
                                 self.blocks.drain(..self.blocks.len() - 200);
+                                let min = self.blocks.first().map(|b| b.0).unwrap_or(0);
+                                self.folded.retain(|l| *l >= min);
                             }
                         },
                         BlockEvent::Exit { code } => {
