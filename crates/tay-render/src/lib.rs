@@ -394,6 +394,16 @@ impl Renderer {
         self.cell
     }
 
+    /// 热重载颜色(字体变化需重启:重建 FontSystem 代价高,且 cell 尺寸会变)。
+    pub fn update_colors(&mut self, config: &Config) {
+        self.fg_default = Color::rgb(
+            config.colors.foreground.0,
+            config.colors.foreground.1,
+            config.colors.foreground.2,
+        );
+        self.bg_default = config.colors.background;
+    }
+
     pub fn surface_size(&self) -> (u32, u32) {
         self.size
     }

@@ -17,7 +17,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors as TermColors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
-use alacritty_terminal::vte::ansi::{Color, CursorShape as ACursorShape, NamedColor};
+use alacritty_terminal::term::search::RegexSearch;
+use alacritty_terminal::vi_mode::ViMotion;
+use alacritty_terminal::vte::ansi::{Color, CursorShape as ACursorShape, CursorStyle, NamedColor};
 
 use crate::ptyloop::{BlockEvent, Msg, TermSender};
 use tay_config::{Config, Rgb};
@@ -163,8 +165,10 @@ pub struct TayApp {
 
     // —— M1:呼出状态 ——
     vis: Vis,
-    // —— M3:QuickSelect ——
+    // —— M3:QuickSelect / vi 复制模式 ——
     quick: Option<QuickState>,
+    vi_search_query: Option<String>,
+    vi_search: Option<(RegexSearch, String)>,
     /// 等待 set_size 后的 configure(避免 wgpu swapchain 二次重建)。
     sizing: bool,
     layer_h: i32,
@@ -185,6 +189,8 @@ pub struct TayApp {
     exec: Option<String>,
     exec_sent: bool,
     quickselect_at_start: bool,
+    vi_at_start: bool,
+    config_mtime: Option<std::time::SystemTime>,
 }
 
 fn ease_out_cubic(t: f32) -> f32 {
@@ -210,6 +216,7 @@ impl TayApp {
         bench: Option<u32>,
         exec: Option<String>,
         quickselect_at_start: bool,
+        vi_at_start: bool,
         ipc_listener: Option<std::os::unix::net::UnixListener>,
         ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
         ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
@@ -239,6 +246,8 @@ impl TayApp {
             scroll_px: 0.0,
             vis: Vis::Hidden,
             quick: None,
+            vi_search_query: None,
+            vi_search: None,
             sizing: false,
             layer_h: 480,
             shown_once: false,
@@ -256,6 +265,8 @@ impl TayApp {
             exec,
             exec_sent: false,
             quickselect_at_start,
+            vi_at_start,
+            config_mtime: None,
         }
     }
 
@@ -371,7 +382,11 @@ impl TayApp {
 
             // 终端 + PTY 事件循环线程。
             let listener = Listener::new(self.tx.clone(), self.wake.clone());
-            let term_config = TermConfig { scrolling_history: 10_000, ..Default::default() };
+            let term_config = TermConfig {
+                scrolling_history: 10_000,
+                vi_mode_cursor_style: Some(CursorStyle { shape: ACursorShape::Beam, blinking: false }),
+                ..Default::default()
+            };
             let term = Arc::new(FairMutex::new(Term::new(
                 term_config,
                 &Dims { cols, rows },
@@ -521,8 +536,8 @@ impl TayApp {
             })
             .collect();
 
-        // QuickSelect 覆盖层。
-        let overlays = self
+        // QuickSelect 覆盖层 + vi 搜索状态栏。
+        let mut overlays: Vec<tay_render::Overlay> = self
             .quick
             .as_ref()
             .map(|q| {
@@ -532,6 +547,15 @@ impl TayApp {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some(query) = &self.vi_search_query {
+            if rows > 0 {
+                overlays.push(tay_render::Overlay {
+                    row: rows - 1,
+                    col: 0,
+                    text: format!(" 搜索: {query} "),
+                });
+            }
+        }
 
         tay_render::Grid {
             cols,
@@ -544,6 +568,126 @@ impl TayApp {
             badges,
             overlays,
         }
+    }
+
+    /// vi 复制模式切换(Ctrl+Shift+Space)。
+    fn toggle_vi(&mut self, ctx: &mut Ctx<'_>) {
+        if let Some(term) = &self.term {
+            term.lock().toggle_vi_mode();
+            self.vi_search_query = None;
+            self.vi_search = None;
+            ctx.request_redraw();
+        }
+    }
+
+    /// vi 模式按键 → 动作(仅消费,不发 PTY)。
+    fn handle_vi_key(&mut self, key: &tay_window::KeyPress, ctx: &mut Ctx<'_>) {
+        use tay_window::KeyKind as K;
+        use tay_window::NamedKey as N;
+
+        let Some(term) = &self.term else { return };
+
+        // 搜索输入中:字符入查询,Enter 执行,Esc 取消。
+        if self.vi_search_query.is_some() {
+            match key.key {
+                K::Named(N::Escape) => {
+                    self.vi_search_query = None;
+                    ctx.request_redraw();
+                },
+                K::Named(N::Enter) => {
+                    if let Some(query) = self.vi_search_query.take() {
+                        self.vi_search = RegexSearch::new(&query)
+                            .ok()
+                            .map(|r| (r, query));
+                        self.vi_search_next(1, ctx);
+                    }
+                },
+                K::Named(N::Backspace) => {
+                    if let Some(q) = self.vi_search_query.as_mut() {
+                        q.pop();
+                    }
+                    ctx.request_redraw();
+                },
+                K::Char(c) => {
+                    if let Some(q) = self.vi_search_query.as_mut() {
+                        q.push(c);
+                    }
+                    ctx.request_redraw();
+                },
+                _ => {},
+            }
+            return;
+        }
+
+        let motion = match key.key {
+            K::Char('h') => Some(ViMotion::Left),
+            K::Char('l') => Some(ViMotion::Right),
+            K::Char('k') => Some(ViMotion::Up),
+            K::Char('j') => Some(ViMotion::Down),
+            K::Char('0') => Some(ViMotion::First),
+            K::Char('$') => Some(ViMotion::Last),
+            K::Char('^') => Some(ViMotion::FirstOccupied),
+            K::Char('w') => Some(ViMotion::WordRight),
+            K::Char('b') => Some(ViMotion::WordLeft),
+            K::Char('e') => Some(ViMotion::WordRightEnd),
+            K::Char('G') => Some(ViMotion::Low),
+            K::Char('g') => Some(ViMotion::High),
+            _ => None,
+        };
+        if let Some(m) = motion {
+            term.lock().vi_motion(m);
+            ctx.request_redraw();
+            return;
+        }
+        match key.key {
+            // yank:复制选区并退出 vi。
+            K::Char('y') => {
+                let text = term.lock().selection_to_string();
+                if let Some(text) = text {
+                    if let Ok(mut cb) = arboard::Clipboard::new() {
+                        let _ = cb.set_text(text);
+                    }
+                }
+                term.lock().toggle_vi_mode();
+                ctx.request_redraw();
+            },
+            // 搜索。
+            K::Char('/') => {
+                self.vi_search_query = Some(String::new());
+                ctx.request_redraw();
+            },
+            K::Char('n') => self.vi_search_next(1, ctx),
+            K::Char('N') => self.vi_search_next(-1, ctx),
+            // 退出。
+            K::Named(N::Escape) | K::Char('q') => {
+                term.lock().toggle_vi_mode();
+                self.vi_search = None;
+                ctx.request_redraw();
+            },
+            _ => {},
+        }
+    }
+
+    /// 下一个/上一个搜索命中(dir = 1/-1)。
+    fn vi_search_next(&mut self, dir: i32, ctx: &mut Ctx<'_>) {
+        let Some(term) = self.term.as_ref() else { return };
+        let Some((regex, _)) = &mut self.vi_search else { return };
+        let mut term = term.lock();
+        let cursor = term.renderable_content().cursor.point;
+        let (first, last) = {
+            let g = term.grid();
+            let history = (g.total_lines() - g.screen_lines()) as i32;
+            (Point::new(Line(-history), Column(0)), Point::new(Line(g.screen_lines() as i32 - 1), Column(0)))
+        };
+        let hit = if dir > 0 {
+            term.regex_search_right(regex, cursor, last)
+        } else {
+            term.regex_search_left(regex, cursor, first)
+        };
+        if let Some(m) = hit {
+            term.scroll_to_point(*m.start());
+        }
+        ctx.request_redraw();
     }
 
     /// 跳转到上一条/下一条提示符(DESIGN §8.4「跳转到上一条提示符」)。
@@ -616,6 +760,15 @@ impl TayApp {
         if let Some(at) = self.show_at.take() {
             self.shown_once = true;
             log::info!("热呼出 {}ms", at.elapsed().as_millis());
+        }
+
+        // TAY_VI:第 13 帧自动进入 vi 模式(验证用)。
+        if self.vi_at_start && self.frames == 13 {
+            self.vi_at_start = false;
+            if let Some(term) = &self.term {
+                term.lock().toggle_vi_mode();
+                log::info!("已进入 vi 复制模式(验证)");
+            }
         }
 
         // TAY_QUICKSELECT:第 12 帧自动触发(验证用)。
@@ -810,6 +963,21 @@ impl Handler for TayApp {
                         },
                     }
                 }
+                // vi 复制模式:Ctrl+Shift+Space 切换;vi 内按键走动作。
+                if mods.ctrl && mods.shift
+                    && matches!(key.key, KeyKind::Char(' '))
+                {
+                    self.toggle_vi(ctx);
+                    return;
+                }
+                let in_vi = self
+                    .term
+                    .as_ref()
+                    .is_some_and(|t| t.lock().mode().contains(TermMode::VI));
+                if in_vi {
+                    self.handle_vi_key(&key, ctx);
+                    return;
+                }
                 // 触发 QuickSelect:Ctrl+Shift+F。
                 if mods.ctrl && mods.shift && matches!(key.key, KeyKind::Char('f') | KeyKind::Char('F')) {
                     let grid = self.build_grid();
@@ -978,6 +1146,25 @@ impl Handler for TayApp {
                 // portal 热键。
                 while self.hotkey_rx.try_recv().is_ok() {
                     self.toggle(ctx);
+                }
+                // 配置热重载(§M3:文件 mtime 变化 → 重载颜色等运行时字段)。
+                if let Ok(meta) = std::fs::metadata(tay_config::Config::config_path()) {
+                    if let Ok(mtime) = meta.modified() {
+                        let changed = self.config_mtime.map_or(true, |t| t != mtime);
+                        if changed {
+                            self.config_mtime = Some(mtime);
+                            let fresh = tay_config::Config::load();
+                            log::info!("配置已热重载");
+                            if fresh.font != self.config.font {
+                                log::warn!("字体变化需重启 tayd 生效");
+                            }
+                            self.config = fresh;
+                            if let Some(r) = &mut self.renderer {
+                                r.update_colors(&self.config);
+                            }
+                            ctx.request_redraw();
+                        }
+                    }
                 }
                 // OSC 133 命令块标记。
                 while let Ok(ev) = self.blocks_rx.try_recv() {
