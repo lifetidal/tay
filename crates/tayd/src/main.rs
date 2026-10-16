@@ -11,6 +11,7 @@
 
 mod app;
 mod hotkey;
+mod kitty;
 mod ipc;
 mod keys;
 mod ptyloop;

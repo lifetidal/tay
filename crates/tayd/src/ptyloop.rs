@@ -18,13 +18,15 @@ use alacritty_terminal::tty::{self, ChildEvent, EventedPty};
 use alacritty_terminal::vte::ansi;
 use polling::{Event as PollEvent, Poller};
 
-/// OSC 133 标记(命令块)。
-#[derive(Clone, Copy, Debug)]
+/// 终端流标记(命令块 / 图像)。
+#[derive(Debug)]
 pub enum BlockEvent {
     /// 提示符开始(网格行号)。
     PromptStart(i32),
     /// 上一条命令退出码。
     Exit { code: i32 },
+    /// kitty graphics 图像(放置于流中光标处)。
+    Image { img: crate::kitty::KittyImage, line: i32, col: u32 },
 }
 
 /// 给 UI 线程的发送端。
@@ -114,7 +116,8 @@ fn run<U>(
     }
 
     let mut parser: ansi::Processor = ansi::Processor::new();
-    let mut osc = OscState::default();
+    let mut cell: (u32, u32) = (8, 16);
+    let mut scanner = StreamScanner::default();
     let mut buf = vec![0u8; 16 * 1024];
     let mut events = polling::Events::new();
     let mut exiting = false;
@@ -150,11 +153,47 @@ fn run<U>(
                             Ok(n) => {
                                 read_any = true;
                                 let chunk = &buf[..n];
-                                // OSC 133 消费(前端命令块)。
-                                osc.scan_into(chunk, &term, &blocks);
-                                // 喂给终端内核。
-                                let mut guard = term.lock();
-                                parser.advance(&mut *guard, chunk);
+                                for ev in scanner.scan(chunk) {
+                                    match ev {
+                                        StreamEvent::Text(bytes) => {
+                                            let mut guard = term.lock();
+                                            parser.advance(&mut *guard, &bytes);
+                                        },
+                                        StreamEvent::PromptStart => {
+                                            let line = {
+                                                let guard = term.lock();
+                                                guard.renderable_content().cursor.point.line.0
+                                            };
+                                            let _ = blocks.send(BlockEvent::PromptStart(line));
+                                        },
+                                        StreamEvent::Exit(code) => {
+                                            let _ = blocks.send(BlockEvent::Exit { code });
+                                        },
+                                        StreamEvent::Kitty(img) => {
+                                            // 放置位置 = 当前光标(流序保证正确)。
+                                            let (line, col) = {
+                                                let guard = term.lock();
+                                                let content = guard.renderable_content();
+                                                (
+                                                    content.cursor.point.line.0,
+                                                    content.cursor.point.column.0 as u32,
+                                                )
+                                            };
+                                            // C=1(默认):光标下移到图像下方。
+                                            if img.cursor_after && !img.delete {
+                                                let rows = (img.h as f32 / cell.1.max(1) as f32)
+                                                    .ceil()
+                                                    .max(1.0) as u32;
+                                                let mut guard = term.lock();
+                                                parser.advance(
+                                                    &mut *guard,
+                                                    format!("\r\x1b[{rows}B").as_bytes(),
+                                                );
+                                            }
+                                            let _ = blocks.send(BlockEvent::Image { img, line, col });
+                                        },
+                                    }
+                                }
                             },
                             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -177,6 +216,7 @@ fn run<U>(
                                 let _ = pty.file().write_all(&bytes);
                             },
                             Msg::Resize(ws) => {
+                                cell = (ws.cell_width as u32, ws.cell_height as u32);
                                 pty.on_resize(ws);
                             },
                             Msg::Shutdown => {
@@ -209,95 +249,159 @@ fn run<U>(
     log::debug!("PTY 事件循环退出");
 }
 
-/// OSC 133 原始标记(字节级解析产物,与 term 无关,可单测)。
-#[derive(Debug, PartialEq, Eq)]
-enum RawMarker {
+/// 字节流事件(扫描器输出;term 无关,可单测)。
+#[derive(Debug)]
+enum StreamEvent {
+    /// 喂给终端的字节。
+    Text(Vec<u8>),
+    /// kitty graphics 图像(已解码;放置位置由调用方按当前光标决定)。
+    Kitty(crate::kitty::KittyImage),
+    /// OSC 133 提示符开始。
     PromptStart,
+    /// OSC 133 退出码。
     Exit(i32),
 }
 
-/// OSC 133 解析状态机(跨 read 分块)。
+/// 流扫描器:字节 → 事件(OSC 133 命令块 + APC kitty graphics)。
 #[derive(Default)]
-struct OscState {
-    /// 正在收的 OSC 内容(ESC ] 之后的部分)。
-    buf: Vec<u8>,
-    active: bool,
+struct StreamScanner {
+    /// 待发文本缓冲。
+    text: Vec<u8>,
+    /// ESC ] 收集中(OSC)。
+    osc: Vec<u8>,
+    /// ESC _ 收集中(APC)。
+    apc: Vec<u8>,
+    state: ScanState,
 }
 
-impl OscState {
-    /// 字节级扫描:返回本块内完成的标记。
-    fn scan(&mut self, chunk: &[u8]) -> Vec<RawMarker> {
+#[derive(Default, PartialEq)]
+enum ScanState {
+    #[default]
+    Text,
+    Osc,
+    Apc,
+    /// ST(ESC \)的 ESC 已见。
+    StEsc,
+}
+
+impl StreamScanner {
+    fn scan(&mut self, chunk: &[u8]) -> Vec<StreamEvent> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < chunk.len() {
-            if !self.active {
-                // 找 ESC ] 开头。
-                if chunk[i] == 0x1b && i + 1 < chunk.len() && chunk[i + 1] == b']' {
-                    self.active = true;
-                    self.buf.clear();
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-                continue;
-            }
-            // OSC 内:找 BEL 或 ST(ESC \)。
             let c = chunk[i];
-            if c == 0x07 || (c == 0x1b && i + 1 < chunk.len() && chunk[i + 1] == b'\\') {
-                if let Some(m) = Self::parse(&self.buf) {
-                    out.push(m);
-                }
-                self.active = false;
-                self.buf.clear();
-                i += if c == 0x07 { 1 } else { 2 };
-            } else {
-                self.buf.push(c);
-                i += 1;
+            match self.state {
+                ScanState::Text => {
+                    if c == 0x1b && i + 1 < chunk.len() {
+                        match chunk[i + 1] {
+                            b']' => {
+                                self.state = ScanState::Osc;
+                                self.osc.clear();
+                                i += 2;
+                                continue;
+                            },
+                            b'_' => {
+                                self.state = ScanState::Apc;
+                                self.apc.clear();
+                                i += 2;
+                                continue;
+                            },
+                            _ => {},
+                        }
+                    }
+                    self.text.push(c);
+                    i += 1;
+                },
+                ScanState::Osc => {
+                    if c == 0x07 {
+                        self.finish_osc(&mut out);
+                        self.state = ScanState::Text;
+                        i += 1;
+                    } else if c == 0x1b && i + 1 < chunk.len() && chunk[i + 1] == b'\\' {
+                        self.finish_osc(&mut out);
+                        self.state = ScanState::Text;
+                        i += 2;
+                    } else {
+                        self.osc.push(c);
+                        i += 1;
+                    }
+                },
+                ScanState::Apc => {
+                    if c == 0x1b {
+                        self.state = ScanState::StEsc;
+                        i += 1;
+                    } else {
+                        self.apc.push(c);
+                        i += 1;
+                    }
+                },
+                ScanState::StEsc => {
+                    if c == b'\\' {
+                        // APC 结束。
+                        log::debug!("APC 结束: {:?}", String::from_utf8_lossy(&self.apc[..self.apc.len().min(40)]));
+                        match crate::kitty::parse_apc(&self.apc) {
+                            crate::kitty::Apc::Kitty(img) => {
+                                self.flush_text(&mut out);
+                                out.push(StreamEvent::Kitty(img));
+                            },
+                            crate::kitty::Apc::Passthrough(bytes) => {
+                                // 未知 APC:原样给终端(终端自行忽略)。
+                                self.text.extend_from_slice(b"\x1b_");
+                                self.text.extend_from_slice(&bytes);
+                                self.text.extend_from_slice(b"\x1b\\");
+                            },
+                            crate::kitty::Apc::Invalid => {},
+                        }
+                        self.state = ScanState::Text;
+                        i += 1;
+                    } else {
+                        // 不是 ST:ESC 属于 APC 内容。
+                        self.apc.push(0x1b);
+                        self.apc.push(c);
+                        self.state = ScanState::Apc;
+                        i += 1;
+                    }
+                },
             }
         }
-        // 防呆:异常内容丢弃。
-        if self.buf.len() > 512 {
-            self.active = false;
-            self.buf.clear();
+        // 防呆。
+        if self.osc.len() > 512 || self.apc.len() > 64 * 1024 * 1024 {
+            self.state = ScanState::Text;
+            self.osc.clear();
+            self.apc.clear();
         }
+        self.flush_text(&mut out);
         out
     }
 
-    fn parse(buf: &[u8]) -> Option<RawMarker> {
+    fn flush_text(&mut self, out: &mut Vec<StreamEvent>) {
+        if !self.text.is_empty() {
+            out.push(StreamEvent::Text(std::mem::take(&mut self.text)));
+        }
+    }
+
+    fn finish_osc(&mut self, out: &mut Vec<StreamEvent>) {
+        // OSC 原样转发给终端(终端处理标题/剪贴板等)。
+        self.text.extend_from_slice(b"\x1b]");
+        self.text.extend_from_slice(&self.osc);
+        self.text.push(0x07);
+        // 同时解析 133 命令块标记。
+        if let Some(m) = Self::parse_osc133(&self.osc) {
+            self.flush_text(out);
+            out.push(m);
+        }
+    }
+
+    fn parse_osc133(buf: &[u8]) -> Option<StreamEvent> {
         let s = String::from_utf8_lossy(buf);
         let mut parts = s.split(';');
         if parts.next()? != "133" {
             return None;
         }
         match parts.next()? {
-            "A" => Some(RawMarker::PromptStart),
-            "D" => Some(RawMarker::Exit(parts.next()?.parse().ok().unwrap_or(0))),
+            "A" => Some(StreamEvent::PromptStart),
+            "D" => Some(StreamEvent::Exit(parts.next()?.parse().ok().unwrap_or(0))),
             _ => None,
-        }
-    }
-
-    fn scan_into<U>(
-        &mut self,
-        chunk: &[u8],
-        term: &Arc<FairMutex<Term<U>>>,
-        blocks: &Sender<BlockEvent>,
-    ) where
-        U: EventListener,
-    {
-        for m in self.scan(chunk) {
-            match m {
-                // A = 提示符开始:记录当前光标所在网格行。
-                RawMarker::PromptStart => {
-                    let line = term.lock().renderable_content().cursor.point.line.0;
-                    log::debug!("OSC133 A @ line {line}");
-                    let _ = blocks.send(BlockEvent::PromptStart(line));
-                },
-                // D = 退出码。
-                RawMarker::Exit(code) => {
-                    log::debug!("OSC133 D code={code}");
-                    let _ = blocks.send(BlockEvent::Exit { code });
-                },
-            }
         }
     }
 }
@@ -307,31 +411,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_simple() {
-        let mut st = OscState::default();
-        let m = st.scan(b"\x1b]133;A\x07");
-        assert_eq!(m, vec![RawMarker::PromptStart]);
-        let m = st.scan(b"\x1b]133;D;127\x07");
-        assert_eq!(m, vec![RawMarker::Exit(127)]);
+    fn text_passthrough() {
+        let mut sc = StreamScanner::default();
+        let evs = sc.scan(b"hello");
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], StreamEvent::Text(t) if t == b"hello"));
     }
 
     #[test]
-    fn parse_split_across_reads() {
-        let mut st = OscState::default();
-        assert!(st.scan(b"\x1b]133;").is_empty());
-        assert_eq!(st.scan(b"A\x07"), vec![RawMarker::PromptStart]);
+    fn osc133_split_across_reads() {
+        let mut sc = StreamScanner::default();
+        assert!(sc.scan(b"\x1b]133;").is_empty());
+        let evs = sc.scan(b"A\x07");
+        // OSC 原样转发给终端 + 标记事件。
+        assert!(matches!(&evs[0], StreamEvent::Text(_)));
+        assert!(matches!(&evs[1], StreamEvent::PromptStart));
     }
 
     #[test]
-    fn parse_st_terminated() {
-        let mut st = OscState::default();
-        assert_eq!(st.scan(b"\x1b]133;D;3\x1b\\"), vec![RawMarker::Exit(3)]);
+    fn osc133_exit_code() {
+        let mut sc = StreamScanner::default();
+        let evs = sc.scan(b"\x1b]133;D;127\x07");
+        assert!(matches!(&evs[0], StreamEvent::Text(_)));
+        assert!(matches!(&evs[1], StreamEvent::Exit(127)));
     }
 
     #[test]
-    fn ignores_other_osc() {
-        let mut st = OscState::default();
-        assert!(st.scan(b"\x1b]0;title\x07").is_empty());
-        assert!(st.scan(b"\x1b]52;c;Zm9v\x07").is_empty());
+    fn kitty_image_apc() {
+        let mut sc = StreamScanner::default();
+        let mut seq = b"\x1b_Gf=32,s=1,v=1,i=5;".to_vec();
+        seq.extend_from_slice(&[255, 0, 0, 255]);
+        seq.extend_from_slice(b"\x1b\\");
+        let evs = sc.scan(&seq);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::Kitty(img) => {
+                assert_eq!(img.id, 5);
+                assert_eq!(img.rgba, vec![255, 0, 0, 255]);
+            },
+            other => panic!("不是 kitty 事件: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kitty_apc_split_across_reads() {
+        let mut sc = StreamScanner::default();
+        assert!(sc.scan(b"before\x1b_Gf=32,s=1,v=1,i=1;").iter().all(|e| matches!(e, StreamEvent::Text(_))));
+        let evs = sc.scan(b"\x00\x00\x00\xff\x1b\\after");
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Kitty(_))));
+        assert!(evs.iter().any(|e| matches!(e, StreamEvent::Text(_))));
+    }
+
+    #[test]
+    fn unknown_apc_passthrough() {
+        let mut sc = StreamScanner::default();
+        let evs = sc.scan(b"\x1b_Xother\x1b\\");
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], StreamEvent::Text(t) if t == b"\x1b_Xother\x1b\\"));
+    }
+
+    #[test]
+    fn st_esc_inside_apc() {
+        // APC 内容中的孤立 ESC 并入内容;畸形 kitty 序列按协议丢弃。
+        let mut sc = StreamScanner::default();
+        assert!(sc.scan(b"\x1b_Gx\x1bz\x1b\\").is_empty());
     }
 }

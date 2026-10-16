@@ -71,6 +71,23 @@ pub struct Overlay {
     pub text: String,
 }
 
+/// kitty graphics 图像(显示坐标)。
+#[derive(Clone, Debug)]
+pub struct RenderImage {
+    pub id: u32,
+    pub row: usize,
+    pub col: usize,
+    /// 占用的单元格。
+    pub cols: u32,
+    pub rows: u32,
+    /// 像素尺寸。
+    pub w: u32,
+    pub h: u32,
+    /// z:负 = 文本之下,正 = 文本之上。
+    pub z: i32,
+    pub rgba: Vec<u8>,
+}
+
 /// 终端网格快照。
 pub struct Grid {
     pub cols: usize,
@@ -85,6 +102,8 @@ pub struct Grid {
     pub badges: Vec<Badge>,
     /// 单元格覆盖层(QuickSelect 标签)。
     pub overlays: Vec<Overlay>,
+    /// kitty graphics 图像。
+    pub images: Vec<RenderImage>,
 }
 
 #[repr(C)]
@@ -131,6 +150,15 @@ pub struct Renderer {
 
     // —— 自绘 bg 管线 ——
     bg_pipeline: wgpu::RenderPipeline,
+    // —— 图像管线(kitty graphics) ——
+    img_pipeline: wgpu::RenderPipeline,
+    uv_quad: wgpu::Buffer,
+    img_sampler: wgpu::Sampler,
+    /// 内容 hash → (纹理, bind group, w, h, 实例缓冲)。
+    /// 每图独立实例缓冲:共用一个会在单帧多图时发生写-读竞态。
+    img_cache: std::collections::HashMap<u64, (wgpu::Texture, wgpu::BindGroup, u32, u32, wgpu::Buffer)>,
+    /// 当前帧图像实例(hash, rect, z)。
+    current_images: Vec<(u64, [f32; 4], i32)>,
     unit_quad: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     locals_buf: wgpu::Buffer,
@@ -147,6 +175,16 @@ struct ShotState {
     path: String,
     after_frames: u32,
     frames: u32,
+}
+
+/// FNV-1a(图像内容 hash,避免逐帧重传纹理)。
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }
 
 /// sRGB 分量 → linear(surface 为 sRGB 格式时硬件会在写入时再编码回去)。
@@ -325,9 +363,109 @@ impl Renderer {
             cache: None,
         });
 
+        // —— 图像管线 ——
+        let img_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tay image"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let img_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tay image layout"),
+            bind_group_layouts: &[Some(&img_layout)],
+            immediate_size: 0,
+        });
+        let img_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tay image"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("image.wgsl"))),
+        });
+        let img_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tay image pipeline"),
+            layout: Some(&img_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &img_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 16,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 16,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![2 => Float32x4],
+                    }),
+                ],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &img_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let uv_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tay image quad"),
+            // (pos, uv) × 4 顶点。
+            contents: bytemuck::cast_slice(&[
+                0.0f32, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 1.0, 0.0, //
+                1.0, 1.0, 1.0, 1.0, //
+                0.0, 0.0, 0.0, 0.0, //
+                1.0, 1.0, 1.0, 1.0, //
+                0.0, 1.0, 0.0, 1.0, //
+            ]),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let img_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("tay image sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
         let unit_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tay unit quad"),
-            contents: bytemuck::cast_slice(&[0.0f32, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]),
+            contents: bytemuck::cast_slice(&[
+                0.0f32, 0.0, 1.0, 0.0, 1.0, 1.0, //
+                0.0, 0.0, 1.0, 1.0, 0.0, 1.0, //
+            ]),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -351,6 +489,9 @@ impl Renderer {
             }],
         });
 
+        device.on_uncaptured_error(std::sync::Arc::new(|e| {
+            log::error!("wgpu 校验错误: {e:?}");
+        }));
         let mut renderer = Self {
             device,
             queue,
@@ -374,6 +515,11 @@ impl Renderer {
             bg_default: config.colors.background,
             srgb: format.is_srgb(),
             bg_pipeline,
+            img_pipeline,
+            uv_quad,
+            img_sampler,
+            img_cache: Default::default(),
+            current_images: Vec::new(),
             unit_quad,
             instance_buf,
             locals_buf,
@@ -462,6 +608,99 @@ impl Renderer {
     pub fn update(&mut self, grid: &Grid) {
         self.rebuild_text(grid);
         self.rebuild_quads(grid);
+        self.rebuild_images(grid);
+    }
+
+    /// 上传新图像纹理(内容 hash 缓存)。
+    fn rebuild_images(&mut self, grid: &Grid) {
+        self.current_images = grid
+            .images
+            .iter()
+            .map(|img| {
+                let hash = fnv1a(&img.rgba);
+                let rect = [
+                    img.col as f32 * self.cell.0 + self.padding,
+                    img.row as f32 * self.cell.1 + self.padding,
+                    img.cols as f32 * self.cell.0,
+                    img.rows as f32 * self.cell.1,
+                ];
+                (hash, rect, img.z)
+            })
+            .collect();
+        for img in &grid.images {
+            let hash = fnv1a(&img.rgba);
+            if self.img_cache.contains_key(&hash) {
+                continue;
+            }
+            if self.img_cache.len() > 64 {
+                // 逐出最老的(hash map 无顺序,直接清一半)。
+                let keys: Vec<u64> = self.img_cache.keys().copied().take(32).collect();
+                for k in keys {
+                    self.img_cache.remove(&k);
+                }
+            }
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tay kitty image"),
+                size: wgpu::Extent3d {
+                    width: img.w,
+                    height: img.h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &img.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(img.w * 4),
+                    rows_per_image: Some(img.h),
+                },
+                wgpu::Extent3d {
+                    width: img.w,
+                    height: img.h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tay kitty image bind"),
+                layout: &self
+                    .img_pipeline
+                    .get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.locals_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.img_sampler),
+                    },
+                ],
+            });
+            let inst = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tay image inst"),
+                size: 16,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.img_cache.insert(hash, (texture, bind, img.w, img.h, inst));
+        }
     }
 
     /// 网格 → cosmic-text:每行按样式分段,(row 之间用 `\n` span 分行)。
@@ -727,11 +966,15 @@ impl Renderer {
                 pass.set_bind_group(0, &self.locals_bind, &[]);
                 pass.set_vertex_buffer(0, self.unit_quad.slice(..));
                 pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                pass.draw(0..4, 0..self.quads.len() as u32);
+                pass.draw(0..6, 0..self.quads.len() as u32);
             }
+            // 图像:z<=0 在文本之下。
+            self.draw_images(&mut pass, false);
             self.text
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| format!("文本渲染失败: {e}"))?;
+            // 图像:z>0 在文本之上。
+            self.draw_images(&mut pass, true);
         }
 
         // TAY_SHOT:渲染 N 帧后抓取当前帧并退出(capture 消耗 encoder)。
@@ -748,6 +991,25 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(texture);
         Ok(())
+    }
+
+    /// 画 kitty 图像(`above` = 文本之上)。
+    fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, above: bool) {
+        let rects: Vec<(u64, [f32; 4])> = self
+            .current_images
+            .iter()
+            .filter(|(_, _, z)| (*z > 0) == above)
+            .map(|(hash, rect, _)| (*hash, *rect))
+            .collect();
+        for (hash, rect) in rects {
+            let Some((_, bind, _, _, inst)) = self.img_cache.get(&hash) else { continue };
+            self.queue.write_buffer(inst, 0, bytemuck::cast_slice(&[rect]));
+            pass.set_pipeline(&self.img_pipeline);
+            pass.set_bind_group(0, bind, &[]);
+            pass.set_vertex_buffer(0, self.uv_quad.slice(..));
+            pass.set_vertex_buffer(1, inst.slice(..));
+            pass.draw(0..6, 0..1);
+        }
     }
 
     /// 把当前帧纹理读回并保存为 PNG(阻塞)。

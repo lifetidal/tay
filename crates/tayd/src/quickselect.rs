@@ -128,6 +128,7 @@ mod tests {
             preedit: None,
             badges: Vec::new(),
             overlays: Vec::new(),
+            images: Vec::new(),
         }
     }
 

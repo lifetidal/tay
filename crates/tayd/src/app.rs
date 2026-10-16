@@ -173,6 +173,8 @@ pub struct TayApp {
     folded: std::collections::BTreeSet<i32>,
     /// 显示行 → 网格行映射(-1 = 折叠标记行)。
     row_map: Vec<i32>,
+    /// kitty graphics 图像(网格行锚定,随滚动移动)。
+    images: Vec<KittyImageEntry>,
     /// 等待 set_size 后的 configure(避免 wgpu swapchain 二次重建)。
     sizing: bool,
     layer_h: i32,
@@ -200,6 +202,14 @@ pub struct TayApp {
 
 fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
+}
+
+/// kitty 图像条目(锚定在网格行)。
+struct KittyImageEntry {
+    id: u32,
+    grid_line: i32,
+    col: u32,
+    img: crate::kitty::KittyImage,
 }
 
 struct QuickState {
@@ -256,6 +266,7 @@ impl TayApp {
             vi_search: None,
             folded: Default::default(),
             row_map: Vec::new(),
+            images: Vec::new(),
             sizing: false,
             layer_h: 480,
             shown_once: false,
@@ -609,6 +620,34 @@ impl TayApp {
             })
             .collect();
 
+        // kitty 图像:网格行 → 显示行(折叠区间内隐藏)。
+        let (cw, ch) = self.renderer.as_ref().map(|r| r.cell_size()).unwrap_or((10.0, 20.0));
+        let images = self
+            .images
+            .iter()
+            .filter_map(|e| {
+                let _ = grid_line_to_row.get(&e.grid_line);
+                let row = *grid_line_to_row.get(&e.grid_line)?;
+                let cols = e.img.cols.unwrap_or((e.img.w as f32 / cw).ceil() as u32).max(1);
+                let rows = e.img.rows.unwrap_or((e.img.h as f32 / ch).ceil() as u32).max(1);
+                // 跨折叠区间 → 隐藏。
+                if ranges.iter().any(|(a, b)| e.grid_line + rows as i32 - 1 >= *a && e.grid_line <= *b) {
+                    return None;
+                }
+                Some(tay_render::RenderImage {
+                    id: e.id,
+                    row,
+                    col: e.col as usize,
+                    cols,
+                    rows,
+                    w: e.img.w,
+                    h: e.img.h,
+                    z: e.img.z,
+                    rgba: e.img.rgba.clone(),
+                })
+            })
+            .collect();
+
         // QuickSelect 覆盖层 + vi 搜索状态栏。
         let mut overlays: Vec<tay_render::Overlay> = self
             .quick
@@ -640,6 +679,21 @@ impl TayApp {
             preedit: self.preedit.clone(),
             badges,
             overlays,
+            images,
+        }
+    }
+
+    /// kitty graphics 图像事件:删除 / 放置。
+    fn handle_kitty_image(&mut self, img: crate::kitty::KittyImage, line: i32, col: u32) {
+        if img.delete {
+            self.images.retain(|e| e.id != img.id);
+            log::debug!("删除图像 #{}", img.id);
+            return;
+        }
+        self.images.retain(|e| e.id != img.id);
+        self.images.push(KittyImageEntry { id: img.id, grid_line: line, col, img });
+        if self.images.len() > 64 {
+            self.images.drain(..self.images.len() - 64);
         }
     }
 
@@ -1324,6 +1378,9 @@ impl Handler for TayApp {
                             if let Some(last) = self.blocks.last_mut() {
                                 last.1 = Some(code);
                             }
+                        },
+                        BlockEvent::Image { img, line, col } => {
+                            self.handle_kitty_image(img, line, col);
                         },
                     }
                 }
