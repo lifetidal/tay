@@ -1,0 +1,19 @@
+[package]
+name = "tayd"
+description = "Tay daemon:PTY + alacritty_terminal 内核 + 窗口/渲染接线"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tayd"
+path = "src/main.rs"
+
+[dependencies]
+tay-config.workspace = true
+tay-window.workspace = true
+tay-render.workspace = true
+alacritty_terminal.workspace = true
+arboard.workspace = true
+log.workspace = true
+env_logger.workspace = true

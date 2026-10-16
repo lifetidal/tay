@@ -1,0 +1,10 @@
+[package]
+name = "tay-window"
+description = "窗口层:winit 适配,自有事件类型,保留换轨 SCTK 的接口形状"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+winit.workspace = true
+log.workspace = true

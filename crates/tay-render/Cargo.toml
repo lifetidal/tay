@@ -1,0 +1,15 @@
+[package]
+name = "tay-render"
+description = "渲染管线:wgpu + glyphon + cosmic-text,终端网格绘制"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glyphon.workspace = true
+wgpu = "30"
+tay-config.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+image = { workspace = true, features = ["png"] }
+log.workspace = true
