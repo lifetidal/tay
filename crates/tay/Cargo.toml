@@ -1,0 +1,13 @@
+[package]
+name = "tay"
+description = "Tay CLI 薄客户端:tay toggle / show / hide / quit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tay"
+path = "src/main.rs"
+
+[dependencies]
+log.workspace = true

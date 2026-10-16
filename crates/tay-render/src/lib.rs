@@ -393,9 +393,13 @@ impl Renderer {
         self.shot.is_some()
     }
 
-    /// 表面尺寸变化(物理像素)。
+    /// 表面尺寸变化(物理像素)。尺寸未变时不动 swapchain
+    /// (wgpu configure 会销毁重建 swapchain,重复调用在 Mesa WSI 上会段错误)。
     pub fn resize(&mut self, width: u32, height: u32) {
         let (w, h) = (width.max(1), height.max(1));
+        if self.size == (w, h) {
+            return;
+        }
         self.size = (w, h);
         self.surface.configure(
             &self.device,

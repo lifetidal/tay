@@ -103,6 +103,14 @@ pub struct Config {
     pub padding: f32,
     /// 窗口不透明度 0.0–1.0,1.0 = 完全不透明(Wayland 模糊是增强项,见 DESIGN §6.4)。
     pub opacity: f32,
+    /// 呼出时终端高度占输出高度的百分比。
+    pub height_percent: u32,
+    /// 呼出/收起动画时长(ms),0 = 无动画。
+    pub animation_ms: u32,
+    /// 失焦自动隐藏(Wayland 上即 keyboard leave;见 DESIGN §6.3)。
+    pub hide_on_focus_out: bool,
+    /// daemon 启动时隐藏(M1 常驻模型)。
+    pub start_hidden: bool,
 }
 
 impl Default for Config {
@@ -113,6 +121,10 @@ impl Default for Config {
             shell: String::new(),
             padding: 3.0,
             opacity: 1.0,
+            height_percent: 45,
+            animation_ms: 150,
+            hide_on_focus_out: true,
+            start_hidden: true,
         }
     }
 }

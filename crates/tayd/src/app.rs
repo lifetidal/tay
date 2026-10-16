@@ -1,8 +1,9 @@
-//! TayApp:终端内核 + PTY + 窗口 + 渲染的接线。
+//! TayApp:终端内核 + PTY + 窗口 + 渲染 + 呼出状态机(M1)。
 //!
 //! 数据流:
 //! - 键盘/IME → `Msg::Input` → PTY → shell → 输出 → term 解析 → `Wakeup` → 重绘
-//! - `Listener`(PTY 线程)把终端事件经 mpsc + EventLoopProxy 送回 UI 线程
+//! - 呼出/收起 = layer margin 动画(DESIGN §8.1):GPU surface 常驻,零重建
+//! - 热键(portal)/ IPC(`tay toggle`)/ 失焦(keyboard leave)三者汇入同一状态机
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Instant;
@@ -21,9 +22,8 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape as ACursorShape, NamedCol
 
 use tay_config::{Config, Rgb};
 use tay_render::wgpu;
-use tay_window::raw_window_handle::HasWindowHandle;
 use tay_window::{
-    Ctx, Event as WEvent, EventLoopProxy, Handler, ImeEvent, KeyCode, MouseButtonIdx,
+    Ctx, Event as WEvent, Handler, ImeEvent, KeyKind, MouseButtonIdx,
 };
 
 /// xterm 标准 16 色(term 调色板为空时的默认)。
@@ -103,13 +103,13 @@ fn resolve(c: Color, colors: &TermColors, cfg: &Config) -> Rgb {
 #[derive(Clone)]
 struct Listener {
     tx: mpsc::Sender<Event>,
-    proxy: EventLoopProxy,
+    wake: mpsc::Sender<()>,
     sender: Arc<Mutex<Option<EventLoopSender>>>,
 }
 
 impl Listener {
-    fn new(tx: mpsc::Sender<Event>, proxy: EventLoopProxy) -> Self {
-        Self { tx, proxy, sender: Arc::new(Mutex::new(None)) }
+    fn new(tx: mpsc::Sender<Event>, wake: mpsc::Sender<()>) -> Self {
+        Self { tx, wake, sender: Arc::new(Mutex::new(None)) }
     }
 }
 
@@ -124,10 +124,18 @@ impl EventListener for Listener {
             },
             event => {
                 let _ = self.tx.send(event);
-                let _ = self.proxy.wake_up();
+                let _ = self.wake.send(());
             },
         }
     }
+}
+
+/// 呼出/收起状态机:layer margin 动画。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Vis {
+    Hidden,
+    Shown,
+    Animating { from: i32, to: i32, start: Instant, target: bool },
 }
 
 pub struct TayApp {
@@ -149,11 +157,31 @@ pub struct TayApp {
     dragging: bool,
     scroll_px: f32,
 
+    // —— M1:呼出状态 ——
+    vis: Vis,
+    /// 等待 set_size 后的 configure(避免 wgpu swapchain 二次重建)。
+    sizing: bool,
+    layer_h: i32,
+    shown_once: bool,
+    show_at: Option<Instant>,
+    ipc_listener: Option<std::os::unix::net::UnixListener>,
+    ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
+    ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
+    hotkey_tx: mpsc::Sender<crate::hotkey::HotkeyTriggered>,
+    hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
+    wake: mpsc::Sender<()>,
+    /// init 完成后启动的后台线程(PTY fork 之后才能起)。
+    threads_started: bool,
+
     frames: u32,
     bench_started: bool,
     bench_times: Vec<f32>,
     exec: Option<String>,
     exec_sent: bool,
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
 }
 
 impl TayApp {
@@ -162,6 +190,12 @@ impl TayApp {
         shot: Option<(String, u32)>,
         bench: Option<u32>,
         exec: Option<String>,
+        ipc_listener: Option<std::os::unix::net::UnixListener>,
+        ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
+        ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
+        hotkey_tx: mpsc::Sender<crate::hotkey::HotkeyTriggered>,
+        hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
+        wake: mpsc::Sender<()>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         Self {
@@ -179,6 +213,18 @@ impl TayApp {
             sel: None,
             dragging: false,
             scroll_px: 0.0,
+            vis: Vis::Hidden,
+            sizing: false,
+            layer_h: 480,
+            shown_once: false,
+            show_at: None,
+            ipc_listener,
+            ipc_tx,
+            ipc_rx,
+            hotkey_tx,
+            hotkey_rx,
+            wake,
+            threads_started: false,
             frames: 0,
             bench_started: false,
             bench_times: Vec::new(),
@@ -187,35 +233,99 @@ impl TayApp {
         }
     }
 
-    /// can_create_surfaces:建窗口 → GPU → 终端 → PTY 线程。
+    /// 呼出(margin 动画到 0)。
+    fn show(&mut self, ctx: &mut Ctx<'_>) {
+        if self.vis == Vis::Shown {
+            return;
+        }
+        let from = self.current_margin();
+        self.show_at = Some(Instant::now());
+        self.vis = Vis::Animating { from, to: 0, start: Instant::now(), target: true };
+        // 呼出即渲染首帧(内容可能已过时;同时完成热呼出延迟测量)。
+        ctx.request_redraw();
+    }
+
+    /// 收起(margin 动画到 -h)。
+    fn hide(&mut self, _ctx: &mut Ctx<'_>) {
+        if self.vis == Vis::Hidden {
+            return;
+        }
+        let from = self.current_margin();
+        self.vis = Vis::Animating { from, to: -self.layer_h, start: Instant::now(), target: false };
+    }
+
+    /// toggle:动画中则反向。
+    fn toggle(&mut self, ctx: &mut Ctx<'_>) {
+        match self.vis {
+            Vis::Hidden => self.show(ctx),
+            Vis::Shown => self.hide(ctx),
+            Vis::Animating { target, .. } => {
+                if target {
+                    self.hide(ctx);
+                } else {
+                    self.show(ctx);
+                }
+            },
+        }
+    }
+
+    fn current_margin(&self) -> i32 {
+        match self.vis {
+            Vis::Hidden => -self.layer_h,
+            Vis::Shown => 0,
+            // 动画中:近似取 from(下一步 tick 会重算)。
+            Vis::Animating { from, .. } => from,
+        }
+    }
+
+    /// 动画步进(AboutToWait 驱动,每 ~5ms 一 tick)。
+    fn step_animation(&mut self, ctx: &mut Ctx<'_>) {
+        let Vis::Animating { from, to, start, target } = self.vis else { return };
+        let ms = self.config.animation_ms.max(1) as f32;
+        let t = (start.elapsed().as_secs_f32() * 1000.0 / ms).clamp(0.0, 1.0);
+        let margin = from + ((to - from) as f32 * ease_out_cubic(t)).round() as i32;
+        if margin != self.current_margin() {
+            ctx.set_top_margin(margin);
+        }
+        if t >= 1.0 {
+            self.vis = if target { Vis::Shown } else { Vis::Hidden };
+        }
+    }
+
+    /// can_create_surfaces:建 GPU → 终端 → PTY 线程 → 定尺寸。
     fn init(&mut self, ctx: &mut Ctx<'_>) {
         let result = (|| -> Result<(), String> {
-            let window = ctx.window();
-            let wh = window
-                .window_handle()
-                .map_err(|e| format!("取窗口句柄失败: {e}"))?
-                .as_raw();
-            let dh = ctx
-                .display_handle()
-                .map_err(|e| format!("取显示句柄失败: {e}"))?
-                .as_raw();
+            // layer 高度 = 输出逻辑高度 × height_percent。
+            let (out_w, out_h) = ctx
+                .output_logical_size()
+                .unwrap_or((1920, 1080));
+            let h = (out_h * self.config.height_percent / 100).max(200);
+            self.layer_h = h as i32;
+            log::info!("layer 高度 {h}px(输出 {out_w}×{out_h})");
+            ctx.set_size(0, h);
 
+            let (disp_ptr, surf_ptr) = ctx.raw_wayland().ok_or("取 Wayland 句柄失败")?;
             let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
             instance_desc.backends = wgpu::Backends::PRIMARY | wgpu::Backends::GL;
             let instance = wgpu::Instance::new(instance_desc);
+            let raw_display =
+                wgpu::rwh::RawDisplayHandle::Wayland(wgpu::rwh::WaylandDisplayHandle::new(
+                    std::ptr::NonNull::new(disp_ptr as *mut _).expect("display 指针非空"),
+                ));
+            let raw_window =
+                wgpu::rwh::RawWindowHandle::Wayland(wgpu::rwh::WaylandWindowHandle::new(
+                    std::ptr::NonNull::new(surf_ptr as *mut _).expect("surface 指针非空"),
+                ));
             let surface = unsafe {
                 instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(dh),
-                    raw_window_handle: wh,
+                    raw_display_handle: Some(raw_display),
+                    raw_window_handle: raw_window,
                 })
             }
             .map_err(|e| format!("创建 surface 失败: {e}"))?;
 
             let size = ctx.surface_size();
-            let shot = self
-                .shot
-                .as_ref()
-                .map(|(p, n)| (p.as_str(), *n));
+            let shot = self.shot.as_ref().map(|(p, n)| (p.as_str(), *n));
             let renderer = tay_render::Renderer::new(
                 &instance,
                 surface,
@@ -234,7 +344,7 @@ impl TayApp {
             self.instance = Some(instance);
 
             // 终端 + PTY 事件循环线程。
-            let listener = Listener::new(self.tx.clone(), ctx.create_proxy());
+            let listener = Listener::new(self.tx.clone(), self.wake.clone());
             let term_config = TermConfig { scrolling_history: 10_000, ..Default::default() };
             let term = Arc::new(FairMutex::new(Term::new(
                 term_config,
@@ -262,7 +372,17 @@ impl TayApp {
             self.term = Some(term);
 
             self.set_ime_area(ctx, (0, 0));
+            // 初始 margin 对齐(WindowState 建面时用 -2000 占位防闪屏)。
+            ctx.set_top_margin(-self.layer_h);
             ctx.request_redraw();
+
+            // PTY 已 fork:现在才允许起多线程(IPC accept / portal)。
+            if let Some(listener) = self.ipc_listener.take() {
+                crate::ipc::accept_loop(listener, self.ipc_tx.clone(), self.wake.clone());
+            }
+            crate::hotkey::spawn(self.hotkey_tx.clone(), self.wake.clone());
+            self.threads_started = true;
+
             Ok(())
         })();
         if let Err(e) = result {
@@ -388,11 +508,15 @@ impl TayApp {
     }
 
     fn render(&mut self, ctx: &mut Ctx<'_>) {
-        if self.frames < 5 || self.frames % 30 == 0 {
-        }
         let t0 = Instant::now();
         let Some(_) = self.renderer.as_ref() else { return };
         self.frames += 1;
+
+        // 热呼出延迟:呼出指令 → 首帧。
+        if let Some(at) = self.show_at.take() {
+            self.shown_once = true;
+            log::info!("热呼出 {}ms", at.elapsed().as_millis());
+        }
 
         // TAY_EXEC:第 10 帧执行命令(等 shell 就绪)。
         if !self.exec_sent && self.frames >= 10 {
@@ -477,10 +601,34 @@ impl TayApp {
 impl Handler for TayApp {
     fn on_event(&mut self, ctx: &mut Ctx<'_>, event: WEvent) {
         match event {
-            WEvent::CanCreateSurfaces => self.init(ctx),
+            WEvent::CanCreateSurfaces => {
+                // 第一 configure 后:按输出高度重设 layer 尺寸,
+                // 等待 Resized 确认后一次性初始化渲染器(只 configure 一次,
+                // 规避 Mesa WSI 二次 swapchain 重建的段错误)。
+                if self.sender.is_none() {
+                    let (_, out_h) = ctx.output_logical_size().unwrap_or((1920, 1080));
+                    let h = (out_h * self.config.height_percent / 100).max(200);
+                    self.layer_h = h as i32;
+                    log::info!("layer 高度 {h}px(输出 {out_h}px 高)");
+                    ctx.set_size(0, h);
+                    self.sizing = true;
+                }
+            },
 
             WEvent::Resized { width, height } => {
+                if self.sizing && height as i32 >= self.layer_h - 1 && height as i32 <= self.layer_h + 1 {
+                    self.sizing = false;
+                    self.init(ctx);
+                    // M1 常驻模型:默认收起;TAY_START_VISIBLE / 配置可让启动即呼出。
+                    if !self.config.start_hidden {
+                        self.show(ctx);
+                    }
+                    return;
+                }
                 if let Some(r) = &mut self.renderer {
+                    if r.surface_size() == (width, height) {
+                        return;
+                    }
                     r.resize(width, height);
                     let (cw, ch) = r.cell_size();
                     let pad = self.config.padding;
@@ -505,18 +653,25 @@ impl Handler for TayApp {
                 ctx.request_redraw();
             },
 
+            WEvent::Focused(focused) => {
+                // 失焦自动隐藏(DESIGN §6.3:Wayland 上即 keyboard leave)。
+                if !focused && self.config.hide_on_focus_out && self.vis != Vis::Hidden {
+                    self.hide(ctx);
+                }
+            },
+
             WEvent::Keyboard { key, pressed, mods } => {
                 if !pressed {
                     return;
                 }
-                // 剪贴板快捷键(物理键位匹配,布局无关)。
+                // 剪贴板快捷键:Ctrl+Shift+C/V(keysym 是字符)。
                 if mods.ctrl && mods.shift {
-                    match key.physical {
-                        KeyCode::KeyC => {
+                    match key.key {
+                        KeyKind::Char('c') | KeyKind::Char('C') => {
                             self.copy_selection();
                             return;
                         },
-                        KeyCode::KeyV => {
+                        KeyKind::Char('v') | KeyKind::Char('V') => {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 if let Ok(text) = cb.get_text() {
                                     if let Some(sender) = &self.sender {
@@ -612,12 +767,13 @@ impl Handler for TayApp {
             WEvent::RedrawRequested => {
                 self.render(ctx);
             },
+
             WEvent::ProxyWake => {
+                // 终端事件。
                 while let Ok(ev) = self.rx.try_recv() {
                     match ev {
                         Event::Wakeup => ctx.request_redraw(),
-                        Event::Title(t) => ctx.set_title(&format!("tay — {t}")),
-                        Event::ResetTitle => ctx.set_title("tay"),
+                        Event::Title(t) => log::debug!("标题: {t}"),
                         Event::ClipboardStore(_, text) => {
                             if let Ok(mut cb) = arboard::Clipboard::new() {
                                 let _ = cb.set_text(text);
@@ -630,12 +786,30 @@ impl Handler for TayApp {
                         _ => {},
                     }
                 }
+                // IPC 命令(`tay toggle` 等)。
+                while let Ok(cmd) = self.ipc_rx.try_recv() {
+                    match cmd {
+                        crate::ipc::IpcCommand::Toggle => self.toggle(ctx),
+                        crate::ipc::IpcCommand::Show => self.show(ctx),
+                        crate::ipc::IpcCommand::Hide => self.hide(ctx),
+                        crate::ipc::IpcCommand::Quit => {
+                            log::info!("收到 quit");
+                            ctx.exit();
+                        },
+                    }
+                }
+                // portal 热键。
+                while self.hotkey_rx.try_recv().is_ok() {
+                    self.toggle(ctx);
+                }
             },
 
             WEvent::CloseRequested => ctx.exit(),
 
             WEvent::AboutToWait => {
-                // 截图/基准模式:事件循环自身驱动连续帧(Wayland 帧回调不可靠)。
+                // 呼出/收起动画步进。
+                self.step_animation(ctx);
+                // 截图/基准模式:事件循环自身驱动连续帧。
                 let continuous = self.renderer.as_ref().is_some_and(|r| r.shot_pending())
                     || self.bench.is_some_and(|n| (self.bench_times.len() as u32) < n);
                 if continuous {

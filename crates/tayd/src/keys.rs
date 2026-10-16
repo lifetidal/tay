@@ -3,7 +3,7 @@
 //! alacritty_terminal 0.26 起键盘绑定由前端负责:这里实现 xterm 风格的
 //! 常用键位(fish/bash 日常使用的子集),kitty 协议等 P1 项见 DESIGN §7。
 
-use tay_window::{Key, KeyPress, Mods, NamedKey};
+use tay_window::{KeyKind, KeyPress, Mods, NamedKey};
 
 /// 修饰键的 CSI 参数值:1 + shift=1 + alt=2 + ctrl=4。
 fn mods_param(mods: Mods) -> u8 {
@@ -66,13 +66,39 @@ fn ctrl_byte(c: u8) -> u8 {
     }
 }
 
+fn translate_named(n: NamedKey, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
+    let v = match n {
+        NamedKey::Enter => b"\r".to_vec(),
+        NamedKey::Backspace => vec![0x7f],
+        NamedKey::Tab => vec![b'\t'],
+        NamedKey::Escape => vec![0x1b],
+        NamedKey::Delete => csi_tilde(mods, 3),
+        NamedKey::Insert => csi_tilde(mods, 2),
+        NamedKey::ArrowUp => ss3_or_csi(b'A', app_cursor, mods),
+        NamedKey::ArrowDown => ss3_or_csi(b'B', app_cursor, mods),
+        NamedKey::ArrowRight => ss3_or_csi(b'C', app_cursor, mods),
+        NamedKey::ArrowLeft => ss3_or_csi(b'D', app_cursor, mods),
+        NamedKey::Home => ss3_or_csi(b'H', app_cursor, mods),
+        NamedKey::End => ss3_or_csi(b'F', app_cursor, mods),
+        NamedKey::PageUp => csi_tilde(mods, 5),
+        NamedKey::PageDown => csi_tilde(mods, 6),
+        NamedKey::F(f) => return Some(fkey_seq(f, mods)),
+    };
+    Some(v)
+}
+
 /// 翻译按键。`None` 表示该键已由调用方特殊处理(剪贴板等)。
 pub fn translate(k: &KeyPress, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
     let ctrl = mods.ctrl;
     let alt = mods.alt;
     let text = k.text.as_deref();
 
-    let is_named_escape = |n: &NamedKey| {
+    // F 键(不受 ctrl 影响之前先处理)。
+    if let KeyKind::Named(NamedKey::F(f)) = k.key {
+        return Some(fkey_seq(f, mods));
+    }
+
+    let is_named_escape = |n: NamedKey| {
         matches!(
             n,
             NamedKey::Enter
@@ -92,36 +118,15 @@ pub fn translate(k: &KeyPress, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> 
         )
     };
 
-    // F 键。
-    if let Key::Named(n) = &k.logical {
-        let f = match n {
-            NamedKey::F1 => Some(1),
-            NamedKey::F2 => Some(2),
-            NamedKey::F3 => Some(3),
-            NamedKey::F4 => Some(4),
-            NamedKey::F5 => Some(5),
-            NamedKey::F6 => Some(6),
-            NamedKey::F7 => Some(7),
-            NamedKey::F8 => Some(8),
-            NamedKey::F9 => Some(9),
-            NamedKey::F10 => Some(10),
-            NamedKey::F11 => Some(11),
-            NamedKey::F12 => Some(12),
-            _ => None,
-        };
-        if let Some(f) = f {
-            return Some(fkey_seq(f, mods));
-        }
-    }
-
     // Alt+常规键:xterm 的 ESC 前缀(fish 的 alt 绑定依赖)。
     if alt && !ctrl {
-        let base = match &k.logical {
-            Key::Named(n) if is_named_escape(n) => match translate_named(n, mods, app_cursor) {
-                Some(v) => v,
-                None => return None,
+        let base = match k.key {
+            KeyKind::Named(n) if is_named_escape(n) => translate_named(n, mods, app_cursor)?,
+            KeyKind::Char(c) => {
+                let t = text.map(|t| t.as_bytes().to_vec()).unwrap_or_else(|| c.to_string().into_bytes());
+                t
             },
-            _ => text.map(|t| t.as_bytes().to_vec())?,
+            KeyKind::Named(n) => return translate_named(n, mods, app_cursor),
         };
         let mut v = vec![0x1b];
         v.extend_from_slice(&base);
@@ -130,83 +135,57 @@ pub fn translate(k: &KeyPress, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> 
 
     // Ctrl+字符 → 控制字节。
     if ctrl && !alt {
-        if let Some(t) = text {
-            if let Some(&b) = t.as_bytes().first() {
-                if b.is_ascii() {
-                    return Some(vec![ctrl_byte(b)]);
-                }
+        let c = match k.key {
+            KeyKind::Char(c) => Some(c),
+            _ => text.and_then(|t| t.chars().next()),
+        };
+        if let Some(c) = c {
+            if c.is_ascii() {
+                return Some(vec![ctrl_byte(c as u8)]);
             }
         }
-        // 布局未给出 text 时,用逻辑键兜底。
-        if let Key::Character(s) = &k.logical {
-            if let Some(&b) = s.as_bytes().first() {
-                if b.is_ascii() {
-                    return Some(vec![ctrl_byte(b)]);
-                }
-            }
-        }
-        if matches!(k.logical, Key::Named(NamedKey::Enter)) {
+        if matches!(k.key, KeyKind::Named(NamedKey::Enter)) {
             return Some(vec![b'\n']);
         }
         return None;
     }
 
-    match &k.logical {
-        Key::Named(n) => translate_named(n, mods, app_cursor),
-        _ => text.map(|t| t.as_bytes().to_vec()),
+    match k.key {
+        KeyKind::Named(n) => translate_named(n, mods, app_cursor),
+        KeyKind::Char(c) => text.map(|t| t.as_bytes().to_vec()).or_else(|| Some(c.to_string().into_bytes())),
     }
-}
-
-fn translate_named(n: &NamedKey, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
-    let v = match n {
-        NamedKey::Enter => b"\r".to_vec(),
-        NamedKey::Backspace => vec![0x7f],
-        NamedKey::Tab => vec![b'\t'],
-        NamedKey::Escape => vec![0x1b],
-        NamedKey::Delete => csi_tilde(mods, 3),
-        NamedKey::Insert => csi_tilde(mods, 2),
-        NamedKey::ArrowUp => ss3_or_csi(b'A', app_cursor, mods),
-        NamedKey::ArrowDown => ss3_or_csi(b'B', app_cursor, mods),
-        NamedKey::ArrowRight => ss3_or_csi(b'C', app_cursor, mods),
-        NamedKey::ArrowLeft => ss3_or_csi(b'D', app_cursor, mods),
-        NamedKey::Home => ss3_or_csi(b'H', app_cursor, mods),
-        NamedKey::End => ss3_or_csi(b'F', app_cursor, mods),
-        NamedKey::PageUp => csi_tilde(mods, 5),
-        NamedKey::PageDown => csi_tilde(mods, 6),
-        _ => return None,
-    };
-    Some(v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tay_window::KeyCode;
 
-    fn press(logical: Key, text: Option<&str>, mods: Mods) -> KeyPress {
-        KeyPress {
-            physical: KeyCode::KeyA,
-            logical,
-            text: text.map(|s| s.to_string()),
-            repeat: false,
-        }
+    fn press(key: KeyKind, text: Option<&str>) -> KeyPress {
+        KeyPress { key, text: text.map(|s| s.to_string()), repeat: false }
+    }
+
+    fn char_key(c: char) -> KeyKind {
+        KeyKind::Char(c)
     }
 
     #[test]
     fn plain_text() {
-        let k = press(Key::Character("a".into()), Some("a"), Mods::default());
+        let k = press(char_key('a'), Some("a"));
         assert_eq!(translate(&k, Mods::default(), false), Some(b"a".to_vec()));
     }
 
     #[test]
     fn ctrl_c() {
-        let k = press(Key::Character("c".into()), Some("c"), Mods::default());
-        assert_eq!(translate(&k, Mods { ctrl: true, ..Default::default() }, false), Some(vec![3]));
+        let k = press(char_key('c'), Some("c"));
+        assert_eq!(
+            translate(&k, Mods { ctrl: true, ..Default::default() }, false),
+            Some(vec![3])
+        );
     }
 
     #[test]
     fn arrows() {
-        let up = press(Key::Named(NamedKey::ArrowUp), None, Mods::default());
+        let up = press(KeyKind::Named(NamedKey::ArrowUp), None);
         assert_eq!(translate(&up, Mods::default(), false), Some(b"\x1b[A".to_vec()));
         assert_eq!(translate(&up, Mods::default(), true), Some(b"\x1bOA".to_vec()));
         let shift_up = translate(&up, Mods { shift: true, ..Default::default() }, false);
@@ -215,18 +194,27 @@ mod tests {
 
     #[test]
     fn f_keys() {
-        let f1 = press(Key::Named(NamedKey::F1), None, Mods::default());
+        let f1 = press(KeyKind::Named(NamedKey::F(1)), None);
         assert_eq!(translate(&f1, Mods::default(), false), Some(b"\x1bOP".to_vec()));
-        let f5 = press(Key::Named(NamedKey::F5), None, Mods::default());
+        let f5 = press(KeyKind::Named(NamedKey::F(5)), None);
         assert_eq!(translate(&f5, Mods::default(), false), Some(b"\x1b[15~".to_vec()));
     }
 
     #[test]
     fn alt_prefix() {
-        let k = press(Key::Character("b".into()), Some("b"), Mods::default());
+        let k = press(char_key('b'), Some("b"));
         assert_eq!(
             translate(&k, Mods { alt: true, ..Default::default() }, false),
             Some(b"\x1bb".to_vec())
+        );
+    }
+
+    #[test]
+    fn delete_with_mods() {
+        let del = press(KeyKind::Named(NamedKey::Delete), None);
+        assert_eq!(
+            translate(&del, Mods { shift: true, ..Default::default() }, false),
+            Some(b"\x1b[3;2~".to_vec())
         );
     }
 }

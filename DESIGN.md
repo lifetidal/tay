@@ -1,6 +1,6 @@
 # Tay — Linux 一键呼出终端 · 设计蓝图
 
-> 版本 v0.3 · 2026-10-16 · 状态:M0 已完成(见 §9 与 docs/m0-impl-notes.md)
+> 版本 v0.4 · 2026-10-16 · 状态:M0/M1 已完成(见 §9;实施笔记 docs/m0-impl-notes.md、docs/m1-impl-notes.md)
 > 竞品与协议事实均核实至 2026-10,依据见文末「参考资料」。
 
 ---
@@ -204,7 +204,7 @@ Wayland 上「全局热键」和「窗口定位」都没有统一答案,必须�
 | 里程碑 | 目标 | 验收 |
 |---|---|---|
 | **M0 内核就绪** ✅ | alacritty_terminal + winit + wgpu/glyphon 渲染出可用终端 | fish 全功能、CJK 输入、连字、150fps 滚动 —— **实测 avg 0.75ms/帧 ≈ 1339fps**(2026-10-16,KDE Wayland + AMD) |
-| **M1 下拉成形(X11)** | daemon 化 + 隐藏窗口 + XGrabKey + 动画 | 热呼出 < 50ms、失焦隐藏、多显示器 |
+| **M1 下拉成形(Wayland 独占)** ✅ | SCTK + wlr-layer-shell 手写窗口层(替换 winit)、daemon/IPC/CLI、portal 热键、margin 动画、失焦隐藏 | **热呼出 16ms/1ms**(验收 <50ms);`tay toggle` 全链路;滚动 1123fps 无退化 —— 2026-10-16 实测。X11 路线暂缓(用户决策),winit 版保留于 git 历史 |
 | **M2 Wayland 覆盖** | layer-shell(wlroots/KDE)+ GlobalShortcuts portal + GNOME 扩展伴侣 | 在 sway、Hyprland、KDE、GNOME 上全部一键呼出 |
 | **M3 体验差异化** | OSC 133 命令块、QuickSelect、搜索/复制模式、主题热重载 | fish 零配置命令块;竞品对标清单逐项打勾 |
 | **M4 生态** | 图像协议、打包(Flathub/AUR/nixpkgs/COPR)、配置文件向导 | Flatpak 沙箱下 portal 全链路可用 |
@@ -247,7 +247,7 @@ tay/
 | 许可证 | **GPL-3.0**(与 cosmic-term 同款;alacritty_terminal 为 Apache-2.0,组合已证实可行) |
 | 命名 | **Tay** |
 
-**待真机调校**:失焦隐藏默认值(Linux 上 Ghostty 默认关闭、Warp 缺失——需按合成器实测后再定默认开/关)。
+**待真机调校**:失焦隐藏默认值(Wayland 上已按 keyboard leave 实现,默认开,待交互实测)。
 
 ---
 

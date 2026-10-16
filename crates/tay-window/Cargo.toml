@@ -1,10 +1,14 @@
 [package]
 name = "tay-window"
-description = "窗口层:winit 适配,自有事件类型,保留换轨 SCTK 的接口形状"
+description = "窗口层:SCTK + wlr-layer-shell 手写 Wayland 后端"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-winit.workspace = true
+wayland-client.workspace = true
+sctk.workspace = true
+wayland-protocols-wlr.workspace = true
+wayland-protocols.workspace = true
 log.workspace = true
+libc = "0.2"
