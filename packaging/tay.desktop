@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tay
+GenericName=下拉终端
+Comment=一键呼出 / 隐藏 Tay 终端
+Exec=tay toggle
+Icon=utilities-terminal
+Terminal=false
+Categories=System;Utility;TerminalEmulator;
+Keywords=terminal;quake;dropdown;

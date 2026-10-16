@@ -36,5 +36,17 @@ M4 = 生态(§9):图像协议、打包、配置向导。
   acquire/present 会永久阻塞(主线程卡在渲染)。解锁后自愈。
   layer-shell 无遮挡信号,根治需 M4+ 的 occlusion 探测或超时
   watchdog。验证视觉输出时请保持会话未锁定。
+## 已完成:打包初版
+
+- packaging/:AUR PKGBUILD(tay-git,git source,cargo release)+
+  systemd user 单元(graphical-session.target,Restart=on-failure,
+  DESIGN §4.3 的登录自启)+ tay.desktop + 安装说明
+- LICENSE(GPL-3.0,SPDX 全文)—— 补齐仓库缺失
+- 验证:PKGBUILD bash -n ✓、desktop-file-validate ✓、
+  systemd-analyze verify ✓(仅缺已安装的 tayd 二进制)
+
+## 遗留
+
 - 图像放置的 c/r 小数偏移、x/y 像素偏移、z 更精细分层
-- 打包(Flathub/AUR/nixpkgs/COPR)与配置向导
+- Flatpak manifest(portal 全链路沙箱验证,M4 验收项)、nixpkgs/COPR
+- 配置向导

@@ -1,0 +1,36 @@
+# Maintainer: tay-term <tay@example.com>
+# 注意:仓库公开后把 source 换成实际 git 地址。
+
+pkgname=tay-git
+pkgver=r9.a6feccc
+pkgrel=1
+pkgdesc="Tay — Linux 一键呼出下拉终端(Rust 原生,Wayland layer-shell)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/tay-term/tay"
+license=('GPL3')
+depends=('wayland' 'libxkbcommon' 'vulkan-icd-loader' 'fontconfig')
+makedepends=('cargo' 'git')
+provides=('tay')
+conflicts=('tay')
+source=("git+$url")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$srcdir/tay"
+    printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+    cd "$srcdir/tay"
+    cargo build --release --locked
+}
+
+package() {
+    cd "$srcdir/tay"
+    install -Dm755 target/release/tayd "$pkgdir/usr/bin/tayd"
+    install -Dm755 target/release/tay "$pkgdir/usr/bin/tay"
+    install -Dm644 packaging/tay.desktop "$pkgdir/usr/share/applications/tay.desktop"
+    install -Dm644 packaging/tayd.service "$pkgdir/usr/lib/systemd/user/tayd.service"
+    install -Dm644 DESIGN.md "$pkgdir/usr/share/doc/tay/DESIGN.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/tay/LICENSE"
+}
