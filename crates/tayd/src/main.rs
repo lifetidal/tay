@@ -93,6 +93,11 @@ fn main() {
         })
         .ok();
 
+    let output = if config.output.is_empty() {
+        None
+    } else {
+        Some(config.output.clone())
+    };
     let app = app::TayApp::new(
         config,
         shot,
@@ -108,7 +113,7 @@ fn main() {
         hotkey_rx,
         wake_tx.clone(),
     );
-    if let Err(e) = tay_window::run("tay", app, (wake_tx, wake_rx)) {
+    if let Err(e) = tay_window::run("tay", app, (wake_tx, wake_rx), output.as_deref()) {
         log::error!("事件循环退出: {e}");
     }
 }

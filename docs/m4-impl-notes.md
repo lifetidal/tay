@@ -39,12 +39,15 @@ M4 = 生态(§9):图像协议、打包、配置向导。
   此前重复包装产生嵌套畸形序列(解码成黑色)
 - 实测:sixel 红方块 4640px + 渐变 8603px 并存,位置正确错开
 
-## 已知问题与遗留
+## 已完成:occlusion watchdog + 多显示器 output 配置
 
-- **锁屏时渲染阻塞**:KWin 锁屏后不再发帧回调,Mesa WSI 的
-  acquire/present 会永久阻塞(主线程卡在渲染)。解锁后自愈。
-  layer-shell 无遮挡信号,根治需 M4+ 的 occlusion 探测或超时
-  watchdog。验证视觉输出时请保持会话未锁定。
+- **occlusion watchdog**:帧回调 2s 中断判定为合成器遮挡/锁屏,
+  暂停渲染请求(丢弃滞留请求防帧风暴);事件循环继续运转
+  (IPC/热键/动画不受影响);回调恢复后自愈。根治了此前
+  「锁屏 → Mesa WSI acquire 永久阻塞主线程」的问题
+- **多显示器 output 配置**:config.output(显示器名),layer surface
+  绑定指定输出;名字无效时告警并退回合成器默认。实测通过。
+  (多屏实机验证待有第二显示器时进行)
 ## 已完成:打包初版
 
 - packaging/:AUR PKGBUILD(tay-git,git source,cargo release)+
@@ -57,5 +60,5 @@ M4 = 生态(§9):图像协议、打包、配置向导。
 ## 遗留
 
 - 图像放置的 c/r 小数偏移、x/y 像素偏移、z 更精细分层
-- Flatpak manifest(portal 全链路沙箱验证,M4 验收项)、nixpkgs/COPR
-- 配置向导
+- Flatpak 沙箱全链路实测(M4 验收项)、nixpkgs/COPR
+- 配置向导、GNOME 扩展伴侣(M2 遗留)

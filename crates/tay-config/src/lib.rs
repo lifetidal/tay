@@ -111,6 +111,8 @@ pub struct Config {
     pub hide_on_focus_out: bool,
     /// daemon 启动时隐藏(M1 常驻模型)。
     pub start_hidden: bool,
+    /// 呼出所在的输出(显示器名,如 "DP-1";空 = 合成器默认)。
+    pub output: String,
 }
 
 impl Default for Config {
@@ -125,6 +127,7 @@ impl Default for Config {
             animation_ms: 150,
             hide_on_focus_out: true,
             start_hidden: true,
+            output: String::new(),
         }
     }
 }

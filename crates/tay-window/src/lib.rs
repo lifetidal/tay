@@ -157,14 +157,18 @@ impl Ctx<'_> {
     /// 顶层 margin(px):负数 = 移出屏幕上沿(收起),0 = 呼出。
     /// 呼出/收起动画由 tayd 按帧驱动此值。
     pub fn set_top_margin(&mut self, margin: i32) {
-        self.state.layer.set_margin(margin, 0, 0, 0);
-        self.state.layer.commit();
+        if let Some(layer) = &self.state.layer {
+            layer.set_margin(margin, 0, 0, 0);
+            layer.commit();
+        }
     }
 
     /// 设置 layer 表面尺寸(width 0 = 由合成器定,锚定左右时即全宽)。
     pub fn set_size(&mut self, width: u32, height: u32) {
-        self.state.layer.set_size(width, height);
-        self.state.layer.commit();
+        if let Some(layer) = &self.state.layer {
+            layer.set_size(width, height);
+            layer.commit();
+        }
     }
 
     /// 当前输出的逻辑尺寸(xdg-output;多显示器时为首个输出)。
@@ -177,7 +181,9 @@ impl Ctx<'_> {
     }
 
     pub fn commit(&mut self) {
-        self.state.layer.commit();
+        if let Some(layer) = &self.state.layer {
+            layer.commit();
+        }
     }
 
     /// 事件循环等待模式:Poll = 不等待(pending 事件为空的轮次立即返回)。
@@ -215,12 +221,13 @@ pub fn run(
     title: &str,
     handler: impl Handler,
     wake: (Sender<()>, Receiver<()>),
+    output_name: Option<&str>,
 ) -> Result<(), String> {
     log::info!("窗口层:SCTK + wlr-layer-shell({title})");
     // state 必须晚于 handler 析构:wgpu surface/swapchain 销毁时
     // wl_surface 仍需存活(Mesa WSI 会在 vkDestroySwapchain 里 marshal 它)。
     // 局部变量按声明逆序析构:handler 先、state 后 ✓
-    let (mut event_queue, mut state) = WindowState::new(wake)?;
+    let (mut event_queue, mut state) = WindowState::new(wake, output_name)?;
     let mut handler = handler;
     state.main_loop(&mut handler, &mut event_queue)
 }
@@ -237,7 +244,7 @@ struct WindowState {
     #[allow(dead_code)]
     compositor: CompositorState,
     surface: wl_surface::WlSurface,
-    layer: LayerSurface,
+    layer: Option<LayerSurface>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     text_input: Option<ZwpTextInputV3>,
@@ -252,6 +259,8 @@ struct WindowState {
     redraw_requested: bool,
     /// arm_frame 时间:帧回调迟迟不来(表面从未呈现过)时兜底派发。
     frame_armed_at: Option<Instant>,
+    /// 合成器疑似遮挡/锁屏(帧回调长时间中断):暂停渲染请求。
+    stalled: bool,
     poll: bool,
     mods: Mods,
     exit: bool,
@@ -262,7 +271,10 @@ struct WindowState {
 }
 
 impl WindowState {
-    fn new(wake: (Sender<()>, Receiver<()>)) -> Result<(wayland_client::EventQueue<Self>, Self), String> {
+    fn new(
+        wake: (Sender<()>, Receiver<()>),
+        output_name: Option<&str>,
+    ) -> Result<(wayland_client::EventQueue<Self>, Self), String> {
         let conn = Connection::connect_to_env().map_err(|e| format!("连接 Wayland 失败: {e}"))?;
         let (globals, mut event_queue) =
             registry_queue_init(&conn).map_err(|e| format!("注册表初始化失败: {e}"))?;
@@ -273,25 +285,13 @@ impl WindowState {
         let layer_shell =
             LayerShell::bind(&globals, &qh).map_err(|_| "合成器不支持 wlr-layer-shell")?;
 
-        // 表面与 layer 角色(TOP 锚定,初始负 margin 保证不闪屏)。
+        // 表面(角色延后到 roundtrip 选好输出后)。
         let surface = compositor.create_surface(&qh);
-        let layer = layer_shell.create_layer_surface(
-            &qh,
-            surface.clone(),
-            Layer::Top,
-            Some("tay"),
-            None,
-        );
-        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-        layer.set_exclusive_zone(0);
-        layer.set_size(0, 480);
-        layer.set_margin(-2000, 0, 0, 0);
-        layer.commit();
 
         let registry_state = RegistryState::new(&globals);
         let seat_state = SeatState::new(&globals, &qh);
         let output_state = OutputState::new(&globals, &qh);
+        let qh2 = qh.clone();
         let mut state = Self {
             conn,
             qh,
@@ -300,7 +300,7 @@ impl WindowState {
             output_state,
             compositor,
             surface,
-            layer,
+            layer: None,
             keyboard: None,
             pointer: None,
             text_input: None,
@@ -313,16 +313,47 @@ impl WindowState {
             frame_pending: false,
             redraw_requested: false,
             frame_armed_at: None,
+            stalled: false,
             poll: false,
             mods: Mods::default(),
             exit: false,
             wake_tx: wake.0,
             wake_rx: wake.1,
         };
-        // 等初始 configure(拿到真实宽度)与 seat/输出信息。
+        // 等 registry 事件(seat/输出信息)。
         if let Err(e) = event_queue.roundtrip(&mut state) {
             log::error!("初始 roundtrip 失败: {e}");
         }
+        // 选输出:配置名 → 首个有信息的输出 → None(合成器默认)。
+        let chosen_output = state
+            .output_state
+            .outputs()
+            .find(|o| {
+                state.output_state.info(o).is_some_and(|i| {
+                    output_name.map_or(true, |n| i.name.as_deref() == Some(n))
+                })
+            });
+        if let Some(name) = output_name {
+            if chosen_output.is_none() {
+                log::warn!("配置的输出 {name} 未找到,使用合成器默认");
+            }
+        }
+        // layer 角色(TOP 锚定,初始负 margin 保证不闪屏)。
+        let layer = layer_shell.create_layer_surface(
+            &qh2,
+            state.surface.clone(),
+            Layer::Top,
+            Some("tay"),
+            chosen_output.as_ref(),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.set_exclusive_zone(0);
+        layer.set_size(0, 480);
+        layer.set_margin(-2000, 0, 0, 0);
+        layer.commit();
+        state.layer = Some(layer);
+
         Ok((event_queue, state))
     }
 
@@ -359,13 +390,28 @@ impl WindowState {
                 .map_err(|e| format!("事件分发失败: {e}"))?;
             self.drain_pending(handler);
 
+            // 遮挡检测:帧回调 2s 中断 = 合成器疑似锁屏/遮挡。
+            // 此时 acquire/present 会永久阻塞(Mesa WSI),暂停渲染,
+            // 事件循环继续运转(IPC/热键/动画仍可用);回调恢复后自愈。
+            if !self.stalled
+                && self.frame_pending
+                && self
+                    .frame_armed_at
+                    .is_some_and(|t| t.elapsed() > Duration::from_secs(2))
+            {
+                log::warn!("合成器 2s 无帧回调(锁屏/遮挡?),暂停渲染");
+                self.stalled = true;
+            }
             // 帧回调后且请求了重绘 → 投递;回调超时(50ms)兜底:
             // 表面从未呈现过时合成器不会发帧回调,不能死等。
             let stale = self.frame_armed_at.is_some_and(|t| t.elapsed() > Duration::from_millis(50));
-            if self.redraw_requested && (!self.frame_pending || stale) {
+            if self.redraw_requested && (!self.frame_pending || stale) && !self.stalled {
                 self.redraw_requested = false;
                 self.frame_armed_at = None;
                 self.emit(handler, Event::RedrawRequested);
+            } else if self.stalled {
+                // 滞留请求丢弃,恢复后由 PTY 输出/操作重新触发。
+                self.redraw_requested = false;
             }
 
             // 跨线程唤醒。
@@ -446,6 +492,10 @@ impl CompositorHandler for WindowState {
     ) {
         self.frame_pending = false;
         self.frame_armed_at = None;
+        if self.stalled {
+            log::info!("合成器帧回调恢复,渲染重启");
+            self.stalled = false;
+        }
     }
 
     fn surface_enter(
