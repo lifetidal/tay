@@ -156,12 +156,141 @@ pub fn translate(k: &KeyPress, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> 
     }
 }
 
+/// kitty keyboard protocol 渐进增强标志(TermMode 位)。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KittyFlags {
+    /// 基础协议(CSI u 消歧)。
+    pub disambiguate: bool,
+    /// 上报按下/抬起/重复事件类型。
+    pub report_events: bool,
+    /// alt 键也走 CSI u(而非 ESC 前缀)。
+    pub report_alternate: bool,
+    /// 所有键都走 CSI u(含纯文本)。
+    pub report_all: bool,
+    /// 附带关联文本。
+    pub report_associated: bool,
+}
+
+/// 事件类型(flag 2)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyEventType {
+    Press,
+    Repeat,
+    Release,
+}
+
+fn kitty_mods(mods: Mods) -> u32 {
+    1 + mods.shift as u32 + mods.alt as u32 * 2 + mods.ctrl as u32 * 4 + mods.meta as u32 * 8
+}
+
+fn kitty_seq(code: u32, mods: u32, event: Option<KeyEventType>, associated: Option<&str>) -> Vec<u8> {
+    let mut s = format!("\x1b[{code}");
+    if mods > 1 {
+        s.push_str(&format!(";{mods}"));
+    }
+    if let Some(ev) = event {
+        let t = match ev {
+            KeyEventType::Press => 1,
+            KeyEventType::Repeat => 2,
+            KeyEventType::Release => 3,
+        };
+        s.push_str(&format!(":{t}"));
+    }
+    if let Some(text) = associated {
+        s.push(';');
+        s.push_str(text);
+    }
+    s.push('u');
+    s.into_bytes()
+}
+
+/// kitty keyboard protocol 编码(kitty 官方语义)。
+pub fn translate_kitty(
+    k: &KeyPress,
+    mods: Mods,
+    flags: &KittyFlags,
+    event: KeyEventType,
+) -> Option<Vec<u8>> {
+    let text = k.text.as_deref();
+    let associated = flags.report_associated.then_some(text).flatten();
+    let ev_suffix = flags.report_events.then_some(event);
+
+    // 特殊键映射(协议规定:Enter→13、Tab→9、Esc→27、Backspace→127)。
+    let named_code = |n: NamedKey| -> u32 {
+        match n {
+            NamedKey::Enter => 13,
+            NamedKey::Tab => 9,
+            NamedKey::Escape => 27,
+            NamedKey::Backspace => 127,
+            _ => k.raw_code,
+        }
+    };
+
+    match k.key {
+        KeyKind::Named(n) => Some(kitty_seq(
+            named_code(n),
+            kitty_mods(mods),
+            ev_suffix,
+            associated,
+        )),
+        KeyKind::Char(c) => {
+            let ctrl = mods.ctrl;
+            let alt = mods.alt;
+            let shift = mods.shift;
+            if ctrl || alt {
+                // ctrl+可打印 → 控制码(ctrl 烘焙进码,mods 不含 ctrl 位);
+                // alt 组合按 flag 4 决定形式。
+                if alt && !ctrl && !flags.report_alternate {
+                    // ESC + 文本。
+                    let c_str = c.to_string();
+                    let t = text.unwrap_or(&c_str);
+                    let mut v = vec![0x1b];
+                    v.extend_from_slice(t.as_bytes());
+                    return Some(v);
+                }
+                let code = if ctrl { ctrl_key_code(c) } else { c as u32 };
+                let m = if ctrl {
+                    1 + mods.shift as u32 + mods.alt as u32 * 2 + mods.meta as u32 * 8
+                } else {
+                    kitty_mods(mods)
+                };
+                Some(kitty_seq(code, m, ev_suffix, associated))
+            } else if shift {
+                // shift+可打印 → 码点即含 shift 语义,mods 省略。
+                let cp = text
+                    .and_then(|t| t.chars().next())
+                    .map(|t| t as u32)
+                    .unwrap_or(c as u32);
+                Some(kitty_seq(cp, 1, ev_suffix, associated))
+            } else if flags.report_all {
+                Some(kitty_seq(c as u32, 1, ev_suffix, associated))
+            } else if event != KeyEventType::Release {
+                // 纯文本原样输出(抬起事件只在 flag 2 时到达这里)。
+                text.map(|t| t.as_bytes().to_vec())
+            } else {
+                None
+            }
+        },
+    }
+}
+
+/// ctrl+字母/符号 → 控制码(与 xterm 路径一致)。
+fn ctrl_key_code(c: char) -> u32 {
+    let b = c as u8;
+    match b {
+        b'@'..=b'_' => (b & 0x1f) as u32,
+        b'`'..=b'~' => (b - 0x60) as u32,
+        b'?' => 0x7f,
+        _ => b as u32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn press(key: KeyKind, text: Option<&str>) -> KeyPress {
-        KeyPress { key, text: text.map(|s| s.to_string()), repeat: false }
+        KeyPress { key, text: text.map(|s| s.to_string()), repeat: false, raw_code: 0 }
     }
 
     fn char_key(c: char) -> KeyKind {
@@ -206,6 +335,95 @@ mod tests {
         assert_eq!(
             translate(&k, Mods { alt: true, ..Default::default() }, false),
             Some(b"\x1bb".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_basic_special_keys() {
+        let f = KittyFlags { disambiguate: true, ..Default::default() };
+        let enter = KeyPress {
+            key: KeyKind::Named(NamedKey::Enter),
+            text: Some("\r".into()),
+            repeat: false,
+            raw_code: 28,
+        };
+        assert_eq!(
+            translate_kitty(&enter, Mods::default(), &f, KeyEventType::Press),
+            Some(b"\x1b[13u".to_vec())
+        );
+        let up = KeyPress {
+            key: KeyKind::Named(NamedKey::ArrowUp),
+            text: None,
+            repeat: false,
+            raw_code: 103,
+        };
+        assert_eq!(
+            translate_kitty(&up, Mods::default(), &f, KeyEventType::Press),
+            Some(b"\x1b[103u".to_vec())
+        );
+        let ctrl_up = translate_kitty(&up, Mods { ctrl: true, ..Default::default() }, &f, KeyEventType::Press);
+        assert_eq!(ctrl_up, Some(b"\x1b[103;5u".to_vec()));
+    }
+
+    #[test]
+    fn kitty_text_keys() {
+        let f = KittyFlags { disambiguate: true, ..Default::default() };
+        let a = KeyPress {
+            key: KeyKind::Char('a'),
+            text: Some("a".into()),
+            repeat: false,
+            raw_code: 30,
+        };
+        // 纯文本原样。
+        assert_eq!(
+            translate_kitty(&a, Mods::default(), &f, KeyEventType::Press),
+            Some(b"a".to_vec())
+        );
+        // shift+A → 码点。
+        let shift_a = KeyPress {
+            key: KeyKind::Char('A'),
+            text: Some("A".into()),
+            repeat: false,
+            raw_code: 30,
+        };
+        assert_eq!(
+            translate_kitty(&shift_a, Mods { shift: true, ..Default::default() }, &f, KeyEventType::Press),
+            Some(b"\x1b[65u".to_vec())
+        );
+        // ctrl+a → 控制码。
+        assert_eq!(
+            translate_kitty(&a, Mods { ctrl: true, ..Default::default() }, &f, KeyEventType::Press),
+            Some(b"\x1b[1u".to_vec())
+        );
+        // alt+a → ESC 前缀(flag 4 关闭)。
+        assert_eq!(
+            translate_kitty(&a, Mods { alt: true, ..Default::default() }, &f, KeyEventType::Press),
+            Some(b"\x1ba".to_vec())
+        );
+        // alt+a + flag 4 → CSI u。
+        let f4 = KittyFlags { disambiguate: true, report_alternate: true, ..Default::default() };
+        assert_eq!(
+            translate_kitty(&a, Mods { alt: true, ..Default::default() }, &f4, KeyEventType::Press),
+            Some(b"\x1b[97;3u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_event_types() {
+        let f = KittyFlags { disambiguate: true, report_events: true, ..Default::default() };
+        let a = KeyPress {
+            key: KeyKind::Char('a'),
+            text: Some("a".into()),
+            repeat: false,
+            raw_code: 30,
+        };
+        assert_eq!(
+            translate_kitty(&a, Mods { ctrl: true, ..Default::default() }, &f, KeyEventType::Press),
+            Some(b"\x1b[1:1u".to_vec())
+        );
+        assert_eq!(
+            translate_kitty(&a, Mods { ctrl: true, ..Default::default() }, &f, KeyEventType::Release),
+            Some(b"\x1b[1:3u".to_vec())
         );
     }
 

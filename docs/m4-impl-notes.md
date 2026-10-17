@@ -57,8 +57,13 @@ M4 = 生态(§9):图像协议、打包、配置向导。
 - 验证:PKGBUILD bash -n ✓、desktop-file-validate ✓、
   systemd-analyze verify ✓(仅缺已安装的 tayd 二进制)
 
-## 遗留
+## 已完成:kitty keyboard protocol(§7 P1 最后缺口)
 
-- 图像放置的 c/r 小数偏移、x/y 像素偏移、z 更精细分层
-- Flatpak 沙箱全链路实测(M4 验收项)、nixpkgs/COPR
-- 配置向导、GNOME 扩展伴侣(M2 遗留)
+- keys.rs 编码器:CSI u 全矩阵 —— 特殊键(Enter→13/Tab→9/Esc→27/
+  Backspace→127 协议映射)、evdev 码、shift+可打印→码点、ctrl 烘焙
+  进控制码、alt 按 flag 4 决定 ESC 前缀或 CSI u;渐进增强 flag
+  2/4/8/16(事件类型、交替键、全键转义、关联文本)全部支持
+- tay-window 透传 evdev raw_code(wl_keyboard key 即 evdev 码)
+- 接线:term 模式位实时读取;QuickSelect/vi/剪贴板等本地模式优先;
+  flag 2 下抬起事件上报
+- 单测 3 个;模式切换序列 CSI >1u / >0u 实测通过(term 自动跟踪)

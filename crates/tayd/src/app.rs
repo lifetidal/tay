@@ -1168,6 +1168,63 @@ impl Handler for TayApp {
                     self.handle_vi_key(&key, ctx);
                     return;
                 }
+                // kitty keyboard protocol(§7 P1):应用启用时走 CSI u 编码,
+                // flag 2 下抬起事件也要上报(QuickSelect/vi 等本地模式优先)。
+                let kitty_flags = self
+                    .term
+                    .as_ref()
+                    .map(|t| {
+                        let m = *t.lock().mode();
+                        crate::keys::KittyFlags {
+                            disambiguate: m.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+                            report_events: m.contains(TermMode::REPORT_EVENT_TYPES),
+                            report_alternate: m.contains(TermMode::REPORT_ALTERNATE_KEYS),
+                            report_all: m.contains(TermMode::REPORT_ALL_KEYS_AS_ESC),
+                            report_associated: m.contains(TermMode::REPORT_ASSOCIATED_TEXT),
+                        }
+                    })
+                    .unwrap_or_default();
+                if kitty_flags.disambiguate {
+                    // 剪贴板快捷键仍由终端层拦截。
+                    if pressed && mods.ctrl && mods.shift {
+                        match key.key {
+                            KeyKind::Char('c') | KeyKind::Char('C') => {
+                                self.copy_selection();
+                                return;
+                            },
+                            KeyKind::Char('v') | KeyKind::Char('V') => {
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    if let Ok(text) = cb.get_text() {
+                                        if let Some(sender) = &self.sender {
+                                            let _ = sender.send(Msg::Input(text.into_bytes()));
+                                        }
+                                    }
+                                }
+                                return;
+                            },
+                            _ => {},
+                        }
+                    }
+                    let event = if !pressed {
+                        crate::keys::KeyEventType::Release
+                    } else if key.repeat {
+                        crate::keys::KeyEventType::Repeat
+                    } else {
+                        crate::keys::KeyEventType::Press
+                    };
+                    if pressed || kitty_flags.report_events {
+                        if let Some(bytes) =
+                            crate::keys::translate_kitty(&key, mods, &kitty_flags, event)
+                        {
+                            if let Some(sender) = &self.sender {
+                                let _ = sender.send(Msg::Input(bytes));
+                            }
+                        }
+                    }
+                    ctx.request_redraw();
+                    return;
+                }
+
                 // 触发 QuickSelect:Ctrl+Shift+F。
                 if mods.ctrl && mods.shift && matches!(key.key, KeyKind::Char('f') | KeyKind::Char('F')) {
                     let grid = self.build_grid();

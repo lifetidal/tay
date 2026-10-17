@@ -75,6 +75,8 @@ pub struct KeyPress {
     pub key: KeyKind,
     pub text: Option<String>,
     pub repeat: bool,
+    /// Linux evdev 键码(kitty keyboard protocol 的 key number)。
+    pub raw_code: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -651,7 +653,7 @@ impl KeyboardHandler for WindowState {
         event: SctkKeyEvent,
     ) {
         self.pending.push_back(Event::Keyboard {
-            key: map_key(event.keysym, event.utf8),
+            key: map_key(event.keysym, event.utf8, event.raw_code),
             pressed: true,
             mods: self.mods,
         });
@@ -665,7 +667,7 @@ impl KeyboardHandler for WindowState {
         _: u32,
         event: SctkKeyEvent,
     ) {
-        let mut key = map_key(event.keysym, event.utf8);
+        let mut key = map_key(event.keysym, event.utf8, event.raw_code);
         key.repeat = true;
         self.pending.push_back(Event::Keyboard { key, pressed: true, mods: self.mods });
     }
@@ -679,7 +681,7 @@ impl KeyboardHandler for WindowState {
         event: SctkKeyEvent,
     ) {
         self.pending.push_back(Event::Keyboard {
-            key: map_key(event.keysym, event.utf8),
+            key: map_key(event.keysym, event.utf8, event.raw_code),
             pressed: false,
             mods: self.mods,
         });
@@ -840,7 +842,7 @@ sctk::delegate_dispatch2!(WindowState);
 
 // —— 键位映射 ——
 
-fn map_key(keysym: Keysym, text: Option<String>) -> KeyPress {
+fn map_key(keysym: Keysym, text: Option<String>, raw_code: u32) -> KeyPress {
     let raw = keysym.raw();
     let named = match raw {
         0xff0d => Some(NamedKey::Enter),
@@ -878,12 +880,17 @@ fn map_key(keysym: Keysym, text: Option<String>) -> KeyPress {
             match c {
                 Some(c) => KeyKind::Char(c),
                 None => {
-                    return KeyPress { key: KeyKind::Char('\0'), text: None, repeat: false };
+                    return KeyPress {
+                        key: KeyKind::Char('\0'),
+                        text: None,
+                        repeat: false,
+                        raw_code,
+                    };
                 },
             }
         },
     };
-    KeyPress { key, text, repeat: false }
+    KeyPress { key, text, repeat: false, raw_code }
 }
 
 fn map_button(button: u32) -> MouseButtonIdx {
