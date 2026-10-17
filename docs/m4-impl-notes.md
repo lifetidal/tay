@@ -30,6 +30,15 @@ M4 = 生态(§9):图像协议、打包、配置向导。
   宽高取显式 px 否则取内禀尺寸;非 inline 的 File 转发
 - make_sixel 示例:PNG → sixel 序列(测试素材生成)
 
+## 修正:sixel 光标语义 + make_sixel 素材生成
+
+- sixel 显示后光标下移到图像下方(VT340 惯例),iTerm2 inline 右移
+  N 列 —— 引入 CursorAfter{None,Down,Right} 枚举统一三种协议;
+  此前两个 sixel 叠在同一位置互相覆盖
+- make_sixel 示例修正:icy_sixel 的 encode() 自带完整 DCS 包装,
+  此前重复包装产生嵌套畸形序列(解码成黑色)
+- 实测:sixel 红方块 4640px + 渐变 8603px 并存,位置正确错开
+
 ## 已知问题与遗留
 
 - **锁屏时渲染阻塞**:KWin 锁屏后不再发帧回调,Mesa WSI 的

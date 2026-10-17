@@ -180,16 +180,29 @@ fn run<U>(
                                                     content.cursor.point.column.0 as u32,
                                                 )
                                             };
-                                            // C=1(默认):光标下移到图像下方。
-                                            if img.cursor_after && !img.delete {
-                                                let rows = (img.h as f32 / cell.1.max(1) as f32)
-                                                    .ceil()
-                                                    .max(1.0) as u32;
-                                                let mut guard = term.lock();
-                                                parser.advance(
-                                                    &mut *guard,
-                                                    format!("\r\x1b[{rows}B").as_bytes(),
-                                                );
+                                            // 光标移动(kitty C=1 / sixel 下移,iTerm2 右移)。
+                                            if !img.delete {
+                                                let move_seq = match img.cursor_after {
+                                                    crate::kitty::CursorAfter::None => None,
+                                                    crate::kitty::CursorAfter::Down => {
+                                                        let rows = (img.h as f32
+                                                            / cell.1.max(1) as f32)
+                                                            .ceil()
+                                                            .max(1.0) as u32;
+                                                        Some(format!("\r\x1b[{rows}B"))
+                                                    },
+                                                    crate::kitty::CursorAfter::Right => {
+                                                        let cols = (img.w as f32
+                                                            / cell.0.max(1) as f32)
+                                                            .ceil()
+                                                            .max(1.0) as u32;
+                                                        Some(format!("\x1b[{cols}C"))
+                                                    },
+                                                };
+                                                if let Some(seq) = move_seq {
+                                                    let mut guard = term.lock();
+                                                    parser.advance(&mut *guard, seq.as_bytes());
+                                                }
                                             }
                                             let _ = blocks.send(BlockEvent::Image { img, line, col });
                                         },
@@ -439,7 +452,7 @@ impl StreamScanner {
                     rows: None,
                     rgba: img.pixels.clone(),
                     z: 0,
-                    cursor_after: false,
+                    cursor_after: crate::kitty::CursorAfter::Down,
                     delete: false,
                     place_after: false,
                     target: None,

@@ -6,6 +6,16 @@
 
 use base64::Engine;
 
+/// 图像后光标移动方式。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorAfter {
+    None,
+    /// 光标下移 N 行(kitty C=1、sixel)。
+    Down,
+    /// 光标右移 N 列(iTerm2 inline)。
+    Right,
+}
+
 /// 解析出的图像传输。
 #[derive(Clone, Debug)]
 pub struct KittyImage {
@@ -20,8 +30,8 @@ pub struct KittyImage {
     pub rgba: Vec<u8>,
     /// z 坐标(负 = 文本之下)。
     pub z: i32,
-    /// 显示后光标下移到图像下方(C=1,默认)。
-    pub cursor_after: bool,
+    /// 显示后光标移动(kitty C=1 / sixel / iTerm2 语义)。
+    pub cursor_after: CursorAfter,
     /// a=d:删除图像。
     pub delete: bool,
     /// p=1:先删除同 id 再放置(与 target 组合,预留)。
@@ -63,7 +73,7 @@ pub fn parse_apc(content: &[u8]) -> Apc {
     let mut cols: Option<u32> = None;
     let mut rows: Option<u32> = None;
     let mut z = 0i32;
-    let mut cursor_after = true;
+    let mut cursor_after = CursorAfter::Down;
     let mut delete = false;
     let mut place_after = false;
     for kv in ctl.split(|&b| b == b',') {
@@ -82,7 +92,11 @@ pub fn parse_apc(content: &[u8]) -> Apc {
             b"c" => cols = vint,
             b"r" => rows = vint,
             b"z" => z = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()).unwrap_or(0),
-            b"C" => cursor_after = vint.unwrap_or(1) == 1,
+            b"C" => cursor_after = if vint.unwrap_or(1) == 1 {
+                CursorAfter::Down
+            } else {
+                CursorAfter::None
+            },
             b"p" => place_after = vint.unwrap_or(0) == 1,
             b"q" | b"m" | b"x" | b"y" | b"X" | b"Y" | b"o" | b"O" | b"d" | b"t" | b"T" => {},
             _ => {},
@@ -239,7 +253,7 @@ pub fn parse_iterm2(content: &[u8]) -> Option<KittyImage> {
         rows: None,
         rgba: img.into_raw(),
         z: 0,
-        cursor_after: false,
+        cursor_after: CursorAfter::Right,
         delete: false,
         place_after: false,
         target: None,
@@ -272,7 +286,7 @@ mod tests {
         assert_eq!(img.id, 7);
         assert_eq!((img.w, img.h), (1, 1));
         assert_eq!(img.rgba, vec![255, 0, 0, 255]);
-        assert!(img.cursor_after);
+        assert_eq!(img.cursor_after, CursorAfter::Down);
     }
 
     #[test]
@@ -310,7 +324,7 @@ mod tests {
         let content = format!("1337;File=inline=1:{}", png_b64);
         let img = parse_iterm2(content.as_bytes()).expect("应解析成功");
         assert_eq!(img.rgba.len(), 4);
-        assert!(!img.cursor_after);
+        assert_eq!(img.cursor_after, CursorAfter::Right);
     }
 
     #[test]
