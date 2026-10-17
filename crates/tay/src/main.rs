@@ -65,6 +65,14 @@ fn cmd_config() {
         false
     } else {
         let default = r##"# Tay 配置(全部可选,保存后 2 秒内热重载)
+# 注意:顶层键需在 [font]/[colors] 表之前(TOML 语法要求)。
+
+shell = ""            # 空 = $SHELL
+height_percent = 45   # 呼出高度占输出百分比
+animation_ms = 150    # 滑入动画时长,0 = 关闭
+hide_on_focus_out = true
+start_hidden = true
+output = ""           # 呼出输出名(如 "DP-1");空 = 合成器默认
 
 [font]
 family = "JetBrainsMono Nerd Font"
@@ -75,13 +83,6 @@ foreground = "#d4d4d4"
 background = "#0f1114"
 cursor = "#00a884"
 selection = "#395e9c"
-
-shell = ""            # 空 = $SHELL
-height_percent = 45   # 呼出高度占输出百分比
-animation_ms = 150    # 滑入动画时长,0 = 关闭
-hide_on_focus_out = true
-start_hidden = true
-output = ""           # 呼出输出名(如 "DP-1");空 = 合成器默认
 "##;
         std::fs::create_dir_all(path.parent().unwrap()).ok();
         std::fs::write(&path, default).is_ok()

@@ -51,6 +51,13 @@ tay toggle      # 呼出/收起(tay show / tay hide / tay quit)
 `~/.config/tay/config.toml`(全部可选,热重载):
 
 ```toml
+shell = ""            # 空 = $SHELL
+height_percent = 45   # 呼出高度占输出百分比
+animation_ms = 150    # 滑入动画,0 = 关闭
+hide_on_focus_out = true
+start_hidden = true
+output = ""           # 呼出输出名(如 "DP-1");空 = 合成器默认
+
 [font]
 family = "JetBrainsMono Nerd Font"
 size = 12.0
@@ -59,13 +66,6 @@ size = 12.0
 foreground = "#d4d4d4"
 background = "#0f1114"
 cursor = "#00a884"
-
-shell = ""            # 空 = $SHELL
-height_percent = 45   # 呼出高度占输出百分比
-animation_ms = 150    # 滑入动画,0 = 关闭
-hide_on_focus_out = true
-start_hidden = true
-output = ""           # 呼出输出名(如 "DP-1");空 = 合成器默认
 ```
 
 ## 开发
