@@ -1,314 +1,140 @@
-# Tay 架构设计(第八轮:架构设计优先的重构与加固)
+# Tay 当前架构
 
-> 2026-10-19。本文记录**核实过的当前事实**与**目标架构**,以及分阶段
-> 迁移方式与验收条件。实施进度在 docs/hardening-notes.md 第八轮。
-> 原则:在现有 crate 内建立模块边界;不为未知后端设计 trait 体系;
-> 每阶段保持可构建、可测试;不一次性大规模重写。
+本文描述 2026-10-20 本轮加固后的代码；旧迁移计划和轮次记录保留在
+[architecture-history.md](architecture-history.md)，不能作为当前实现依据。
+不新增 crate，不引入后端 trait 体系。
 
-## 1. 当前事实(已核实)
+## 当前模块与所有权
 
-### 1.1 线程拓扑(当前事实,2026-10-19 第十五轮)
-
-| 线程 | 职责 | 与外界的通道 |
-|---|---|---|
-| UI(主线程,`tay_window::run`) | 事件循环、wgpu 渲染、视图状态(折叠/选区/QuickSelect)、配置、可见性;**不接触 Term** —— 渲染读快照,操作发命令 | wake 管道、term 事件 mpsc、快照单槽 |
-| PTY/session 线程(`ptyloop::run`) | **独占 Term**;poll PTY + wake 管道 + 命令 mpsc;协议解析(CountingHandler → Term)、语义状态(命令块/图像/锚点)全部在此维护 | `SessionCommand` mpsc + wake 管道(输入侧);快照单槽 + term `Event::Wakeup`(输出侧) |
-| cfg-watch 线程 | notify 监视 config.lua → 写 wake 管道 | wake 管道 |
-| IPC accept 线程 | UnixListener accept → `IpcCommand` mpsc | mpsc |
-| 热键 portal 线程 | GlobalShortcuts portal → mpsc | mpsc |
-
-### 1.2 跨线程消息(当前事实)
-
-```
-UI ──SessionCommand{Input,Resize,ScrollDisplay,ScrollToAnchor{anchor,
-       epoch},ToggleVi,ViMotion,Search,CopyAnchors{范围,epoch,应答},
-       SelectionToString,Shutdown}──▶ session
-UI ◀─SessionUpdate{snapshot, revision}(单槽原子发布:网格 + 语义状态
-       同版本;慢 UI 下旧显示快照被覆盖,语义状态在会话侧累积)── session
-UI ◀─Event{Wakeup,Bell,Title,ChildExit,ClipboardStore,PtyWrite}── session
-UI ◀─SessionReply{Copy{text,revision,stale},Search,Selection}── session
-UI ◀─IpcCommand{toggle,show,hide,quit,pin,…}── IPC
-UI ◀─热键 mpsc / cfg wake 管道
-```
-
-输入背压(统一预算,2026-10-19 第十七轮定点修复):**一个共享
-原子计数器**同时覆盖「跨线程消息」与「PTY 待写队列」——
-`TermSender::send` 在入队前**原子检查 + 预留**(fetch_update,
-多发送者并发不突破上限),超限显式拒绝整块(不静默截断、
-不破坏粘贴边界);额度只在字节**实际写入 PTY、明确拒绝或
-会话结束**时释放(出队不释放,会话端不再做第二次预算检查);
-控制命令(Resize/Shutdown 等)不受预算影响;协议应答
-(PtyWrite / kitty 应答)必须送达,不受上限约束但计入在途,
-超过「上限 + 256 KiB 余量」告警(查询风暴诊断,不拒绝)。
-三种状态明确区分:**已发送**(进通道)/ **已接受**(send 返回
-true,保证按序完整写入或显式释放)/ **已写入**(实际写进 PTY)。
-UI 对拒绝给出可见反馈(status toast)。
-resize 处理:连续 Resize 合并为最新值(`ResizeMerger` 纯逻辑),
-遇其它命令先应用 —— 命令 FIFO 保持(后续复制/搜索/输入看到
-新布局与失效世代),连续的 configure 风暴只重排一次。
-清屏检测:复用内核同源 vte 解析器(跨 flush 状态),文本无 ESC
-且无未完成序列时走快速路径跳过双解析(`text_ends_in_escape_
-sequence` 保守判定)。
-
-### 1.3 状态所有者(现状)
-
-| 状态 | 当前所有者 | 问题 |
-|---|---|---|
-| `Term`(网格、光标、模式、selection) | **UI 与 session 共享** `FairMutex` | UI 直接修改(16 处 lock;resize/滚动/vi/选区) |
-| `cum_scroll`(累计滚动位移) | **app 字段**(UI 侧) | 与网格分属两次 lock,存在「新网格 + 旧 cum」的单帧不一致窗口 |
-| 命令块 `blocks`(元组 `(i32,i32,Option,Option)`) | app | 含义隐晦;无稳定 ID;绝对行 + app 侧手工 `± cum_scroll` 转换散落 10 处 |
-| kitty 图像(解码 RGBA + 放置位置) | app | 资源与放置同存;总量预算只有条数(64) |
-| 配置 | app(唯一) | 无效热重载保留旧值 ✓;字段即时性靠注释 |
-| 可见性/动画 | app(`VisibilityController`) | 唯一 ✓ |
-| surface 状态 | tay-window(`configured`/`surface_configured_once`/`frame_pending`/`frame_armed_at`/`stalled`) + app(`sizing`/`renderer_pending`) | 7 个布尔横跨两层,生命周期阶段不可见;无 SurfaceGeneration 校验 |
-| 输入写队列 `pending`(VecDeque) | session | 无预算上限 |
-
-## 2. 目标架构:六职责与边界
-
-模块边界在**现有 crate 内**建立(crates/tayd 下分模块;tay-window、
-tay-render 保持独立 crate)。不新增 trait 抽象。
-
-### 2.1 App(app.rs)
-事件路由、模块组装、平台服务协调(剪贴板、IPC、portal、配置监视)。
-**不解析协议、不直接操作终端网格** —— 网格访问一律经 Session 接口。
-
-### 2.2 TerminalSession(session.rs ← ptyloop.rs)
-统一管理 PTY、终端内核、协议解析、命令块、图像资源与锚点。
-不依赖窗口、GPU、系统剪贴板或浏览器。
-- 命令:`SessionCommand::{Input, Resize, ScrollDisplay, Select, Copy{范围,应答}, Search, ToggleVi, …}`(输入侧 mpsc);
-- 事件:`SessionEvent::{Wakeup, Bell, Title, ChildExit, ClipboardStore, PtyWrite}` + 语义事件(块/图像/失效);
-- **快照**:`SessionSnapshot`(可见区域内容 + 锚点 + `SessionRevision`)。
-
-### 2.3 TerminalView(✅ view.rs,2026-10-19 落地)
-可视区域、折叠、选区投影、搜索展示、QuickSelect。
-不修改终端底层内容;坐标映射(正向/反向)唯一实现在此。
-
-### 2.4 InputRouter(input.rs ← keys.rs + app 按键分发)
-区分:`LocalAction`(tay 快捷键)/ `TermKey`(转义序列)/ `Ime` /
-`Paste`。本地模式(vi 复制、QuickSelect、IME 预编辑)与终端输入
-的优先级明确:**本地模式全量消费,不进 PTY;正常模式本地快捷键
-优先,其余翻译后进 PTY**。release 只影响本地按下语义,不向 PTY
-发送。纯决策函数 + 单测。
-
-### 2.5 WindowController(tay-window/lib.rs + app 的 surface 路径)
-显隐动画、输出选择、焦点策略、surface 生命周期。
-生命周期阶段显式化(见 §5),与 TerminalSession 解耦。
-
-### 2.6 Renderer(tay-render)
-消费显示数据(单元、徽章、选区、图像纹理、光标)。
-不解释终端协议、不维护业务锚点;图像只认**共享资源句柄**。
-
-## 3. 状态唯一所有者(目标)
-
-| 状态 | 唯一所有者 | UI 如何访问 |
-|---|---|---|
-| `Term` + `SessionMeta{cum_scroll, revision}` | **session 线程**(迁移终点;本轮先合入同一把锁,见 §6 阶段 2a) | 快照 / 命令应答 |
-| 命令块、图像放置、锚点 | session(块事件携带**绝对行**;UI 不做转换算术) | 语义事件 + 快照 |
-| 图像解码资源 | session(资源句柄:一次解码、共享引用) | 快照携带句柄 |
-| 配置 | App | 只读快照 |
-| 可见性/动画 | App(VisibilityController) | — |
-| surface 生命周期/帧调度 | tay-window(显式状态机) | — |
-| 系统剪贴板 | App 的平台服务(持久 arboard 实例) | — |
-
-## 4. 坐标模型与转换(唯一实现点:session.rs / view.rs)
-
-### 4.1 类型
-
-```rust
-/// 历史绝对行:grid 行 + cum_scroll,只增不减的稳定行号。
-pub struct HistoryAnchor(pub i32);
-/// 网格行(可为负 = 滚动回看)与列。
-pub struct GridPoint { pub line: i32, pub col: u32 }
-/// 屏幕显示行(row 0..rows)与列。
-pub struct DisplayPoint { pub row: usize, pub col: usize }
-/// 会话版本:每次 PTY 输出批次推进 +1。
-pub struct SessionRevision(pub u64);
-/// 锚点失效世代:清屏/重置、resize/reflow、主/备屏幕切换时 +1;
-/// 锚点请求(复制/跳转)必须携带来源快照的世代,会话执行前校验。
-/// **普通输出滚屏不推进世代** —— 稳定锚点在持续输出下仍可复制。
-pub struct AnchorEpoch(pub u64);
-/// surface 世代:每次重建 layer surface +1。
-pub struct SurfaceGeneration(pub u64);
-```
-
-### 4.2 转换(全部集中在此,禁止 UI 手工加减)
-
-| 转换 | 公式 | 失效条件 |
-|---|---|---|
-| `HistoryAnchor → GridPoint` | `line − meta.cum_scroll` | 锚点早于历史淘汰 → **显式失效**(不猜位置) |
-| `GridPoint → DisplayPoint` | `row_map[grid]`,折叠占位行映射到占位标记行 | grid 不在可视范围 → 不渲染 |
-| `DisplayPoint → GridPoint` | `row_map` 反查(鼠标命中/光标/选区共用) | 折叠占位行 → 返回区间首行 + `FoldMarker` 标记 |
-| `HistoryAnchor → DisplayPoint` | 前两者复合(快照内一次性完成) | 同上 |
-
-### 4.3 失效规则(使锚点失效,不显示错误位置)
-
-| 事件 | 处理 |
+| 层 | 当前职责与边界 |
 |---|---|
-| 清屏/重置(ED2/ED3/RIS) | 块与图像锚点**全部失效**(`Invalidated`)+ 失效世代 +1 |
-| resize/reflow | 全部失效(行号重排)+ 失效世代 +1(同尺寸 resize 不推进 —— surface 重建场景) |
-| 主/备屏幕切换(ALT_SCREEN 进出) | 失效世代 +1(坐标身份切换;主屏网格在 alt 期间冻结,块/图像锚点本身保持有效) |
-| 历史淘汰(锚点早于 `−meta.cum_scroll` 裁剪线) | 裁剪该锚点(block 首行、图像) |
-| 无法可靠映射的滚动(如顶部锚定局部区域 0..k<rows 的 alacritty 内部整体 rotate) | 按规则计 0(局部操作不是全局平移);如需精确 → 将来内核补丁,本轮不 vendor |
-| alt-screen 内的 133 标记 | 抑制(备用屏幕语义隔离) |
+| `tay` | IPC 客户端、冷启动、doctor、resurrect |
+| `tayd::runtime` | 环境变量、配置监视、启动装配；bin 仅调用 `tayd::run()` |
+| `app` | UI 事件路由、平台服务、会话集合、显示模型与退出协调 |
+| `tabs` | 单调不复用的 TabId、显示顺序到身份的转换 |
+| `session` / `ptyloop` | 每会话一个线程，独占 Term、语义状态、元数据、协议解析与 PTY I/O |
+| `view` | 网格与显示行映射、折叠投影、选区/徽章/图像投影 |
+| `tay-window` | Wayland、焦点、IME、surface 生命周期与帧调度 |
+| `tay-render` | 消费显示网格，管理 GPU 与字体资源；不依赖 alacritty_terminal |
+| `tay-config` | Lua 配置、验证、迁移和保存 |
 
-**锚点世代(第十七轮定点修复)**:选择、复制、跳转等依赖历史锚点
-的请求**携带来源快照的失效世代**(`AnchorEpoch`),会话执行前校验:
-- 不匹配 → 明确返回过期(`SessionReply::Copy { stale: true }`),
-  UI 轻量反馈(status toast)且**不覆盖已有剪贴板**;
-- 世代匹配但锚点已被历史淘汰 → `stale = false` 且 `text = None`
-  (Evicted),同样只反馈不复制;
-- **普通输出滚屏不推进世代**(不以 revision 差异作粗略拒绝),
-  持续输出下选择复制照常工作 —— 竞态窗口(选择→清屏→复制请求
-  到达会话前)由世代校验关闭。
+所有 TabSession（包括活跃标签）始终保存在同一 `Tabs` 集合。
+App 只以 TabId 标识活跃项；切换标签不移动 sender、快照、应答通道或 worker。
+列表位置只用于标签栏与持久化文件，进入操作时转换成身份。
+删除其它标签不会改变当前标签身份；最后一个标签关闭后保留一个空槽，
+下次显式 show 才启动 shell。
 
-### 4.4 内核变更检测(CountingHandler 的定位)
+标签持有 worker、输入端、快照槽、最新快照、事件邮箱、应答槽、shell/PID、
+折叠集合、最近世代和铃状态。鼠标拖动、选区、QuickSelect、IME 预编辑、
+按键按下表与显示映射是当前焦点 UI 的临时状态，切换时明确清理。
+配置、剪贴板、显隐动画、renderer 和服务通道由 App 持有。
 
-- 优先用内核已有接口:`Dimensions::total_lines` 的增量(历史增长)
-  与 `cum` 在历史上限**以下**时互相印证(测试断言);
-- 历史上限**之后**内核不暴露单调计数(total_lines 封顶、storage
-  重编号不可观测),影子计数是唯一可行机制 —— **保留**。
-  **2026-10-20 复核(alacritty_terminal 0.26,已升级)**:0.26 的
-  Grid 仍只暴露 `display_offset`/`history_size`/`max_scroll_limit`,
-  无封顶后单调滚动计数;`Dimensions::total_lines` 依旧封顶 ——
-  结论不变,影子计数继续保留,升级成本随内核版本复核。
-- 影子语义与内核逐条对齐并已有回归测试:DECAWM、宽字符、局部
-  滚动区、行数截断、备用屏幕、历史淘汰(第七轮)。
+## 线程与消息
 
-## 5. surface 生命周期与资源释放顺序
+UI 主线程执行窗口/渲染与协调；每会话独立 PTY 线程。
+此外有配置监视、IPC accept（最多 16 个连接处理者）、portal 执行线程。
+SIGTERM/SIGINT 不新增线程：signal-hook 处理器只设置原子标志并写入
+非阻塞唤醒管道；实际保存与清理由 UI 执行。
 
-### 5.1 阶段状态机(tay-window + app 各一份枚举)
+Term 从创建后移入会话线程，UI 从不访问或修改它。
+`SessionSnapshot` 同时携带网格、SessionMeta、命令块与共享图像；
+快照槽的 Mutex 只保护发布/取出，不保护 Term。
+锚点使用 HistoryAnchor 与 AnchorEpoch；清屏、reflow、主备屏幕切换
+推进世代。普通滚屏保持稳定锚点。过期请求拒绝，淘汰的内容不猜测位置。
 
-```
-Uninitialized → AwaitingConfigure → Ready
-Ready → ReplacingSurface → AwaitingConfigure → Ready
-任意阶段 → Closing
-```
+### 容量与满载行为
 
-- 只有**当前 generation** 完成 configure 后才允许呈现;
-- configure / frame / closed 回调一律校验 `SurfaceGeneration`,
-  旧世代事件不得修改新实例;
-- 输出移除 → `ReplacingSurface`:新 wl_surface + 重绑 layer 角色,
-  PTY 会话保持;新 surface **不继承** stalled;
-- 退役 surface 释放条件:GPU 资源(vkDestroySwapchain 的 marshal)
-  完成后随旧 `WlSurface` 一起 drop(保活于 `retired` Vec,
-  不长期积累 —— 每次重建只退役一代);
-- 显隐动画(VisibilityController)与生命周期**分状态管理**,
-  动画中 surface 重建会重新锚定 margin;
-- 隐藏期间调整高度:尺寸与 margin 同一次 commit 提交(已有,
-  本轮纳入回归测试)。
-
-### 5.2 初始化 / 退出顺序(已核实,保持)
-
-初始化:主线程 IPC 绑定 → **PTY fork(所有后台线程之前)** →
-IPC accept 线程 → 热键 portal 线程 → cfg-watch 线程 → 事件循环。
-fork 之后不再有 fork 路径(热键/监视/IPC 均为纯线程)。
-
-退出:IPC quit → `Ctx::exit` → 事件循环收尾 → `Msg::Shutdown`
-→ session 线程退出(子进程由 PTY 关闭触发 ChildExit)→ drop
-Term/SessionState → 退役 surface 随窗口层 drop(swapchain
-marshal 完成)→ arboard 剪贴板实例随 App drop。
-
-## 6. 分阶段迁移与验收条件
-
-每阶段结束:fmt / test / clippy / git diff --check 全绿,可构建。
-
-### 阶段 1(本轮已完成)架构文档与边界
-- 验收:docs/architecture.md 齐备(本文);DESIGN.md 同步。
-
-### 阶段 2 会话状态原子化 + 类型化锚点(本轮)
-- 2a `SessionState{term, meta{cum_scroll, revision}}` 合入**同一把
-  FairMutex**:cum 从 app 移入;块事件携带绝对行;UI 渲染在
-  `drain 块事件 → lock 状态` 后读取,网格与锚点必然同版本。
-  **不变量:任何一次 grid 读取都配对产生它的 meta**(同锁)。
-- 2b 类型化:`HistoryAnchor / GridPoint / DisplayPoint /
-  SessionRevision / SurfaceGeneration`;转换集中 session.rs/view.rs;
-  删除 UI 侧全部 `± cum_scroll` 手写算术。
-- 2c CountingHandler 影子:保留(原因见 §4.4),范围不变,文档化
-  升级成本;新增「分块等价」测试用真实 alacritty 网格。
-- 验收:全量测试;新增测试断言「任意切分字节流 → 网格内容、
-  cum、模式、块事件完全等价」。
-
-### 阶段 3 一致快照与 TerminalView(✅ 会话线程迁移已完成,2026-10-19)
-- ✅ session 线程**拥有** Term 与**协议语义状态**(命令块/图像/
-  锚点,COW Arc);UI 经 `SessionCommand`(Input/Resize/ScrollDisplay/
-  ScrollToAnchor/ToggleVi/ViMotion/Search/CopyAnchors/
-  SelectionToString/Shutdown)操作,渲染读 `SessionSnapshot`
-  (可见区 + 锚点 + revision + invalidate_epoch + 模式 + 颜色表 +
-  块/图像共享引用;只复制可见行,不复制全历史);
-- ✅ 快照**单槽原子发布**(`SessionUpdate{snapshot, revision}`):
-  语义事件在会话内直接应用,不存在「旧网格配新事件」;
-  慢 UI 下旧显示快照被覆盖,语义状态在会话侧累积、不积压队列;
-- ✅ 复制/搜索应答携带 `SessionRevision`(复制文本+版本落剪贴板,
-  搜索命中记日志);
-- ✅ 折叠/徽章/图像/跳转/复制全部经 `SessionMeta::resolve` 唯一
-  转换点;顺手修复:图像折叠隐藏此前把绝对行与 grid 相对区间
-  比较(滚动后折叠隐藏失效);
-- ✅ TerminalView 模块化(2026-10-20 补完):折叠区间/选区/徽章/
-  图像四组投影逻辑从 app.build_grid 抽入 view.rs 纯函数族
-  (`fold_ranges_to_grid` / `selection_to_display` /
-  `badges_to_display` / `images_to_display`),带单测;build_grid
-  只做组装(单元格上色、铃闪烁、覆盖层仍属 app 视图状态)。
-- 验收:UI 侧 0 处 term.lock()(✅,16 处全部迁移);快照/复制/
-  跳锚点单测用真实网格回放(✅);慢 UI 队列有界(预算测试 ✅)。
-
-### 阶段 4 surface 生命周期与 generation 隔离(本轮)
-- 状态机枚举替换 7 个布尔;generation 校验;退役条件文档化;
-  动画收敛回归(反向/零时长/取整不变/动画中 resize)。
-- 验收:窗口层单测(受控时钟);现有 KDE 实测场景回归。
-
-### 图像资源预算计账表(架构 §6「避免重复计费或漏计」)
-
-| 环节 | 预算 | 实现 | 计费方式 |
-|---|---|---|---|
-| 编码数据(base64 载荷) | 单块 ≤ 32 MiB,分块累计 ≤ 32 MiB | kitty 解码侧 `MAX_KITTY_CHUNK_BYTES` | 每块按原始载荷字节计,超限丢弃整块 |
-| 解码像素(单图) | ≤ 64 MiB RGBA | `decode_payload` 尺寸上限 | 解码时一次性校验 |
-| 放置实例 | 数量 ≤ 64 + 像素总量 ≤ 64 MiB | 会话侧 `apply_event` 逐出最旧 | 放置与资源一一对应(同 id 替换,不共享),每张 rgba 只计一次 |
-| GPU 纹理缓存 | 按当前可见集保留 | 渲染器 `img_cache`(id, 数据指针)键,帧末 retain | 同一数据零哈希零上传;删除/替换图像的纹理随帧释放 |
-
-### 阶段 5 InputRouter / 配置 / 资源策略(✅ 全部落地,2026-10-19)
-- InputRouter 纯决策 + 单测(本地/终端/IME/粘贴,release 语义);
-- 输入队列预算(超限**显式拒绝 + 日志**,不静默截断)+ 单测;
-- 配置:✅ 期望 vs 实际(config.rs 纯决策 `reload_decision`,
-  无效热重载保留有效状态、同版本错误只告警一次)、逐字段
-  即时性表在 config.rs 模块文档;高度/padding 触发链已有回归;
-- 图像:资源句柄与放置分离(数据一次解码)、像素总量预算;
-- 验收:各策略单测 + 现有实机回归。
-
-## 7. 必须验证的架构不变量(测试映射)
-
-| 不变量 | 测试 |
-|---|---|
-| 同一字节流不同分块 → 等价终端与语义结果 | `chunk_split_equivalence_full_term`(真实网格逐边界切分) |
-| UI 使用的网格与锚点来自同一版本 | SessionState 同锁 + revision 单测 |
-| 锚点始终可解析,或明确失效 | 历史淘汰裁剪、Invalidated、max_span 测试(已有,补充断言) |
-| 依赖历史锚点的请求携带世代,过期明确拒绝 | `stale_epoch_is_rejected_not_miscopied`、`scroll_keeps_epoch_and_copies_original_text`、`evicted_anchor_is_evicted_not_stale`、`resize_advances_epoch_only_on_dim_change` |
-| 备用屏幕操作不污染主屏幕历史坐标 | 已有 alt-screen 回归 + `alt_screen_advances_epoch_and_separates_coordinates` |
-| 旧 surface 回调不能修改新实例 | generation 单测 |
-| 隐藏和 surface 重建不终止 PTY | 实机回归(KDE) |
-| 慢速 UI 不造成无界队列或内存增长 | 统一输入预算(原子预留 `reserve_input_is_atomic_under_concurrency`、`accepted_300k_input_is_delivered_fully`、`wouldblock_recovers_and_delivers_accepted_input_in_order`、`partial_writes_release_only_written_bytes`、`sender_accepts_300k_rejects_over_budget_and_keeps_control_free`)、图像预算、写队列测试 |
-| 已接受 = 保证按序完整写入或显式释放(不因第二次检查丢失) | `response_bypasses_limit_but_is_accounted` + 上述统一预算测试;实机:TAY_PASTE 307200 字节精确交付、慢消费下超限原子拒绝 + 可见 toast |
-
-## 8. 未验证清单(照实标注,不沿用旧笔记结论)
-
-- 合成器矩阵:仅本机 KDE Wayland 实测;wlroots(sway/niri/river/
-  labwc)、Hyprland、GNOME 未实测;
-- 锁屏恢复、显示器热插拔(单显示器机器无法实测)、多屏指针定位
-  未实测 —— surface 重建路径由协议语义 + 单测覆盖;
-- IME:ping-pong 修复基于协议语义(KWin 实测正常),其它合成器
-  text-input 行为未验证;
-- fish 4.9.3 不再内置 OSC 133(逐字节抓包确认),集成改钩子
-  (docs/shell-integration.md 已更新)。
-
-## 9. 2026-10-20 新增特性(架构落点)
-
-| 特性 | 落点 | 说明 |
+| 路径 | 边界 | 满载行为 |
 |---|---|---|
-| 可视铃(BEL) | app.rs `bell_until` + build_grid 背景衰减混色 | AboutToWait + anim_deadline 驱动重绘;时长 140ms、强度 0.30 常量;配置开关留作后续 |
-| OSC 8 超链接 | session.rs 快照 `hyperlinks` 表(去重 Arc\<str\>)+ `SnapshotCell::hyperlink` 索引;渲染下划线;Ctrl+点击 xdg-open | Ctrl 状态由键盘事件 mods 追踪(指针事件不携带);悬停显示手形指针 |
-| 会话持久化 | `persist.rs`(纯函数,带单测)+ app.rs `write_session_file` / init 恢复分支 | 优雅退出写 `$XDG_STATE_HOME/tay/session.toml`(壳/cwd/标题骨架,不含网格内容);`tay resurrect` 以 `TAY_RESURRECT=1` 拉起 daemon 恢复;cwd 经 /proc/\<pid\>/cwd 实时读取 |
-| 模糊测试 | fuzz/(独立 workspace,不进主构建) | parser_bytes / sixel_dcs 两个 harness,复用 ptyloop 同源管线(build.rs include 副本);nightly + cargo-fuzz,冒烟 0 崩溃 |
-| 依赖审计 | audit.toml(5 条豁免,每条记录路径与升级条件)+ CI audit 任务 | 无 CVE 级漏洞;zvariant 系待 ashpd 迁移 zbus 6,lru 待 glyphon 更新 |
+| 用户输入在途 | 512 KiB，跨命令通道和待写队列统一原子记账 | 整块拒绝，UI 反馈，不截断 |
+| 全部 PTY 待写在途（含应答） | 硬上限 768 KiB | 应答无法完整预留时明确结束会话，记录错误 |
+| 协议应答高低水位 | 640 KiB / 256 KiB | 高水位暂停 PTY 读取，降到低水位恢复 |
+| 暂停读取后无写入进展 | 5 秒 | 记录双向阻塞并结束会话，避免无限等待 |
+| 会话命令 | 4096 条，非阻塞发送 | 输入发送失败释放额度；控制/协议通道耗尽时明确停止该会话 |
+| 启动前协议事件 | 4096 条 | 耗尽记错，attach 后停止会话 |
+| UI 快照 | 单槽 | 覆盖旧快照 |
+| UI 会话事件 | Wakeup/Bell 各一位，Title 单槽（最多 4096 字节），退出保留槽 | 重复状态合并，退出不因队列满而丢失 |
+| 其它 UI 事件 | 最多 64 条且累计文本最多 1 MiB | 拒绝并记日志；不截断剪贴板文本 |
+| 复制/选区回执 | 最新结果单槽，文本最多 4 MiB | 超大结果转为拒绝通知，保持系统剪贴板 |
+| 搜索回执 | 独立单槽 | 最新结果覆盖，不覆盖待处理复制结果 |
+| IPC 命令 | 128 条 | 返回 error，不返回虚假的 ok |
+| portal 消息 | 64 条 | 非阻塞拒绝多余消息 |
+| 配置文件通知 | 1 条 | 重复文件变化合并，由主线程检查最新 mtime |
 
-其中「会话持久化」只恢复标签骨架:滚动历史、图像、命令块的
-完整恢复需要内核侧状态导出(alacritty Term 不可序列化),列为
-后续里程碑;崩溃退出不会更新会话文件(只在优雅 quit 时写)。
+会话邮箱只在空到非空时写唤醒字节。UI 必须先原子取出/清除通知，再读取
+快照和回执，避免读取期间到达的更新被旧 Wakeup 合并掉。复制/搜索生成回执后也发唤醒；
+不能依赖下一次 PTY 输出才刷新剪贴板。发布回执和发布快照是独立机制。
+应答与已接受输入按队列顺序处理，只有实际写入、发送失败或会话结束才释放额度。
+结束会话会作废尚未写出的数据，并非承诺所有被结束会话的数据仍能交付。
+
+每轮最多读取一个 16 KiB PTY chunk，并处理最多 256 条命令，避免持续输出
+饿死写入与退出。暂停读取时仍监听写就绪和控制唤醒；不用阻塞式通道制造
+会话线程自阻塞。超时结束是无法同时保证有界内存、无限期存活与可靠应答时的
+明确取舍，不静默丢弃中间应答后让应用继续运行。
+
+## 退出与恢复
+
+服务使用 KillMode=mixed，先只通知主进程，避免 shell 先退出导致 cwd 丢失；
+TimeoutStopSec=5 是外部兜底。IPC quit、窗口关闭、SIGTERM/SIGINT 进入同一协调流程：
+
+1. 设置 shutting_down，停止处理后续 UI/IPC 操作。
+2. 在 shell 尚存活时读取 cwd 并保存会话骨架。保存失败记日志，继续退出。
+3. 对所有活跃、后台、退役会话设置独立原子停止位并唤醒；停止不受命令队列容量影响。
+4. 共用 2 秒截止时间等待 worker；超时通过 pidfd 发送 SIGKILL。
+5. 共用额外 100 ms 回收窗口，随后离开事件循环。已 join 的 worker 再次清理为 no-op。
+
+关闭单个标签不会在 UI 上等待子进程；worker 转入退役集合，定时回收。
+依赖的 Pty::drop 会发送 SIGHUP 并等待 shell，因此仅发送 Shutdown 不足以保证
+清理有界。pidfd 将信号绑定到原子进程身份，避免 PID 重用误杀。
+当前实现要求内核/沙箱允许 pidfd_open、pidfd_send_signal（Linux 5.3+）；
+不可获得 pidfd 时会话启动失败，不退回不安全的裸 PID 终止。
+这只管理直接 shell 的回收，不承诺终止自行脱离会话的后台作业。
+
+事件循环异常返回时 Drop 也停止并限时等待会话，但不承诺异常路径保存。
+SIGKILL、崩溃、机器断电不保存；本轮未实现周期性崩溃恢复。
+配置监视、IPC、portal 仍是进程级后台服务，随进程结束；会话 worker 有显式句柄。
+
+恢复只包含 shell/cwd/title 和激活位置，不包含滚动历史、图像或命令块。
+最多尝试 24 个条目，失败条目跳过（包括首个）；激活原条目按成功恢复的
+索引映射，目标失败则激活首个成功项。全部失败才回退默认 shell。
+文件格式仍为 version=1。
+
+## 多线程期间创建 PTY 的事实与约束
+
+配置监视在线程启动早期已运行，renderer/clipboard 也可能创建内部线程；
+初始 PTY 之后还会新建、恢复标签。因此不存在“所有 fork 都在后台线程之前完成”的保证。
+
+本轮检查本地锁定的 alacritty_terminal 0.26 `tty/unix.rs`：
+它使用 std::process::Command 的 pre_exec，子侧调用 setsid、chdir、
+设置控制终端、关闭 fd 和重置信号处理；exec 前不调用 Tay 的 UI/配置代码。
+当前路径无需依赖“进程只有一个线程”，但依赖上游的子侧实现持续遵守
+fork 后的信号安全约束。升级 alacritty 或修改 pre_exec 时必须重新核查；
+本轮源码审查与真实 PTY 回归不等于对所有 libc/平台组合的形式安全证明。
+
+## 库、fuzz 与验证边界
+
+bin 不再重复声明模块。常规公共 API 只有 run；启用 fuzzing feature 后额外
+公开两个有 64 KiB 输入上限的 fuzz_support 函数。
+内部 StreamScanner/CountingHandler 保持私有，fuzz 直接链接同一份生产实现；
+不再用 build.rs 复制源码，不再维护 target 内部模块副本或重复运行时依赖表。
+sixel target 复用生产解码包装函数。
+
+回归覆盖合并邮箱、应答硬上限与恢复水位、控制停止位、稳定标签身份、
+复制回执容量与搜索隔离、信号唤醒，以及真实 PTY 的查询堵塞、后台退出、
+恢复缺失 shell、SIGTERM 保存、忽略 SIGHUP 的子进程终止与线程回收。
+真实 PTY/信号测试在独立测试子进程和临时 state 目录内运行。
+
+本机隔离 Wayland 冒烟已覆盖标签切换/关闭/重开、配置热重载、字体与栏高调整；
+`tools/lifecycle-smoke.py` 已在唯一命名的临时 systemd 用户服务中验证停止保存
+3 个标签、cwd 与激活位置，并通过 CLI resurrect 恢复。unit 静态校验通过。
+这些结果仅适用于本机环境；未安装或替换正常服务。
+
+当前未由这些测试证明的范围：物理桌面焦点/IME、
+跨合成器、多屏热插拔、GPU 卡顿、进程级故障与所有恶意图像解码成本。
+图像解析/解码仍在会话线程，完整帧快照仍逐批构建；本轮未引入解码线程池或脏行协议。
+
+## 后续方向（未实现）
+
+- 对高频快照分配和图像解码延迟先建立基准，再决定是否增加脏行发布或异步解码。
+- 将进程级服务也纳入可显式停止的生命周期，扩展其它合成器验收。
+- 将配置、截图/基准等启动参数聚合为结构体；按职责逐步缩小 App，避免只按行数拆文件。

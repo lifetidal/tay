@@ -107,6 +107,8 @@ pub enum Event {
     ScaleFactor(f64),
     /// keyboard enter / leave。
     Focused(bool),
+    /// 修饰键变化独立于普通按键,供指针交互使用。
+    ModifiersChanged(Mods),
     Keyboard {
         key: KeyPress,
         pressed: bool,
@@ -1181,6 +1183,7 @@ impl KeyboardHandler for WindowState {
             alt: modifiers.alt,
             meta: modifiers.logo,
         };
+        self.pending.push_back(Event::ModifiersChanged(self.mods));
     }
 }
 

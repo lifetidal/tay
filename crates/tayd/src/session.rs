@@ -1,8 +1,8 @@
 //! 会话状态:终端内核 + 锚点元数据(第八轮,架构 §3/§4)。
 //!
-//! 核心不变量:**Term 与 SessionMeta 合入同一把锁** —— 任何一次
-//! 网格读取都配对产生它的累计滚动位移与版本号,不存在「新网格 +
-//! 旧 cum」的中间态。坐标转换全部集中在本模块,UI 不做手工加减。
+//! 核心不变量:Term、语义状态与 SessionMeta 由会话线程独占。
+//! UI 仅读取同一版本的不可变快照,经命令修改状态;单槽锁只保护
+//! 快照发布,不保护终端内核。坐标转换集中在 session.rs / view.rs。
 //!
 //! 坐标模型:
 //! - `HistoryAnchor`:grid 行 + cum_scroll,只增不减的稳定行号;
@@ -11,7 +11,7 @@
 //! - `SessionMeta::resolve`:锚点 → 网格行的唯一转换点,锚点早于
 //!   历史淘汰时返回 None(显式失效,不猜位置)。
 
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::event::WindowSize;
@@ -54,7 +54,7 @@ pub struct SessionRevision(pub u64);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AnchorEpoch(pub u64);
 
-/// 会话元数据(与 Term 同锁)。
+/// 会话元数据(与 Term 同属会话线程)。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionMeta {
     /// 累计滚动位移(只增不减;绝对行 - cum_scroll = 当前 grid 行)。
@@ -196,7 +196,7 @@ pub enum SessionCommand {
     Search {
         query: String,
         dir: i32,
-        reply: mpsc::Sender<SessionReply>,
+        reply: Replies,
     },
     /// 复制:历史绝对锚点范围(唯一稳定坐标系 —— 滚屏后仍指向
     /// 同一文本;会话侧解析 + 裁剪到存活历史)。`to_col = None`
@@ -208,11 +208,11 @@ pub enum SessionCommand {
         to_line: HistoryAnchor,
         to_col: Option<u32>,
         epoch: AnchorEpoch,
-        reply: mpsc::Sender<SessionReply>,
+        reply: Replies,
     },
     /// vi 模式 yank(选区文本)。
     SelectionToString {
-        reply: mpsc::Sender<SessionReply>,
+        reply: Replies,
     },
     Shutdown,
 }
@@ -221,6 +221,7 @@ pub enum SessionCommand {
 /// revision 丢弃 —— 本轮复制/搜索应答即带快照版本)。
 #[derive(Debug)]
 pub enum SessionReply {
+    Rejected,
     /// 复制结果:`stale` = 世代校验失败(来源快照已失效 —— 清屏/
     /// resize/屏幕切换发生在请求来源之后),UI 应给出轻量反馈且
     /// **不覆盖已有剪贴板**;`stale = false` 且 `text = None` =
@@ -238,6 +239,43 @@ pub enum SessionReply {
         text: Option<String>,
         revision: SessionRevision,
     },
+}
+
+/// Latest clipboard result wins; searches have a separate slot so they cannot
+/// overwrite a pending copy. Oversize copies are rejected whole, never truncated.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct Replies(Arc<Mutex<ReplySlots>>);
+#[derive(Default, Debug)]
+struct ReplySlots {
+    clipboard: Option<SessionReply>,
+    search: Option<SessionReply>,
+}
+impl Replies {
+    pub(crate) fn send(&self, mut reply: SessionReply) {
+        let bytes = match &reply {
+            SessionReply::Copy { text, .. } | SessionReply::Selection { text, .. } => {
+                text.as_ref().map_or(0, String::len)
+            }
+            _ => 0,
+        };
+        if bytes > 4 * 1024 * 1024 {
+            reply = SessionReply::Rejected;
+        }
+        let mut slots = self.0.lock().unwrap();
+        if matches!(reply, SessionReply::Search { .. }) {
+            slots.search = Some(reply);
+        } else {
+            slots.clipboard = Some(reply);
+        }
+    }
+    pub(crate) fn try_recv(&self) -> Result<SessionReply, std::sync::mpsc::TryRecvError> {
+        let mut slots = self.0.lock().unwrap();
+        slots
+            .clipboard
+            .take()
+            .or_else(|| slots.search.take())
+            .ok_or(std::sync::mpsc::TryRecvError::Empty)
+    }
 }
 
 /// 世代校验后的复制结果(会话侧唯一执行入口的返回值)。
@@ -535,6 +573,38 @@ impl Dimensions for TermDims {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replies_are_bounded_and_search_does_not_overwrite_copy() {
+        let replies = super::Replies::default();
+        for i in 0..1000 {
+            replies.send(super::SessionReply::Copy {
+                text: Some(i.to_string()),
+                revision: super::SessionRevision(i),
+                stale: false,
+            });
+            replies.send(super::SessionReply::Search {
+                found: true,
+                revision: super::SessionRevision(i),
+            });
+        }
+        assert!(
+            matches!(replies.try_recv(), Ok(super::SessionReply::Copy { text: Some(text), .. }) if text == "999")
+        );
+        assert!(matches!(
+            replies.try_recv(),
+            Ok(super::SessionReply::Search { .. })
+        ));
+        assert!(replies.try_recv().is_err());
+        replies.send(super::SessionReply::Selection {
+            text: Some("x".repeat(4 * 1024 * 1024 + 1)),
+            revision: super::SessionRevision(1000),
+        });
+        assert!(matches!(
+            replies.try_recv(),
+            Ok(super::SessionReply::Rejected)
+        ));
+    }
+
     use super::*;
 
     #[test]

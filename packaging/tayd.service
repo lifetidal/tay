@@ -5,6 +5,9 @@ After=graphical-session.target
 
 [Service]
 ExecStart=/usr/bin/tayd
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=5
 Restart=on-failure
 # Wayland 连接失败时快速失败重启。
 RestartSec=2

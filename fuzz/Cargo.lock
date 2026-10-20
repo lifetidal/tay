@@ -2425,17 +2425,8 @@ dependencies = [
 name = "tay-fuzz"
 version = "0.0.0"
 dependencies = [
- "alacritty_terminal",
- "base64",
- "icy_sixel",
- "image",
  "libfuzzer-sys",
- "log",
- "polling",
- "tay-config",
- "tay-render",
  "tayd",
- "unicode-width",
 ]
 
 [[package]]
@@ -2473,6 +2464,7 @@ dependencies = [
  "ashpd",
  "async-io",
  "base64",
+ "dirs",
  "env_logger",
  "futures-lite",
  "icy_sixel",
@@ -2482,9 +2474,12 @@ dependencies = [
  "notify",
  "polling",
  "regex",
+ "serde",
+ "signal-hook",
  "tay-config",
  "tay-render",
  "tay-window",
+ "toml",
  "unicode-width",
  "zbus",
 ]

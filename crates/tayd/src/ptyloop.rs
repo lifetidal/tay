@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,18 +35,131 @@ pub const MAX_INFLIGHT_INPUT_BYTES: usize = 512 * 1024;
 
 /// 发送端预算判定(纯函数):在途 + 本次 ≤ 上限。
 pub fn input_budget_ok(inflight: usize, incoming: usize) -> bool {
-    inflight + incoming <= MAX_INFLIGHT_INPUT_BYTES
+    inflight
+        .checked_add(incoming)
+        .is_some_and(|n| n <= MAX_INFLIGHT_INPUT_BYTES)
 }
 
 /// 协议应答(终端 → PTY)的额外余量:应答必须送达,不计入用户
 /// 输入上限但计入在途 —— 在途总量超过「用户上限 + 余量」说明
-/// 应用在输入积压期间高频查询终端(查询风暴),**告警**(不拒绝,
-/// 拒绝会卡住应用)。正常交互远达不到。
+/// 应用在输入积压期间高频查询终端。高水位暂停读取;硬上限或
+/// 长期无进展时明确结束会话,不静默截断应答。
 pub const MAX_RESPONSE_SLACK_BYTES: usize = 256 * 1024;
 
 /// 在途总量(用户输入 + 协议应答)的健康上限(纯函数)。
 pub fn response_budget_ok(total_inflight: usize) -> bool {
     total_inflight <= MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES
+}
+
+const RESPONSE_HIGH_WATER: usize = MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES / 2;
+const RESPONSE_LOW_WATER: usize = MAX_INFLIGHT_INPUT_BYTES / 2;
+const RESPONSE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn reserve_response(inflight: &std::sync::atomic::AtomicUsize, len: usize) -> bool {
+    inflight
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |cur| cur.checked_add(len).filter(|&n| response_budget_ok(n)),
+        )
+        .is_ok()
+}
+
+#[derive(Default)]
+struct Backpressure {
+    paused: bool,
+    last: usize,
+    progress_at: Option<Instant>,
+}
+impl Backpressure {
+    fn update(&mut self, bytes: usize, now: Instant) -> bool {
+        if !self.paused && bytes >= RESPONSE_HIGH_WATER {
+            self.paused = true;
+            self.progress_at = Some(now);
+        }
+        if self.paused {
+            if bytes <= RESPONSE_LOW_WATER {
+                self.paused = false;
+                self.progress_at = None;
+            } else if bytes < self.last {
+                self.progress_at = Some(now);
+            }
+        }
+        self.last = bytes;
+        self.progress_at
+            .is_some_and(|at| now.duration_since(at) >= RESPONSE_STALL_TIMEOUT)
+    }
+}
+
+/// Owns the worker, separately from cloneable input handles.
+pub(crate) struct SessionWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+    sender: TermSender,
+    pidfd: Option<std::os::fd::OwnedFd>,
+    stop_at: std::cell::Cell<Option<Instant>>,
+}
+impl SessionWorker {
+    pub(crate) fn request_stop(&self) {
+        if self.stop_at.get().is_none() {
+            self.stop_at.set(Some(Instant::now()));
+        }
+        let _ = self.sender.send(SessionCommand::Shutdown);
+    }
+    pub(crate) fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_none_or(|h| h.is_finished())
+    }
+    pub(crate) fn reap(&mut self) -> bool {
+        if self
+            .stop_at
+            .get()
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            self.force_stop();
+        }
+        if self.is_finished() {
+            self.finish_until(Instant::now())
+        } else {
+            false
+        }
+    }
+    pub(crate) fn force_stop(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = &self.pidfd {
+            // pidfd identifies this child even if its numeric PID has since been reused.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+    pub(crate) fn finish_until(&mut self, deadline: Instant) -> bool {
+        if self.handle.is_none() {
+            return true;
+        }
+        self.request_stop();
+        while self.handle.as_ref().is_some_and(|h| !h.is_finished()) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.handle.as_ref().is_some_and(|h| h.is_finished()) {
+            if self.handle.take().unwrap().join().is_err() {
+                log::error!("session worker panicked");
+            }
+            true
+        } else {
+            self.force_stop();
+            false
+        }
+    }
+}
+impl Drop for SessionWorker {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
 }
 
 /// 原子预留:检查 + 预留一步完成(`fetch_update` 保证多发送者
@@ -90,11 +203,12 @@ fn input_len(msg: &SessionCommand) -> Option<usize> {
 ///   释放预算)。
 #[derive(Clone)]
 pub struct TermSender {
-    tx: Sender<SessionCommand>,
+    tx: SyncSender<SessionCommand>,
     wake: Arc<UnixStream>,
     /// 在途输入字节(统一预算:跨线程消息 + PTY 待写队列):
     /// UI 入队即预留,会话按实际写入 / 发送失败 / 会话结束释放。
     inflight: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TermSender {
@@ -102,8 +216,18 @@ impl TermSender {
     /// 已排队;顺序由 mpsc FIFO 保证);返回 false 时调用方应给
     /// 用户可见反馈。控制命令不受预算影响。
     pub fn send(&self, msg: SessionCommand) -> bool {
+        if matches!(msg, SessionCommand::Shutdown) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            let _ = (&*self.wake).write(&[0]);
+            return true;
+        }
+        if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
         let Some(len) = input_len(&msg) else {
-            if self.tx.send(msg).is_err() {
+            if self.tx.try_send(msg).is_err() {
+                log::warn!("session command queue full or disconnected; command rejected");
+                let _ = self.send(SessionCommand::Shutdown);
                 return false;
             }
             let _ = (&*self.wake).write(&[0]);
@@ -116,7 +240,7 @@ impl TermSender {
             );
             return false;
         }
-        if self.tx.send(msg).is_err() {
+        if self.tx.try_send(msg).is_err() {
             // 会话已结束:释放预留,额度随会话退出统一清零。
             release_input(&self.inflight, len);
             return false;
@@ -126,25 +250,23 @@ impl TermSender {
         true
     }
 
-    /// 协议应答(终端 → PTY 自回环,如查询应答、OSC 52 确认):
-    /// **必须送达** —— 丢弃应答会卡住应用;不受上限约束但计入
-    /// 在途(会话侧按实际写入释放,记账不变;超出的少量字节会让
-    /// 后续用户输入暂时被拒,直到写掉)。超过「上限 + 余量」
-    /// 只告警(应用查询风暴的诊断信号)。
+    /// Reserve ordered protocol responses within the hard limit.
+    /// Exhaustion terminates the session explicitly rather than truncating a response.
     pub fn send_response(&self, bytes: Vec<u8>) -> bool {
         let len = bytes.len();
-        let total = self
-            .inflight
-            .fetch_add(len, std::sync::atomic::Ordering::Relaxed)
-            + len;
-        if !response_budget_ok(total) {
-            log::error!(
-                "协议应答在途 {total}B 超过余量上限 {}B(应用查询风暴?),仍送达不拒绝",
-                MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES
-            );
+        if self.stop.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
         }
-        if self.tx.send(SessionCommand::Input(bytes)).is_err() {
+        if !reserve_response(&self.inflight, len) {
+            log::error!(
+                "protocol response hard limit reached; terminating session without truncating queued bytes"
+            );
+            let _ = self.send(SessionCommand::Shutdown);
+            return false;
+        }
+        if self.tx.try_send(SessionCommand::Input(bytes)).is_err() {
             release_input(&self.inflight, len);
+            let _ = self.send(SessionCommand::Shutdown);
             return false;
         }
         let _ = (&*self.wake).write(&[0]);
@@ -161,25 +283,39 @@ pub fn spawn<U>(
     pty: tty::Pty,
     snapshot_slot: Arc<Mutex<Option<SessionUpdate>>>,
     initial_cell: (u32, u32),
-) -> std::io::Result<TermSender>
+) -> std::io::Result<(TermSender, SessionWorker)>
 where
-    U: EventListener + Send + 'static,
+    U: EventListener + Clone + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel::<SessionCommand>();
+    let (tx, rx) = mpsc::sync_channel::<SessionCommand>(4096);
     let (wake_tx, wake_rx) = UnixStream::pair()?;
     wake_tx.set_nonblocking(true)?;
     wake_rx.set_nonblocking(true)?;
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let inflight_thread = inflight.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_thread = stop.clone();
 
-    std::thread::Builder::new()
+    use std::os::fd::FromRawFd;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pty.child().id(), 0) };
+    // Refuse startup if a safe process handle cannot be obtained: cleanup must not
+    // signal a reused PID or wait forever on a shell that ignores SIGHUP.
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) });
+    let handle = std::thread::Builder::new()
         .name("pty".into())
         .spawn(move || {
             run(
                 state,
-                listener,
+                listener.clone(),
                 pty,
-                SessionInbox { rx, wake_rx },
+                SessionInbox {
+                    rx,
+                    wake_rx,
+                    stop: stop_thread,
+                },
                 snapshot_slot,
                 inflight_thread,
                 initial_cell,
@@ -187,11 +323,21 @@ where
         })
         .map_err(std::io::Error::other)?;
 
-    Ok(TermSender {
+    let sender = TermSender {
         tx,
         wake: Arc::new(wake_tx),
         inflight,
-    })
+        stop,
+    };
+    Ok((
+        sender.clone(),
+        SessionWorker {
+            handle: Some(handle),
+            sender,
+            pidfd,
+            stop_at: Default::default(),
+        },
+    ))
 }
 
 /// vte Handler 代理(P1 锚点修复):转发给 Term,同时精确计数
@@ -662,7 +808,7 @@ fn flush_pending<W: Write>(
 /// 接受的输入整块丢弃(此前发送端 512 KiB / 会话端 256 KiB
 /// 的不一致:300 KiB 粘贴在 send 成功后仍可能被拒)。pending
 /// 总量由统一预留约束(用户输入 ≤ MAX;协议应答必须送达,
-/// 可另计少量);超出 MAX 只告警、不拒绝。
+/// 可使用独立余量);发送端已强制全部在途硬上限。
 fn enqueue_input(pending: &mut VecDeque<Vec<u8>>, queued_bytes: &mut usize, bytes: Vec<u8>) {
     if *queued_bytes + bytes.len() > MAX_INFLIGHT_INPUT_BYTES {
         log::warn!(
@@ -798,7 +944,15 @@ impl ResizeMerger {
     }
 }
 
+struct ExitNotification<U: EventListener>(U);
+impl<U: EventListener> Drop for ExitNotification<U> {
+    fn drop(&mut self) {
+        self.0.send_event(Event::Exit);
+    }
+}
+
 struct SessionInbox {
+    stop: Arc<std::sync::atomic::AtomicBool>,
     rx: Receiver<SessionCommand>,
     wake_rx: UnixStream,
 }
@@ -812,9 +966,14 @@ fn run<U>(
     inflight: Arc<std::sync::atomic::AtomicUsize>,
     initial_cell: (u32, u32),
 ) where
-    U: EventListener,
+    U: EventListener + Clone,
 {
-    let SessionInbox { rx, mut wake_rx } = inbox;
+    let _exit = ExitNotification(listener.clone());
+    let SessionInbox {
+        rx,
+        mut wake_rx,
+        stop,
+    } = inbox;
     let poller = match Poller::new() {
         Ok(p) => p,
         Err(e) => {
@@ -854,7 +1013,7 @@ fn run<U>(
     let mut buf = vec![0u8; 16 * 1024];
     let mut events = polling::Events::new();
     let mut exiting = false;
-    // 累计滚动位移在 SessionState::meta(与 Term 同锁,架构 §3):
+    // 累计滚动位移在 SessionState::meta(与 Term 同线程,架构 §3):
     // 稳定绝对行 = grid 行 + cum_scroll,只增不减,CountingHandler 精确计数。
     // Term 的 input_needs_wrap 影子(跨 chunk 连续,CountingHandler 维护)。
     let mut wrap_pending = false;
@@ -869,8 +1028,29 @@ fn run<U>(
     let mut queued_bytes: usize = 0;
     // 备用屏幕状态跟踪(坐标身份切换 → 推进锚点世代)。
     let mut alt_screen_active = false;
+    let mut pressure = Backpressure::default();
 
     loop {
+        if stop.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        if pressure.update(
+            inflight.load(std::sync::atomic::Ordering::Relaxed),
+            Instant::now(),
+        ) {
+            log::error!(
+                "protocol response stalled for 5s; terminating session (PTY duplex deadlock)"
+            );
+            break;
+        }
+        // Reapply after drain_pty: paused reads must not spin on a readable fd.
+        let interest = PollEvent::new(PTY_KEY, !pressure.paused, want_write);
+        if poller
+            .modify_with_mode(pty.file(), interest, polling::PollMode::Level)
+            .is_err()
+        {
+            break;
+        }
         // DEC 2026 同步超时:即便无数据也要按时推进 parser(与原版同款)。
         let handler = parser.sync_timeout();
         let timeout = handler
@@ -892,7 +1072,7 @@ fn run<U>(
             match ev.key {
                 PTY_KEY => {
                     let mut read_any = false;
-                    loop {
+                    while !pressure.paused && !stop.load(std::sync::atomic::Ordering::Acquire) {
                         match pty.file().read(&mut buf) {
                             Ok(0) => {
                                 exiting = true;
@@ -976,22 +1156,18 @@ fn run<U>(
                                             state.apply_event(BlockEvent::Invalidated);
                                         }
                                         StreamEvent::KittyResponse(bytes) => {
-                                            // 查询/放置应答:写回 PTY(进写队列,
-                                            // 缓冲满不丢);应答很小,必须送达
-                                            // —— 不计上限但计入在途(写入后
-                                            // 随 flush 释放,记账不变;丢弃
-                                            // 协议应答会卡住应用)。超余量只
-                                            // 告警(查询风暴诊断)。
-                                            let total = inflight.fetch_add(
-                                                bytes.len(),
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            ) + bytes.len();
-                                            if !response_budget_ok(total) {
+                                            // 应答与用户输入共用有界在途记账。
+                                            // 不能完整预留时结束会话,不截断中间应答。
+                                            if !reserve_response(&inflight, bytes.len()) {
                                                 log::error!(
-                                                    "协议应答在途 {total}B 超过余量上限 {}B(应用查询风暴?),仍送达不拒绝",
-                                                    MAX_INFLIGHT_INPUT_BYTES
-                                                        + MAX_RESPONSE_SLACK_BYTES
+                                                    "kitty response hard limit reached; terminating session"
                                                 );
+                                                stop.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                exiting = true;
+                                                continue;
                                             }
                                             queued_bytes += bytes.len();
                                             pending.push_back(bytes);
@@ -1083,6 +1259,7 @@ fn run<U>(
                                 break;
                             }
                         }
+                        break; // One chunk per turn: bound query work and service writes/control.
                     }
                     // 每波输出后发布最新快照并唤醒 UI(架构 §3):
                     // 块事件已入通道、快照已入单槽 —— 不主动唤醒的话,
@@ -1123,7 +1300,11 @@ fn run<U>(
         // (后续复制/搜索/输入看到新布局与失效世代),连续的
         // configure 风暴只重排一次。
         let mut merger = ResizeMerger::new();
-        loop {
+        for _ in 0..256 {
+            if stop.load(std::sync::atomic::Ordering::Acquire) {
+                exiting = true;
+                break;
+            }
             match rx.try_recv() {
                 Ok(msg) => {
                     let is_resize = matches!(msg, SessionCommand::Resize(_));
@@ -1219,7 +1400,8 @@ fn run<U>(
                             let revision = state.meta.revision;
                             state.bump();
                             publish(&snapshot_slot, &state, &listener);
-                            let _ = reply.send(SessionReply::Search { found, revision });
+                            reply.send(SessionReply::Search { found, revision });
+                            listener.send_event(Event::Wakeup);
                         }
                         SessionCommand::CopyAnchors {
                             from_line,
@@ -1242,18 +1424,20 @@ fn run<U>(
                                 }
                                 crate::session::CopyOutcome::Evicted => (None, false),
                             };
-                            let _ = reply.send(SessionReply::Copy {
+                            reply.send(SessionReply::Copy {
                                 text,
                                 revision: state.meta.revision,
                                 stale,
                             });
+                            listener.send_event(Event::Wakeup);
                         }
                         SessionCommand::SelectionToString { reply } => {
                             let text = state.term.selection_to_string();
-                            let _ = reply.send(SessionReply::Selection {
+                            reply.send(SessionReply::Selection {
                                 text,
                                 revision: state.meta.revision,
                             });
+                            listener.send_event(Event::Wakeup);
                         }
                         SessionCommand::Shutdown => {
                             exiting = true;
@@ -1327,6 +1511,18 @@ fn run<U>(
     // 一并作废;并发的发送端释放用饱和减,不会下溢)。
     inflight.store(0, std::sync::atomic::Ordering::Relaxed);
     log::debug!("PTY 事件循环退出");
+}
+
+fn decode_sixel(seq: &[u8]) -> Result<icy_sixel::SixelImage, icy_sixel::SixelError> {
+    icy_sixel::SixelImage::decode(seq)
+}
+
+#[cfg(feature = "fuzzing")]
+pub(crate) fn exercise_sixel(data: &[u8]) {
+    let mut seq = b"\x1bP".to_vec();
+    seq.extend_from_slice(data);
+    seq.extend_from_slice(b"\x1b\\");
+    let _ = decode_sixel(&seq);
 }
 
 /// 字节流事件(扫描器输出;term 无关,可单测)。
@@ -1826,7 +2022,7 @@ impl StreamScanner {
         let mut seq = b"\x1bP".to_vec();
         seq.extend_from_slice(&self.dcs);
         seq.extend_from_slice(b"\x1b\\");
-        if let Ok(img) = icy_sixel::SixelImage::decode(&seq) {
+        if let Ok(img) = decode_sixel(&seq) {
             let (w, h) = img.dimensions();
             if w > 0 && h > 0 && !img.pixels.is_empty() {
                 self.flush_text(out);
@@ -1937,9 +2133,87 @@ fn publish<U: EventListener>(
     }
     listener.send_event(Event::Wakeup);
 }
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn exercise_stream(data: &[u8]) {
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::Config as TermConfig;
+
+    // 与 chunk_split_equivalence_full_term 相同的真实网格
+    // (40 列 × 6 行,历史 200 行;小网格更容易触发换行/滚动边界)。
+    struct Dims;
+    impl Dimensions for Dims {
+        fn columns(&self) -> usize {
+            40
+        }
+        fn screen_lines(&self) -> usize {
+            6
+        }
+        fn total_lines(&self) -> usize {
+            206
+        }
+    }
+
+    let mut term: Term<VoidListener> = Term::new(
+        TermConfig {
+            scrolling_history: 200,
+            ..Default::default()
+        },
+        &Dims,
+        VoidListener,
+    );
+    let mut parser: ansi::Processor = ansi::Processor::new();
+    // 影子状态跨 chunk 存活(与 ptyloop 主循环一致)。
+    let mut wrap_pending = false;
+    let mut scroll_region: Option<(i32, i32, i32)> = None;
+    let mut scanner = StreamScanner::default();
+
+    // 在中点强制切一刀:即使输入很小也覆盖「孤立 ESC 挂起、
+    // OSC/APC/DCS 跨 chunk」等跨读状态(见
+    // chunk_boundaries_do_not_change_events 测试);其余按生产
+    // 16 KiB PTY 读缓冲继续切分。扫描器状态全程存活。
+    let chunks: Vec<&[u8]> = if data.len() >= 2 {
+        let mid = data.len() / 2;
+        data[..mid]
+            .chunks(16 * 1024)
+            .chain(data[mid..].chunks(16 * 1024))
+            .collect()
+    } else {
+        data.chunks(16 * 1024).collect()
+    };
+
+    for chunk in chunks {
+        for ev in scanner.scan(chunk) {
+            if let StreamEvent::Text(bytes) = ev {
+                let mut h = CountingHandler {
+                    term: &mut term,
+                    palette: None,
+                    cell: (8, 16),
+                    responses: Vec::new(),
+                    response_listener: None,
+                    scrolled: 0,
+                    wrap_pending: &mut wrap_pending,
+                    scroll_region: &mut scroll_region,
+                };
+                parser.advance(&mut h, &bytes);
+                let _ = h.scrolled;
+            }
+            // Kitty 图像已在 scan() 内解码(kitty base64/PNG);
+            // OSC 133 / ClearScreen / 应答事件无额外解析步骤。
+        }
+    }
+
+    // 读取最终网格状态,保证整条管线结果被使用。
+    let _ = term.renderable_content();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_fuzz_entry_exercises_chunked_stream() {
+        exercise_stream(b"hello\x1b]133;A\x07\x1b[6n\x1bPq~\x1b\\");
+    }
 
     #[test]
     fn mixed_protocol_replies_preserve_query_order() {
@@ -3344,9 +3618,10 @@ mod tests {
     /// 会话退出清零后并发释放饱和减不溢出。
     #[test]
     fn sender_accepts_300k_rejects_over_budget_and_keeps_control_free() {
-        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let (tx, rx) = mpsc::sync_channel::<SessionCommand>(4096);
         let (wake_tx, _wake_rx) = UnixStream::pair().unwrap();
         let sender = TermSender {
+            stop: Default::default(),
             tx,
             wake: Arc::new(wake_tx),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3363,7 +3638,8 @@ mod tests {
         // 控制命令不受预算影响(满预算下 Shutdown 仍可发可收)。
         assert!(sender.send(SessionCommand::Shutdown));
         assert!(matches!(rx.recv().unwrap(), SessionCommand::Input(_)));
-        assert!(matches!(rx.recv().unwrap(), SessionCommand::Shutdown));
+        assert!(sender.stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(rx.try_recv().is_err());
         // 会话侧:出队不释放 → 写掉后释放 → 归零。
         let inflight = &sender.inflight;
         assert_eq!(
@@ -3389,9 +3665,10 @@ mod tests {
     /// 在途(会话侧写掉后释放,记账不变)。
     #[test]
     fn response_bypasses_limit_but_is_accounted() {
-        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let (tx, rx) = mpsc::sync_channel::<SessionCommand>(4096);
         let (wake_tx, _wake_rx) = UnixStream::pair().unwrap();
         let sender = TermSender {
+            stop: Default::default(),
             tx,
             wake: Arc::new(wake_tx),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(
@@ -3413,6 +3690,47 @@ mod tests {
 
     /// 协议应答余量(纯函数):用户上限 + 余量内健康,超出告警
     /// (不拒绝 —— 应答必须送达)。
+    #[test]
+    fn response_pressure_resumes_on_progress_and_times_out_duplex_stall() {
+        let start = Instant::now();
+        let mut pressure = Backpressure::default();
+        assert!(!pressure.update(RESPONSE_HIGH_WATER, start));
+        assert!(pressure.paused);
+        assert!(!pressure.update(RESPONSE_HIGH_WATER - 1, start + Duration::from_secs(4)));
+        assert!(!pressure.update(RESPONSE_LOW_WATER, start + Duration::from_secs(8)));
+        assert!(!pressure.paused);
+        assert!(!pressure.update(RESPONSE_HIGH_WATER, start + Duration::from_secs(9)));
+        assert!(pressure.update(RESPONSE_HIGH_WATER, start + Duration::from_secs(14)));
+    }
+
+    #[test]
+    fn response_flood_is_bounded_and_stops_session_explicitly() {
+        let (tx, rx) = mpsc::sync_channel(4096);
+        let (wake, _reader) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let sender = TermSender {
+            tx,
+            wake: Arc::new(wake),
+            inflight: Default::default(),
+            stop: Default::default(),
+        };
+        while sender.send_response(vec![1; 8192]) {}
+        assert!(sender.stop.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            sender.inflight.load(std::sync::atomic::Ordering::Relaxed)
+                <= MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES
+        );
+        let bytes: usize = rx
+            .try_iter()
+            .map(|m| match m {
+                SessionCommand::Input(b) => b.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(bytes, MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES);
+        assert!(!sender.send(SessionCommand::Input(vec![2])));
+    }
+
     #[test]
     fn response_slack_boundaries() {
         assert!(response_budget_ok(MAX_INFLIGHT_INPUT_BYTES));
@@ -3625,9 +3943,10 @@ mod tests {
     /// 会话出队后预算释放。
     #[test]
     fn sender_input_budget_refuses_over_limit() {
-        let (tx, rx) = mpsc::channel::<SessionCommand>();
+        let (tx, rx) = mpsc::sync_channel::<SessionCommand>(4096);
         let (w_tx, _w_rx) = UnixStream::pair().unwrap();
         let sender = TermSender {
+            stop: Default::default(),
             tx,
             wake: Arc::new(w_tx),
             inflight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3662,9 +3981,10 @@ mod tests {
         for v in 1..=4u8 {
             assert!(sender.send(SessionCommand::Input(vec![v; 128 * 1024])));
         }
-        assert!(sender.send(SessionCommand::Shutdown));
-        // 排空(与 run 循环同一减计数语义);Shutdown 排在输入之后、
-        // 不受预算阻塞。
+        assert!(sender.send(SessionCommand::ScrollDisplay(
+            alacritty_terminal::grid::Scroll::Delta(0)
+        )));
+        // 排空普通控制命令;真正 Shutdown 使用独立停止位。
         let mut got_shutdown = false;
         loop {
             match rx.try_recv() {
@@ -3673,7 +3993,7 @@ mod tests {
                         .inflight
                         .fetch_sub(bytes.len(), std::sync::atomic::Ordering::Relaxed);
                 }
-                Ok(SessionCommand::Shutdown) => got_shutdown = true,
+                Ok(SessionCommand::ScrollDisplay(_)) => got_shutdown = true,
                 Ok(_) => {}
                 Err(_) => break,
             }

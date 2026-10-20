@@ -15,7 +15,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::Duration;
 const MAX_LINE: usize = 4096;
 const MAX_HANDLERS: usize = 16;
@@ -100,14 +100,14 @@ fn bind_at(path: &std::path::Path) -> std::io::Result<UnixListener> {
 }
 
 /// 命令通道。
-pub fn channel() -> (Sender<IpcCommand>, Receiver<IpcCommand>) {
-    std::sync::mpsc::channel::<IpcCommand>()
+pub fn channel() -> (SyncSender<IpcCommand>, Receiver<IpcCommand>) {
+    std::sync::mpsc::sync_channel::<IpcCommand>(128)
 }
 
-/// 启动 accept 线程(必须在 PTY fork 之后;fork 于多线程进程有死锁风险)。
+/// 启动进程级 accept 服务;初始会话就绪后调用。新标签仍会创建 PTY。
 /// `wake`:命令入队后向事件循环写 1 字节唤醒(非阻塞,失败可忽略——
 /// 唤醒会被合并,下一轮事件自然处理)。
-pub fn accept_loop(listener: UnixListener, tx: Sender<IpcCommand>, wake: Arc<UnixStream>) {
+pub fn accept_loop(listener: UnixListener, tx: SyncSender<IpcCommand>, wake: Arc<UnixStream>) {
     let handlers = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -145,7 +145,7 @@ pub enum IpcCommand {
     Restore,
 }
 
-fn handle_client(stream: UnixStream, tx: Sender<IpcCommand>, wake: Arc<UnixStream>) {
+fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixStream>) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut reader = BufReader::new(stream.try_clone().unwrap_or(stream));
     let mut line = String::new();
@@ -182,11 +182,11 @@ fn handle_client(stream: UnixStream, tx: Sender<IpcCommand>, wake: Arc<UnixStrea
         };
         if let Some(c) = parsed {
             // 语义:ok = 命令已入队(接收确认);操作完成状态见 daemon 日志。
-            if tx.send(c).is_ok() {
+            if tx.try_send(c).is_ok() {
                 let _ = (&*wake).write(&[0]);
                 let _ = writeln!(reader.get_mut(), "ok");
             } else {
-                let _ = writeln!(reader.get_mut(), "error daemon 正在退出");
+                let _ = writeln!(reader.get_mut(), "error daemon 忙碌或正在退出");
                 break;
             }
         }

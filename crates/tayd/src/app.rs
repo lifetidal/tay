@@ -51,6 +51,23 @@ const BELL_FLASH: Duration = Duration::from_millis(140);
 /// 可视铃最大混色强度(背景 → 闪光色的线性插值系数)。
 const BELL_FLASH_MAX: f32 = 0.30;
 
+/// 修饰键事件可能没有对应的普通按键事件;失焦后也不能保留 Ctrl。
+fn pointer_ctrl_state(event: &WEvent) -> Option<bool> {
+    match event {
+        WEvent::ModifiersChanged(mods) | WEvent::Keyboard { mods, .. } => Some(mods.ctrl),
+        WEvent::Focused(false) => Some(false),
+        _ => None,
+    }
+}
+
+/// 失败的标签不会占槽,必须从原索引映射到成功恢复后的索引。
+fn restored_active_index(restored: &[usize], active: usize) -> usize {
+    restored
+        .iter()
+        .position(|&original| original == active)
+        .unwrap_or(0)
+}
+
 /// alacritty_terminal 要求的网格尺寸(其 (usize,usize) 实现仅测试可见)。
 struct Dims {
     cols: usize,
@@ -74,19 +91,21 @@ impl Dimensions for Dims {
 /// 终端事件转发:PTY 线程 → UI 线程。
 #[derive(Clone)]
 struct Listener {
-    tx: mpsc::Sender<Event>,
+    tx: crate::events::Events,
     wake: Arc<UnixStream>,
     sender: Arc<Mutex<Option<TermSender>>>,
     pending: Arc<Mutex<Vec<Event>>>,
+    pending_failed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Listener {
-    fn new(tx: mpsc::Sender<Event>, wake: Arc<UnixStream>) -> Self {
+    fn new(tx: crate::events::Events, wake: Arc<UnixStream>) -> Self {
         Self {
             tx,
             wake,
             sender: Arc::new(Mutex::new(None)),
             pending: Arc::new(Mutex::new(Vec::new())),
+            pending_failed: Default::default(),
         }
     }
 }
@@ -107,6 +126,12 @@ impl Listener {
         for event in self.pending.lock().unwrap().drain(..) {
             Self::respond(&sender, event);
         }
+        if self
+            .pending_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let _ = sender.send(SessionCommand::Shutdown);
+        }
         *sink = Some(sender);
     }
 }
@@ -125,25 +150,35 @@ impl EventListener for Listener {
                 if let Some(s) = sender.as_ref() {
                     Self::respond(s, event);
                 } else {
-                    self.pending.lock().unwrap().push(event);
+                    let mut pending = self.pending.lock().unwrap();
+                    if pending.len() < 4096 {
+                        pending.push(event);
+                    } else {
+                        self.pending_failed
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        log::error!(
+                            "protocol startup queue exhausted; session will terminate on attach"
+                        );
+                    }
                 }
             }
             event => {
-                let _ = self.tx.send(event);
-                let _ = (&*self.wake).write(&[0]);
+                if self.tx.push(event) {
+                    let _ = (&*self.wake).write(&[0]);
+                }
             }
         }
     }
 }
 
 struct TabSession {
-    sender: TermSender,
-    slot: Arc<Mutex<Option<SessionUpdate>>>,
+    worker: Option<crate::ptyloop::SessionWorker>,
+    sender: Option<TermSender>,
+    slot: Option<Arc<Mutex<Option<SessionUpdate>>>>,
     snapshot: Option<Arc<SessionSnapshot>>,
-    tx: mpsc::Sender<Event>,
-    rx: mpsc::Receiver<Event>,
-    reply_tx: mpsc::Sender<SessionReply>,
-    reply_rx: mpsc::Receiver<SessionReply>,
+    rx: crate::events::Events,
+    reply_tx: Option<crate::session::Replies>,
+    reply_rx: Option<crate::session::Replies>,
     title: String,
     /// Shell 子进程 pid(退出时经 /proc/<pid>/cwd 取工作目录,
     /// 写入会话文件供 resurrect 恢复)。
@@ -153,13 +188,39 @@ struct TabSession {
     shell: String,
     /// 折叠状态按**稳定 BlockId** 键控,属该标签(切换标签保留,
     /// 与 alt-screen 切换同理 —— 折叠不得因离开标签而丢失)。
+    seen_epoch: AnchorEpoch,
+    bell_until: Option<Instant>,
     folded: std::collections::BTreeSet<crate::blocks::BlockId>,
 }
 
+use crate::tabs::{TabId, Tabs};
+
+impl TabSession {
+    fn empty() -> Self {
+        Self {
+            worker: None,
+            sender: None,
+            slot: None,
+            snapshot: None,
+            rx: Default::default(),
+            reply_tx: None,
+            reply_rx: None,
+            title: "shell".into(),
+            pid: None,
+            shell: String::new(),
+            folded: Default::default(),
+            seen_epoch: Default::default(),
+            bell_until: None,
+        }
+    }
+}
+
 pub struct TayApp {
-    tabs: Vec<Option<TabSession>>,
-    active_tab: usize,
-    tab_title: String,
+    termination: crate::shutdown::Termination,
+    shutting_down: bool,
+    retiring: Vec<crate::ptyloop::SessionWorker>,
+    tabs: Tabs<TabSession>,
+    active_tab: TabId,
     settings_open: bool,
     hotkey_status: String,
     chrome_hover: Option<crate::chrome::Action>,
@@ -172,9 +233,6 @@ pub struct TayApp {
 
     instance: Option<wgpu::Instance>,
     renderer: Option<tay_render::Renderer>,
-    sender: Option<TermSender>,
-    tx: mpsc::Sender<Event>,
-    rx: mpsc::Receiver<Event>,
     dims: Option<(usize, usize)>,
     preedit: Option<tay_render::Preedit>,
     /// 鼠标选区(稳定锚点):(起点, 当前点) —— 行号为历史绝对行、
@@ -197,22 +255,18 @@ pub struct TayApp {
     vi_search_query: Option<String>,
     /// 显示映射(架构 §2.3:TerminalView;折叠感知正向/反向转换)。
     view: crate::view::ViewMap,
-    /// 折叠状态(UI 视图状态,按稳定 BlockId;行号变化不影响)。
-    folded: std::collections::BTreeSet<crate::blocks::BlockId>,
-    /// 最近见过的网格失效代数(变化 → 丢弃旧视图状态)。
-    seen_epoch: AnchorEpoch,
     /// GPU surface 生命周期阶段(架构 §5.1)。
     gpu_phase: GpuPhase,
     layer_h: i32,
     shown_once: bool,
     show_at: Option<Instant>,
     ipc_listener: Option<std::os::unix::net::UnixListener>,
-    ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
+    ipc_tx: mpsc::SyncSender<crate::ipc::IpcCommand>,
     ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
-    hotkey_tx: mpsc::Sender<crate::hotkey::HotkeyTriggered>,
+    hotkey_tx: mpsc::SyncSender<crate::hotkey::HotkeyTriggered>,
     hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
     wake: Arc<UnixStream>,
-    /// init 完成后启动的后台线程(PTY fork 之后才能起)。
+    /// init 已启动 IPC/portal 服务;运行中新标签仍可创建 PTY。
     threads_started: bool,
 
     frames: u32,
@@ -243,10 +297,6 @@ pub struct TayApp {
     /// Ctrl 键当前是否按住(键盘事件携带 mods;Ctrl+点击打开
     /// OSC 8 超链接时用 —— 指针事件不带修饰键状态)。
     ctrl_held: bool,
-    /// 激活标签的 shell pid 与命令(与 sender 同生命周期,切标签
-    /// 时随 TabSession 往返;退出时写会话文件)。
-    active_pid: Option<u32>,
-    active_shell: String,
     /// 最近一次热重载失败的配置 mtime(同一版本只告警一次,修复后自动恢复)。
     config_error_at: Option<std::time::SystemTime>,
     /// 持久剪贴板(Wayland 上数据归属存活连接:每用新建即弃可能丢数据,
@@ -254,16 +304,6 @@ pub struct TayApp {
     clipboard: Option<arboard::Clipboard>,
     /// 状态 toast(QuickSelect 反馈等):(消息, 置入时间)。
     status_msg: Option<(String, Instant)>,
-    /// 可视铃(终端 BEL):到此时刻为止闪烁网格背景;AboutToWait
-    /// 驱动衰减重绘,到期清除(与状态 toast 同一机制)。
-    bell_until: Option<Instant>,
-    /// 会话:快照单槽(会话线程发布,UI 渲染只读它 —— 架构 §3)。
-    snapshot_slot: Option<Arc<Mutex<Option<SessionUpdate>>>>,
-    /// 最近一次快照(渲染/输入路由/光标定位的唯一来源)。
-    snapshot: Option<Arc<SessionSnapshot>>,
-    /// 会话应答发送端(复制/搜索回执;接收端在 ProxyWake 排空)。
-    reply_tx: Option<mpsc::Sender<SessionReply>>,
-    reply_rx: Option<mpsc::Receiver<SessionReply>>,
 }
 
 /// GPU surface 生命周期(对应窗口层 surface 状态,架构 §5.1):
@@ -330,26 +370,26 @@ impl TayApp {
         paste_at_start: bool,
         slowui_at_start: bool,
         ipc_listener: Option<std::os::unix::net::UnixListener>,
-        ipc_tx: mpsc::Sender<crate::ipc::IpcCommand>,
+        ipc_tx: mpsc::SyncSender<crate::ipc::IpcCommand>,
         ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
-        hotkey_tx: mpsc::Sender<crate::hotkey::HotkeyTriggered>,
+        hotkey_tx: mpsc::SyncSender<crate::hotkey::HotkeyTriggered>,
         hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
         wake: Arc<UnixStream>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel();
+        let (tabs, active_tab) = Tabs::new(TabSession::empty());
         let hotkey_status = format!("{}: requesting system binding", config.global_shortcut);
         Self {
+            termination: crate::shutdown::Termination::install(&wake)
+                .expect("install termination handlers"),
+            shutting_down: false,
+            retiring: Vec::new(),
             config,
             shot,
             bench,
             instance: None,
             renderer: None,
-            sender: None,
-            tx,
-            rx,
-            tabs: vec![None],
-            active_tab: 0,
-            tab_title: "shell".into(),
+            tabs,
+            active_tab,
             settings_open: false,
             hotkey_status,
             chrome_hover: None,
@@ -396,25 +436,16 @@ impl TayApp {
             config_reload: None,
             kitty_down: Default::default(),
             ctrl_held: false,
-            active_pid: None,
-            active_shell: String::new(),
             config_error_at: None,
             clipboard: arboard::Clipboard::new().ok(),
             status_msg: None,
-            bell_until: None,
-            snapshot_slot: None,
-            snapshot: None,
-            folded: Default::default(),
-            seen_epoch: AnchorEpoch::default(),
-            reply_tx: None,
-            reply_rx: None,
         }
     }
 
     /// 呼出(margin 动画到 0;状态机见 visibility.rs,
     /// 此处提交 margin + 重绘;无会话时先启动新会话)。
     fn show(&mut self, ctx: &mut Ctx<'_>) {
-        if self.sender.is_none()
+        if self.tabs[self.active_tab].sender.is_none()
             && let Some((cols, rows)) = self.dims
         {
             match self.start_session(cols, rows) {
@@ -451,7 +482,7 @@ impl TayApp {
 
     /// toggle:动画中则反向(从当前实际位置,而非动画起点)。
     fn toggle(&mut self, ctx: &mut Ctx<'_>) {
-        if self.sender.is_none() {
+        if self.tabs[self.active_tab].sender.is_none() {
             self.show(ctx);
             return;
         }
@@ -567,7 +598,8 @@ impl TayApp {
         cwd: Option<std::path::PathBuf>,
     ) -> Result<TabSession, String> {
         // 终端 + PTY 事件循环线程。
-        let (tx, rx) = mpsc::channel();
+        let tx = crate::events::Events::default();
+        let rx = tx.clone();
         let listener = Listener::new(tx.clone(), self.wake.clone());
         let term_config = TermConfig {
             scrolling_history: 10_000,
@@ -602,13 +634,14 @@ impl TayApp {
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).map_err(|e| format!("创建 PTY 失败: {e}"))?;
-        // spawn 前捕获子进程 pid(会话文件写 /proc/<pid>/cwd 用)。
+        // 捕获 shell pid,供会话保存读取 cwd;线程句柄另由 worker 管理。
         let pid = pty.child().id();
         // 快照单槽 + 应答通道(架构 §3):Term 所有权随 spawn 移入
         // 会话线程,UI 只留句柄。
         let slot: Arc<Mutex<Option<SessionUpdate>>> = Arc::new(Mutex::new(None));
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let sender = crate::ptyloop::spawn(
+        let reply_tx = crate::session::Replies::default();
+        let reply_rx = reply_tx.clone();
+        let (sender, worker) = crate::ptyloop::spawn(
             state,
             listener.clone(),
             pty,
@@ -618,39 +651,43 @@ impl TayApp {
         .map_err(|e| format!("PTY 事件循环创建失败: {e}"))?;
         listener.attach(sender.clone());
         Ok(TabSession {
-            sender,
-            slot,
+            worker: Some(worker),
+            sender: Some(sender),
+            slot: Some(slot),
             snapshot: None,
-            tx,
             rx,
-            reply_tx,
-            reply_rx,
+            reply_tx: Some(reply_tx),
+            reply_rx: Some(reply_rx),
             title: "shell".into(),
             pid: Some(pid),
             shell,
             folded: Default::default(),
+            seen_epoch: Default::default(),
+            bell_until: None,
         })
     }
 
     fn install_session(&mut self, tab: TabSession) {
+        self.tabs[self.active_tab] = tab;
+        self.activate_view();
+    }
+
+    /// Transient gestures belong to the focused UI; session data stays in the collection.
+    fn activate_view(&mut self) {
         self.kitty_down.clear();
-        self.sender = Some(tab.sender);
-        self.snapshot = tab
+        let tab = &mut self.tabs[self.active_tab];
+        if let Some(update) = tab
             .slot
-            .lock()
-            .unwrap()
-            .take()
-            .map(|u| u.snapshot)
-            .or(tab.snapshot);
-        self.snapshot_slot = Some(tab.slot);
-        self.tx = tab.tx;
-        self.rx = tab.rx;
-        self.reply_tx = Some(tab.reply_tx);
-        self.reply_rx = Some(tab.reply_rx);
-        self.tab_title = tab.title;
-        self.active_pid = tab.pid;
-        self.active_shell = tab.shell;
-        self.folded = tab.folded;
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap().take())
+        {
+            tab.snapshot = Some(update.snapshot);
+        }
+        tab.seen_epoch = tab
+            .snapshot
+            .as_ref()
+            .map(|s| s.meta.invalidate_epoch)
+            .unwrap_or_default();
         self.sel = None;
         self.quick = None;
         self.preedit = None;
@@ -659,46 +696,32 @@ impl TayApp {
         self.vi_search_query = None;
         self.scroll_px = 0.0;
         self.status_msg = None;
-        self.seen_epoch = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.meta.invalidate_epoch)
-            .unwrap_or_default();
         self.view = Default::default();
     }
 
+    fn active_index(&self) -> usize {
+        self.tabs.position(self.active_tab)
+    }
+
     fn switch_tab(&mut self, index: usize, ctx: &mut Ctx<'_>) {
-        if index == self.active_tab || index >= self.tabs.len() {
+        let Some(id) = self.tabs.id_at(index) else {
+            return;
+        };
+        if id == self.active_tab {
             return;
         }
-        let Some(next) = self.tabs[index].take() else {
-            return;
-        };
-        let (_, empty_rx) = mpsc::channel();
-        let old = TabSession {
-            sender: self.sender.take().expect("active session"),
-            slot: self.snapshot_slot.take().expect("active snapshot slot"),
-            snapshot: self.snapshot.take(),
-            tx: self.tx.clone(),
-            rx: std::mem::replace(&mut self.rx, empty_rx),
-            reply_tx: self.reply_tx.take().expect("active reply sender"),
-            reply_rx: self.reply_rx.take().expect("active reply receiver"),
-            title: self.tab_title.clone(),
-            pid: self.active_pid,
-            shell: std::mem::take(&mut self.active_shell),
-            folded: std::mem::take(&mut self.folded),
-        };
-        self.tabs[self.active_tab] = Some(old);
-        self.active_tab = index;
-        self.install_session(next);
+        self.active_tab = id;
+        self.activate_view();
         self.resize_active();
         ctx.request_redraw();
     }
 
     fn resize_active(&self) {
-        if let (Some((cols, rows)), Some(r), Some(sender)) =
-            (self.dims, &self.renderer, &self.sender)
-        {
+        if let (Some((cols, rows)), Some(r), Some(sender)) = (
+            self.dims,
+            &self.renderer,
+            &self.tabs[self.active_tab].sender,
+        ) {
             let (cw, ch) = r.cell_size();
             let _ = sender.send(SessionCommand::Resize(WindowSize {
                 num_cols: cols as u16,
@@ -712,33 +735,74 @@ impl TayApp {
     /// 优雅退出:把标签骨架写入会话文件(`tay resurrect` 恢复)。
     /// 保存失败只记日志,不阻断退出(quit 语义优先)。
     fn write_session_file(&self) {
-        let mut tabs: Vec<crate::persist::PersistTab> = Vec::new();
-        for (i, slot) in self.tabs.iter().enumerate() {
-            let pt = if i == self.active_tab {
-                crate::persist::PersistTab {
-                    shell: self.active_shell.clone(),
-                    cwd: self.active_pid.and_then(crate::persist::cwd_of),
-                    title: self.tab_title.clone(),
-                }
-            } else if let Some(t) = slot {
-                crate::persist::PersistTab {
-                    shell: t.shell.clone(),
-                    cwd: t.pid.and_then(crate::persist::cwd_of),
-                    title: t.title.clone(),
-                }
-            } else {
-                continue;
-            };
-            tabs.push(pt);
-        }
-        match crate::persist::save(&tabs, self.active_tab) {
+        let tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .filter(|(_, tab)| tab.sender.is_some())
+            .map(|(_, tab)| crate::persist::PersistTab {
+                shell: tab.shell.clone(),
+                cwd: tab.pid.and_then(crate::persist::cwd_of),
+                title: tab.title.clone(),
+            })
+            .collect();
+        match crate::persist::save(&tabs, self.active_index()) {
             Ok(()) => log::info!("会话文件已保存: {} 个标签", tabs.len()),
             Err(e) => log::warn!("会话文件保存失败: {e}"),
         }
     }
 
+    /// All normal exits converge here; persistence precedes stopping child shells.
+    fn shutdown(&mut self, ctx: &mut Ctx<'_>) {
+        if self.shutting_down {
+            return;
+        }
+        self.finish_shutdown();
+        ctx.exit();
+    }
+
+    fn finish_shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
+        self.write_session_file();
+        self.stop_sessions();
+    }
+
+    fn stop_sessions(&mut self) {
+        for worker in &self.retiring {
+            worker.request_stop();
+        }
+        for (_, tab) in self.tabs.iter() {
+            if let Some(worker) = &tab.worker {
+                worker.request_stop();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for (_, tab) in self.tabs.iter_mut() {
+            if let Some(worker) = &mut tab.worker
+                && !worker.finish_until(deadline)
+            {
+                log::warn!("session cleanup timed out; child killed via pidfd");
+            }
+        }
+        for worker in &mut self.retiring {
+            let _ = worker.finish_until(deadline);
+        }
+        // Give killed children a shared short window to be reaped by Pty::drop.
+        let reap_deadline = Instant::now() + Duration::from_millis(100);
+        for (_, tab) in self.tabs.iter_mut() {
+            if let Some(worker) = &mut tab.worker {
+                let _ = worker.finish_until(reap_deadline);
+            }
+        }
+        for worker in &mut self.retiring {
+            let _ = worker.finish_until(reap_deadline);
+        }
+    }
+
     fn new_tab(&mut self, ctx: &mut Ctx<'_>) {
-        if self.sender.is_none() {
+        if self.tabs[self.active_tab].sender.is_none() {
             self.show(ctx);
             return;
         }
@@ -749,7 +813,7 @@ impl TayApp {
         let (cols, rows) = self.dims.unwrap_or((80, 24));
         match self.start_session(cols, rows) {
             Ok(tab) => {
-                self.tabs.push(Some(tab));
+                self.tabs.insert(tab);
                 self.switch_tab(self.tabs.len() - 1, ctx);
             }
             Err(e) => self.status(format!("新建标签失败: {e}"), ctx),
@@ -757,54 +821,67 @@ impl TayApp {
     }
 
     fn close_tab(&mut self, index: usize, ctx: &mut Ctx<'_>) {
-        if index >= self.tabs.len() {
+        let Some(id) = self.tabs.id_at(index) else {
             return;
-        }
-        if self.tabs.len() == 1 {
-            if let Some(s) = self.sender.take() {
-                let _ = s.send(SessionCommand::Shutdown);
-            }
-            self.snapshot = None;
-            self.snapshot_slot = None;
-            self.sel = None;
-            self.quick = None;
-            self.preedit = None;
-            self.tab_title = "shell".into();
-            // Keep the portal binding alive. Start a fresh shell only on
-            // the next explicit show, so an exiting shell cannot respawn-loop.
+        };
+        self.remove_session(id);
+        if self.tabs[self.active_tab].sender.is_none() {
             self.hide(ctx);
-            return;
-        }
-        if index == self.active_tab {
-            let next = if index == 0 { 1 } else { index - 1 };
-            self.switch_tab(next, ctx);
-        }
-        if let Some(tab) = self.tabs.remove(index) {
-            let _ = tab.sender.send(SessionCommand::Shutdown);
-        }
-        if self.active_tab > index {
-            self.active_tab -= 1;
         }
         ctx.request_redraw();
     }
 
-    fn chrome_items(&self, cols: usize) -> Vec<crate::chrome::Item> {
-        let titles: Vec<String> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                if i == self.active_tab {
-                    self.tab_title.clone()
-                } else {
-                    t.as_ref().map(|t| t.title.clone()).unwrap_or_default()
+    fn remove_session(&mut self, id: TabId) {
+        let index = self.tabs.position(id);
+        if let Some(mut worker) = self.tabs[id].worker.take() {
+            worker.request_stop();
+            // UI must not wait on a child. Keep its handle until the next wake/shutdown.
+            if worker.is_finished() {
+                let _ = worker.finish_until(Instant::now());
+            } else {
+                self.retiring.push(worker);
+            }
+        }
+        if self.tabs.len() == 1 {
+            self.tabs[id] = TabSession::empty();
+            self.activate_view();
+            return;
+        }
+        if id == self.active_tab {
+            let next = if index == 0 { 1 } else { index - 1 };
+            self.active_tab = self.tabs.id_at(next).expect("remaining tab");
+            self.activate_view();
+            self.resize_active();
+        }
+        self.tabs.remove(id);
+    }
+
+    fn background_exits(&mut self) -> Vec<TabId> {
+        let mut exited = Vec::new();
+        for (id, tab) in self.tabs.iter_mut() {
+            if id == self.active_tab {
+                continue;
+            }
+            for event in tab.rx.drain() {
+                match event {
+                    Event::Title(title) => tab.title = title,
+                    Event::Exit | Event::ChildExit(_) => {
+                        exited.push(id);
+                        break;
+                    }
+                    _ => {}
                 }
-            })
-            .collect();
+            }
+        }
+        exited
+    }
+
+    fn chrome_items(&self, cols: usize) -> Vec<crate::chrome::Item> {
+        let titles: Vec<_> = self.tabs.iter().map(|(_, tab)| tab.title.clone()).collect();
         crate::chrome::layout(
             cols,
             &titles,
-            self.active_tab,
+            self.active_index(),
             self.settings_open,
             &self.config,
             &clock_text(),
@@ -818,13 +895,10 @@ impl TayApp {
     }
 
     fn update_session_colors(&self) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(SessionCommand::SetColors(self.config.colors.clone()));
-        }
-        for tab in self.tabs.iter().flatten() {
-            let _ = tab
-                .sender
-                .send(SessionCommand::SetColors(self.config.colors.clone()));
+        for (_, tab) in self.tabs.iter() {
+            if let Some(sender) = &tab.sender {
+                let _ = sender.send(SessionCommand::SetColors(self.config.colors.clone()));
+            }
         }
     }
 
@@ -853,8 +927,7 @@ impl TayApp {
             }
             Action::CloseWindow => {
                 // 窗口 × 按钮 = 优雅退出:与 tay quit 同路写会话文件。
-                self.write_session_file();
-                ctx.exit();
+                self.shutdown(ctx);
             }
             Action::Clock => { /* 非交互:点击无操作 */ }
             Action::Hotkeys => {
@@ -936,6 +1009,40 @@ impl TayApp {
         }
     }
 
+    fn restore_sessions(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        saved: &[crate::persist::PersistTab],
+        active: usize,
+    ) -> bool {
+        let mut restored = Vec::new();
+        for (i, pt) in saved.iter().take(24).enumerate() {
+            let cwd = pt.cwd.as_deref().map(std::path::PathBuf::from);
+            match self.start_session_with(cols, rows, pt.shell.clone(), cwd) {
+                Ok(mut tab) => {
+                    tab.title = pt.title.clone();
+                    if restored.is_empty() {
+                        self.install_session(tab);
+                    } else {
+                        self.tabs.insert(tab);
+                    }
+                    restored.push(i);
+                }
+                Err(error) => log::warn!("恢复标签 {i} 失败: {error}"),
+            }
+        }
+        if restored.is_empty() {
+            return false;
+        }
+        let index = restored_active_index(&restored, active);
+        self.active_tab = self.tabs.id_at(index).expect("restored active tab");
+        self.activate_view();
+        self.resize_active();
+        log::info!("resurrect: 恢复 {} 个标签,激活 {index}", restored.len());
+        true
+    }
+
     /// can_create_surfaces:建 GPU → 终端 → PTY 线程 → 定尺寸。
     fn init(&mut self, ctx: &mut Ctx<'_>) {
         let result = (|| -> Result<(), String> {
@@ -963,43 +1070,9 @@ impl TayApp {
                 .then(crate::persist::load)
                 .flatten()
             {
-                let mut created = 0usize;
-                for (i, pt) in persist_tabs.iter().enumerate() {
-                    if i >= 24 {
-                        log::warn!("会话文件超过 24 个标签,其余忽略");
-                        break;
-                    }
-                    let cwd = pt.cwd.as_deref().map(std::path::PathBuf::from);
-                    match self.start_session_with(cols, rows, pt.shell.clone(), cwd) {
-                        Ok(mut tab) => {
-                            tab.title = pt.title.clone();
-                            if i == 0 {
-                                self.tabs[0] = Some(tab);
-                            } else {
-                                self.tabs.push(Some(tab));
-                            }
-                            created += 1;
-                        }
-                        Err(e) => {
-                            log::warn!("恢复标签 {i} 失败: {e}");
-                            if i == 0 {
-                                break; // 首个失败 → 整体回退默认单标签
-                            }
-                        }
-                    }
-                }
-                if created == 0 {
+                if !self.restore_sessions(cols, rows, &persist_tabs, active) {
                     let tab = self.start_session(cols, rows)?;
                     self.install_session(tab);
-                } else {
-                    // 先安装首个(switch_tab 的旧槽构造前提),再切到
-                    // 记录的目标;目标槽缺失(恢复失败)→ 留在首个。
-                    let first = self.tabs[0].take().expect("首个标签已创建");
-                    self.install_session(first);
-                    if active > 0 && active < self.tabs.len() && self.tabs[active].is_some() {
-                        self.switch_tab(active, ctx);
-                    }
-                    log::info!("resurrect:恢复 {created} 个标签,激活 {}", self.active_tab);
                 }
             } else {
                 let tab = self.start_session(cols, rows)?;
@@ -1012,7 +1085,7 @@ impl TayApp {
             ctx.set_top_margin(-self.layer_h);
             ctx.request_redraw();
 
-            // PTY 已 fork:现在才允许起多线程(IPC accept / portal)。
+            // 初始 PTY 已就绪后启动 IPC/portal;新标签仍在多线程运行期创建。
             if let Some(listener) = self.ipc_listener.take() {
                 crate::ipc::accept_loop(listener, self.ipc_tx.clone(), self.wake.clone());
             }
@@ -1035,7 +1108,7 @@ impl TayApp {
 
     /// 当前光标位置(显示坐标;唯一来源 = 会话快照)。
     fn cursor_pos(&self) -> (usize, usize) {
-        let Some(snap) = &self.snapshot else {
+        let Some(snap) = &self.tabs[self.active_tab].snapshot else {
             return (0, 0);
         };
         self.view
@@ -1085,7 +1158,7 @@ impl TayApp {
             self.sel = None;
             self.quick = None;
             // 终端内核 resize 归会话线程(架构 §3):PTY 与网格一并更新。
-            if let Some(sender) = &self.sender {
+            if let Some(sender) = &self.tabs[self.active_tab].sender {
                 let _ = sender.send(SessionCommand::Resize(WindowSize {
                     num_lines: rows as u16,
                     num_cols: cols as u16,
@@ -1143,7 +1216,7 @@ impl TayApp {
     /// 显示单元 → OSC 8 超链接 URI(显示行经视图映射回网格行,
     /// 与选区/光标共用同一转换;无链接 → None)。
     fn link_at_cell(&self, col: usize, row: usize) -> Option<Arc<str>> {
-        let snap = self.snapshot.as_ref()?;
+        let snap = self.tabs[self.active_tab].snapshot.as_ref()?;
         let cols = snap.dims.0;
         let gl = self.view.row_to_grid(row)?;
         let first = -(snap.display_offset as i32);
@@ -1167,7 +1240,7 @@ impl TayApp {
     /// 它的 SessionMeta —— 网格与锚点必然同一版本(架构 §3);
     /// 尚未收到快照(会话刚启动)时渲染空白网格。
     fn build_grid(&mut self) -> tay_render::Grid {
-        let snap = self.snapshot.clone();
+        let snap = self.tabs[self.active_tab].snapshot.clone();
         // 快照尺寸优先(会话版本),尚未有快照时回退到本地布局值。
         let (cols, rows) = snap
             .as_ref()
@@ -1195,7 +1268,13 @@ impl TayApp {
         let ranges: Vec<(i32, i32)> = snap
             .as_ref()
             .map(|s| {
-                crate::view::fold_ranges_to_grid(&s.blocks, &self.folded, meta, total_lines, rows)
+                crate::view::fold_ranges_to_grid(
+                    &s.blocks,
+                    &self.tabs[self.active_tab].folded,
+                    meta,
+                    total_lines,
+                    rows,
+                )
             })
             .unwrap_or_default();
         // 显示映射(架构 §2.3:TerminalView,view.rs;正向/反向
@@ -1252,7 +1331,7 @@ impl TayApp {
         }
         // 可视铃:网格背景向闪光色衰减混色(剩余时长 → 强度)。
         // 覆盖全部单元(含折叠占位行),整面统一闪烁。
-        if let Some(until) = self.bell_until {
+        if let Some(until) = self.tabs[self.active_tab].bell_until {
             let remain = until.saturating_duration_since(Instant::now());
             let k =
                 BELL_FLASH_MAX * (remain.as_secs_f32() / BELL_FLASH.as_secs_f32()).clamp(0.0, 1.0);
@@ -1378,7 +1457,7 @@ impl TayApp {
     /// 滚动条指示器(终端区,不含操作栏):视口位置与占比。
     /// 无滚动历史(total ≤ rows)时返回 None。
     fn build_scrollbar(&self, term_rows: usize) -> Option<tay_render::Scrollbar> {
-        let snap = self.snapshot.as_ref()?;
+        let snap = self.tabs[self.active_tab].snapshot.as_ref()?;
         if snap.mode.contains(TermMode::ALT_SCREEN) {
             return None;
         }
@@ -1408,8 +1487,8 @@ impl TayApp {
     fn drag_scrollbar(&self, y: f32, grab: f32, epoch: AnchorEpoch) {
         if let (Some(geometry), Some(snapshot), Some(sender), Some((_, rows))) = (
             self.scrollbar_geometry(),
-            &self.snapshot,
-            &self.sender,
+            &self.tabs[self.active_tab].snapshot,
+            &self.tabs[self.active_tab].sender,
             self.dims,
         ) {
             let offset = geometry.offset(y, grab, snapshot.total_lines.saturating_sub(rows));
@@ -1419,7 +1498,9 @@ impl TayApp {
 
     /// 折叠/展开光标所在命令块(Ctrl+Shift+H)。
     fn toggle_fold_at_cursor(&mut self, ctx: &mut Ctx<'_>) {
-        let Some(snap) = &self.snapshot else { return };
+        let Some(snap) = self.tabs[self.active_tab].snapshot.clone() else {
+            return;
+        };
         let line = snap.cursor.line;
         self.toggle_fold_line(line, ctx);
     }
@@ -1427,7 +1508,9 @@ impl TayApp {
     /// 折叠/展开包含网格行 `line` 的命令块(折叠按稳定 BlockId,
     /// 不依赖可能变化的行号 —— 架构 §3)。
     fn toggle_fold_line(&mut self, line: i32, ctx: &mut Ctx<'_>) {
-        let Some(snap) = &self.snapshot else { return };
+        let Some(snap) = self.tabs[self.active_tab].snapshot.clone() else {
+            return;
+        };
         let anchor = HistoryAnchor(line + snap.meta.cum_scroll);
         let Some(prompt) = snap.blocks.prompt_containing(anchor) else {
             return;
@@ -1435,10 +1518,10 @@ impl TayApp {
         let Some(block) = snap.blocks.blocks().iter().find(|b| b.prompt == prompt) else {
             return;
         };
-        let folded = if self.folded.remove(&block.id) {
+        let folded = if self.tabs[self.active_tab].folded.remove(&block.id) {
             false
         } else {
-            self.folded.insert(block.id);
+            self.tabs[self.active_tab].folded.insert(block.id);
             true
         };
         log::info!(
@@ -1473,7 +1556,7 @@ impl TayApp {
         if grid_line < 0 {
             return None;
         }
-        let snap = self.snapshot.as_ref()?;
+        let snap = self.tabs[self.active_tab].snapshot.as_ref()?;
         let cum = snap.meta.cum_scroll;
         snap.blocks
             .nonzero_exit_at(HistoryAnchor(grid_line + cum))
@@ -1491,7 +1574,7 @@ impl TayApp {
     /// TAY_IME 验收钩子复用)。
     fn ime_commit(&mut self, text: String, ctx: &mut Ctx<'_>) {
         log::info!("IME 提交 {} 字节", text.len());
-        if let Some(sender) = &self.sender
+        if let Some(sender) = &self.tabs[self.active_tab].sender
             && !sender.send(SessionCommand::Input(text.into_bytes()))
         {
             // 拒绝有可见反馈(统一预算满:终端积压)。
@@ -1503,7 +1586,7 @@ impl TayApp {
 
     /// vi 复制模式切换(Ctrl+Shift+Space;命令 → 会话)。
     fn toggle_vi(&mut self, ctx: &mut Ctx<'_>) {
-        if let Some(sender) = &self.sender {
+        if let Some(sender) = &self.tabs[self.active_tab].sender {
             let _ = sender.send(SessionCommand::ToggleVi);
             self.vi_search_query = None;
             ctx.request_redraw();
@@ -1512,12 +1595,12 @@ impl TayApp {
 
     fn paste_clipboard(&mut self, ctx: &mut Ctx<'_>) {
         if let Some(text) = self.get_clipboard() {
-            let bracketed = self
+            let bracketed = self.tabs[self.active_tab]
                 .snapshot
                 .as_ref()
                 .is_some_and(|s| s.mode.contains(TermMode::BRACKETED_PASTE));
             let bytes = crate::input::paste_bytes(&text, bracketed);
-            if let Some(sender) = &self.sender
+            if let Some(sender) = &self.tabs[self.active_tab].sender
                 && !sender.send(SessionCommand::Input(bytes))
             {
                 self.status("粘贴被拒绝:终端积压,请稍后再试", ctx);
@@ -1553,7 +1636,7 @@ impl TayApp {
         };
         if (pressed || kitty_flags.report_events)
             && let Some(bytes) = crate::keys::translate_kitty(key, mods, &kitty_flags, event)
-            && let Some(sender) = &self.sender
+            && let Some(sender) = &self.tabs[self.active_tab].sender
         {
             if sender.send(SessionCommand::Input(bytes)) {
                 if pressed && kitty_flags.report_events {
@@ -1614,7 +1697,7 @@ impl TayApp {
             _ => None,
         };
         if let Some(m) = motion {
-            if let Some(sender) = &self.sender {
+            if let Some(sender) = &self.tabs[self.active_tab].sender {
                 let _ = sender.send(SessionCommand::ViMotion(m));
             }
             ctx.request_redraw();
@@ -1623,7 +1706,10 @@ impl TayApp {
         match key.key {
             // yank:复制选区并退出 vi(应答在 ProxyWake 排空 → 剪贴板)。
             K::Char('y') => {
-                if let (Some(sender), Some(reply)) = (&self.sender, self.reply_tx.clone()) {
+                if let (Some(sender), Some(reply)) = (
+                    &self.tabs[self.active_tab].sender,
+                    self.tabs[self.active_tab].reply_tx.clone(),
+                ) {
                     let _ = sender.send(SessionCommand::SelectionToString { reply });
                     let _ = sender.send(SessionCommand::ToggleVi);
                 }
@@ -1638,7 +1724,7 @@ impl TayApp {
             K::Char('N') => self.vi_search_next(-1, ctx),
             // 退出。
             K::Named(N::Escape) | K::Char('q') => {
-                if let Some(sender) = &self.sender {
+                if let Some(sender) = &self.tabs[self.active_tab].sender {
                     let _ = sender.send(SessionCommand::ToggleVi);
                 }
                 ctx.request_redraw();
@@ -1652,7 +1738,10 @@ impl TayApp {
         let Some(query) = self.vi_search_query.clone() else {
             return;
         };
-        if let (Some(sender), Some(reply)) = (&self.sender, self.reply_tx.clone()) {
+        if let (Some(sender), Some(reply)) = (
+            &self.tabs[self.active_tab].sender,
+            self.tabs[self.active_tab].reply_tx.clone(),
+        ) {
             let _ = sender.send(SessionCommand::Search { query, dir, reply });
         }
         ctx.request_redraw();
@@ -1662,9 +1751,15 @@ impl TayApp {
     /// 视口顶来自快照;滚动定位在会话侧解析 + 世代校验(淘汰/过期
     /// 目标 no-op)。
     fn jump_prompt(&mut self, dir: i32) {
-        let Some(snap) = &self.snapshot else { return };
+        let Some(snap) = self.tabs[self.active_tab].snapshot.clone() else {
+            return;
+        };
         let top = HistoryAnchor(-(snap.display_offset as i32) + snap.meta.cum_scroll);
-        let Some(blocks) = self.snapshot.as_ref().map(|s| s.blocks.clone()) else {
+        let Some(blocks) = self.tabs[self.active_tab]
+            .snapshot
+            .as_ref()
+            .map(|s| s.blocks.clone())
+        else {
             return;
         };
         let target = if dir < 0 {
@@ -1673,7 +1768,7 @@ impl TayApp {
             blocks.prompt_after(top)
         };
         if let Some(line) = target
-            && let Some(sender) = &self.sender
+            && let Some(sender) = &self.tabs[self.active_tab].sender
         {
             // 携带来源世代:执行前清屏/resize/屏幕切换 → 会话拒绝。
             let epoch = snap.meta.invalidate_epoch;
@@ -1688,13 +1783,16 @@ impl TayApp {
     /// 并裁剪到存活历史;请求携带来源世代,执行前校验(应答携带
     /// 版本与过期标记,ProxyWake 排空 → 剪贴板/轻量反馈)。
     fn copy_command_output(&mut self) {
-        let Some(snap) = self.snapshot.as_ref() else {
+        let Some(snap) = self.tabs[self.active_tab].snapshot.as_ref() else {
             return;
         };
         let Some((from_line, end_line, end_col)) = snap.blocks.last_output_range() else {
             return;
         };
-        if let (Some(sender), Some(reply)) = (&self.sender, self.reply_tx.clone()) {
+        if let (Some(sender), Some(reply)) = (
+            &self.tabs[self.active_tab].sender,
+            self.tabs[self.active_tab].reply_tx.clone(),
+        ) {
             let _ = sender.send(SessionCommand::CopyAnchors {
                 from_line,
                 from_col: 0,
@@ -1726,7 +1824,7 @@ impl TayApp {
     /// 滚轮滚动(ScrollDisplay 命令;TAY_SCROLL 钩子共用)。
     fn scroll_delta(&mut self, delta: i32) {
         if delta != 0
-            && let Some(sender) = &self.sender
+            && let Some(sender) = &self.tabs[self.active_tab].sender
         {
             let _ = sender.send(SessionCommand::ScrollDisplay(Scroll::Delta(delta)));
         }
@@ -1744,7 +1842,10 @@ impl TayApp {
 
     /// 选区复制:优先自己的鼠标选区,其次 vi 选区(会话侧应答)。
     fn copy_selection(&mut self) {
-        let (Some(sender), Some(reply)) = (&self.sender, self.reply_tx.clone()) else {
+        let (Some(sender), Some(reply)) = (
+            &self.tabs[self.active_tab].sender,
+            self.tabs[self.active_tab].reply_tx.clone(),
+        ) else {
             return;
         };
         if let Some((start, end)) = self.sel {
@@ -1812,7 +1913,7 @@ impl TayApp {
         if let (Some(stage), Some(g), Some(snapshot), Some((_, rows))) = (
             self.scrollbar_smoke,
             self.scrollbar_geometry(),
-            self.snapshot.clone(),
+            self.tabs[self.active_tab].snapshot.clone(),
             self.dims,
         ) {
             let history = snapshot.total_lines.saturating_sub(rows);
@@ -1902,7 +2003,7 @@ impl TayApp {
                 self.paste_at_start = false;
             }
             let paste = vec![if second { b'b' } else { b'a' }; 300 * 1024];
-            if let Some(sender) = &self.sender
+            if let Some(sender) = &self.tabs[self.active_tab].sender
                 && !sender.send(SessionCommand::Input(paste))
             {
                 log::error!(
@@ -1920,12 +2021,13 @@ impl TayApp {
         // TAY_FOLD:第 14 帧自动折叠第一条命令输出(验证用)。
         if self.fold_at_start && self.frames == 14 {
             self.fold_at_start = false;
-            if let Some(block) = self
+            if let Some(block) = self.tabs[self.active_tab]
                 .snapshot
+                .clone()
                 .as_ref()
                 .and_then(|s| s.blocks.blocks().first())
             {
-                self.folded.insert(block.id);
+                self.tabs[self.active_tab].folded.insert(block.id);
                 log::info!("折叠验证:块 #{} @ {}", block.id.0, block.prompt.0);
             }
         }
@@ -1933,7 +2035,7 @@ impl TayApp {
         // TAY_VI:第 13 帧自动进入 vi 模式(验证用)。
         if self.vi_at_start && self.frames == 13 {
             self.vi_at_start = false;
-            if let Some(sender) = &self.sender {
+            if let Some(sender) = &self.tabs[self.active_tab].sender {
                 let _ = sender.send(SessionCommand::ToggleVi);
                 log::info!("已进入 vi 复制模式(验证)");
             }
@@ -1954,7 +2056,7 @@ impl TayApp {
         // TAY_EXEC:第 10 帧执行命令(等 shell 就绪)。
         if !self.exec_sent && self.frames >= 10 {
             self.exec_sent = true;
-            if let (Some(sender), Some(cmd)) = (&self.sender, &self.exec) {
+            if let (Some(sender), Some(cmd)) = (&self.tabs[self.active_tab].sender, &self.exec) {
                 log::info!("执行: {cmd}");
                 let _ = sender.send(SessionCommand::Input(format!("{cmd}\n").into_bytes()));
             }
@@ -1967,7 +2069,7 @@ impl TayApp {
         {
             self.bench_started = true;
             log::info!("基准:灌入 3000 行输出");
-            if let Some(sender) = &self.sender {
+            if let Some(sender) = &self.tabs[self.active_tab].sender {
                 let cmd = "i=0; while [ $i -lt 3000 ]; do echo $i; i=$((i+1)); done\n";
                 let _ = sender.send(SessionCommand::Input(cmd.as_bytes().to_vec()));
             }
@@ -2106,17 +2208,23 @@ impl TayApp {
 
 impl Drop for TayApp {
     fn drop(&mut self) {
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(SessionCommand::Shutdown);
-        }
-        for tab in self.tabs.iter().flatten() {
-            let _ = tab.sender.send(SessionCommand::Shutdown);
-        }
+        self.stop_sessions();
     }
 }
 
 impl Handler for TayApp {
     fn on_event(&mut self, ctx: &mut Ctx<'_>, event: WEvent) {
+        self.retiring.retain_mut(|worker| !worker.reap());
+        if !self.retiring.is_empty() {
+            ctx.request_wake_at(Instant::now() + Duration::from_millis(100));
+        }
+        if self.termination.requested() {
+            self.shutdown(ctx);
+            return;
+        }
+        if self.shutting_down {
+            return;
+        }
         match &event {
             WEvent::PointerMoved { y, .. } if self.scrollbar_drag.is_some() => {
                 let (grab, epoch) = self.scrollbar_drag.unwrap();
@@ -2142,7 +2250,7 @@ impl Handler for TayApp {
                 if let Some(geometry) = self
                     .scrollbar_geometry()
                     .filter(|g| g.contains(*x as f32, *y as f32))
-                    && let Some(snapshot) = &self.snapshot
+                    && let Some(snapshot) = &self.tabs[self.active_tab].snapshot
                 {
                     let grab = if (*y as f32) >= geometry.thumb_top
                         && (*y as f32) < geometry.thumb_top + geometry.thumb_height
@@ -2219,12 +2327,15 @@ impl Handler for TayApp {
                 return;
             }
         }
+        if let Some(ctrl) = pointer_ctrl_state(&event) {
+            self.ctrl_held = ctrl;
+        }
         match event {
             WEvent::CanCreateSurfaces
                 // 第一 configure 后:按输出高度重设 layer 尺寸,
                 // 等待 Resized 确认后一次性初始化渲染器(只 configure 一次,
                 // 规避 Mesa WSI 二次 swapchain 重建的段错误)。
-                if self.sender.is_none() => {
+                if self.tabs[self.active_tab].sender.is_none() => {
                     let (_, out_h) = ctx.output_logical_size().unwrap_or((1920, 1080));
                     let h = (out_h * if self.maximized {100}else{self.config.height_percent} / 100).max(200);
                     self.layer_h = h as i32;
@@ -2240,7 +2351,7 @@ impl Handler for TayApp {
                 {
                     let rebuild = self.gpu_phase.on_resized_handshake();
                     self.gpu_phase = GpuPhase::Ready;
-                    if self.sender.is_none() {
+                    if self.tabs[self.active_tab].sender.is_none() {
                         // 首次初始化:建终端/PTY/渲染器。
                         self.init(ctx);
                         // M1 常驻模型:默认收起;TAY_START_VISIBLE / 配置可让启动即呼出。
@@ -2258,7 +2369,7 @@ impl Handler for TayApp {
                         }
                         // 网格尺寸可能变化:PTY 同步(内核 resize 归会话)。
                         if let Some((cols, rows)) = self.dims
-                            && let Some(sender) = &self.sender
+                            && let Some(sender) = &self.tabs[self.active_tab].sender
                         {
                             {
                                 let (cw, ch) = self
@@ -2315,12 +2426,9 @@ impl Handler for TayApp {
                 }
 
             WEvent::Keyboard { key, pressed, mods } => {
-                // 按下/释放都携带当前 mods:同步 Ctrl 状态(指针事件
-                // 不携带修饰键,Ctrl+点击打开超链接依赖此字段)。
-                self.ctrl_held = mods.ctrl;
                 if !pressed {
                     if let Some(original) = self.kitty_down.remove(&key.raw_code) {
-                        let mode = self.snapshot.as_ref().map(|s|s.mode).unwrap_or_default();
+                        let mode = self.tabs[self.active_tab].snapshot.as_ref().map(|s|s.mode).unwrap_or_default();
                         let flags = crate::keys::KittyFlags {
                             disambiguate: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
                             report_events: mode.contains(TermMode::REPORT_EVENT_TYPES),
@@ -2359,9 +2467,9 @@ impl Handler for TayApp {
                     log::debug!("configured shortcut: {action}");
                     use crate::chrome::Action;
                     match action.as_str() {
-                        "new-tab"=>self.new_tab(ctx), "close-tab"=>self.close_tab(self.active_tab,ctx),
-                        "next-tab"=>self.switch_tab((self.active_tab+1)%self.tabs.len(),ctx),
-                        "previous-tab"=>self.switch_tab((self.active_tab+self.tabs.len()-1)%self.tabs.len(),ctx),
+                        "new-tab"=>self.new_tab(ctx), "close-tab"=>self.close_tab(self.active_index(),ctx),
+                        "next-tab"=>self.switch_tab((self.active_index()+1)%self.tabs.len(),ctx),
+                        "previous-tab"=>self.switch_tab((self.active_index()+self.tabs.len()-1)%self.tabs.len(),ctx),
                         "copy"=>self.copy_selection(), "paste"=>self.paste_clipboard(ctx),
                         "hide"=>self.hide(ctx), "maximize"=>self.chrome_action(Action::Maximize,ctx),
                         "settings"=>self.chrome_action(Action::Settings,ctx),
@@ -2433,8 +2541,7 @@ impl Handler for TayApp {
                 // 单一来源 input::is_local;见 crates/tayd/src/input.rs。
                 // 模式来自会话快照(快照与内容同版本;按键翻译用
                 // 的快照滞后一个输出批次,与 PTY 往返同级,可接受)。
-                let mode = self
-                    .snapshot
+                let mode = self.tabs[self.active_tab].snapshot
                     .as_ref()
                     .map(|s| s.mode)
                     .unwrap_or_default();
@@ -2514,12 +2621,11 @@ impl Handler for TayApp {
                         return;
                     }
                 }
-                let app_cursor = self
-                    .snapshot
+                let app_cursor = self.tabs[self.active_tab].snapshot
                     .as_ref()
                     .is_some_and(|s| s.mode.contains(TermMode::APP_CURSOR));
                 if let Some(bytes) = crate::keys::translate(&key, mods, app_cursor)
-                    && let Some(sender) = &self.sender
+                    && let Some(sender) = &self.tabs[self.active_tab].sender
                     && !sender.send(SessionCommand::Input(bytes))
                 {
                     self.status("输入被拒绝:终端积压,请稍后再试", ctx);
@@ -2625,15 +2731,18 @@ impl Handler for TayApp {
             }
 
             WEvent::ProxyWake => {
-                let mut exited=Vec::new();
-                for(i,tab)in self.tabs.iter_mut().enumerate(){if let Some(t)=tab{while let Ok(e)=t.rx.try_recv(){match e{Event::Title(title)=>t.title=title,Event::Exit|Event::ChildExit(_)=>{exited.push(i);break;},_=>{}}}}}
-                for i in exited.into_iter().rev(){self.close_tab(i,ctx);}
+                for id in self.background_exits() {
+                    let index = self.tabs.position(id);
+                    self.close_tab(index, ctx);
+                }
 
+                // Clear/coalesce notification bits before observing shared state.
+                // A publication racing with snapshot/reply reads must enqueue a new wake.
+                let events = self.tabs[self.active_tab].rx.drain();
                 // 原子批次(架构 §7):快照与语义事件一起取出 ——
                 // 网格、命令块、图像、清屏事件必然同源,不存在
                 // 「旧网格配新事件」的版本竞争。
-                let update = self
-                    .snapshot_slot
+                let update = self.tabs[self.active_tab].slot
                     .as_ref()
                     .and_then(|slot| slot.lock().unwrap().take());
                 if let Some(update) = update {
@@ -2646,8 +2755,8 @@ impl Handler for TayApp {
                     // 推进世代但主屏块锚点保持有效(网格冻结),
                     // 清空会把进 vim 前用户的折叠全部弄丢(第十七轮
                     // 回归,已修复)。
-                    if update.snapshot.meta.invalidate_epoch != self.seen_epoch {
-                        self.seen_epoch = update.snapshot.meta.invalidate_epoch;
+                    if update.snapshot.meta.invalidate_epoch != self.tabs[self.active_tab].seen_epoch {
+                        self.tabs[self.active_tab].seen_epoch = update.snapshot.meta.invalidate_epoch;
                         self.sel = None;
                         self.quick = None;
                     }
@@ -2659,8 +2768,8 @@ impl Handler for TayApp {
                         .iter()
                         .map(|b| b.id)
                         .collect();
-                    self.folded.retain(|id| live.contains(id));
-                    self.snapshot = Some(update.snapshot);
+                    self.tabs[self.active_tab].folded.retain(|id| live.contains(id));
+                    self.tabs[self.active_tab].snapshot = Some(update.snapshot);
                 }
                 // 会话应答:复制/搜索回执(携带版本)。乱序/过期语义:
                 // 复制文本在会话侧解析时即定格(不可变),按到达序
@@ -2669,9 +2778,10 @@ impl Handler for TayApp {
                 // 校验把关;过期(Stale)给轻量反馈且不覆盖已有剪贴板,
                 // 淘汰(Evicted)同样只反馈不复制;revision 保留作审计。
                 // 搜索应答只记日志,不对旧命中做任何 UI 动作。
-                if let Some(rx) = self.reply_rx.take() {
+                if let Some(rx) = self.tabs[self.active_tab].reply_rx.take() {
                     while let Ok(reply) = rx.try_recv() {
                         match reply {
+                            SessionReply::Rejected => self.status("复制内容超过 4 MiB,未写入剪贴板", ctx),
                             SessionReply::Copy {
                                 text,
                                 revision,
@@ -2712,10 +2822,10 @@ impl Handler for TayApp {
                             }
                         }
                     }
-                    self.reply_rx = Some(rx);
+                    self.tabs[self.active_tab].reply_rx = Some(rx);
                 }
                 // 终端事件。
-                while let Ok(ev) = self.rx.try_recv() {
+                for ev in events {
                     match ev {
                         // P2b:完全收起时 PTY 输出不触发重绘(内容在下次
                         // 呼出时按当前网格重绘;show 自带 request_redraw)。
@@ -2723,10 +2833,10 @@ impl Handler for TayApp {
                             if !self.vis.is_hidden() => {
                                 ctx.request_redraw();
                             }
-                        Event::Title(t) => {self.tab_title=t;ctx.request_redraw();},
+                        Event::Title(t) => {self.tabs[self.active_tab].title=t;ctx.request_redraw();},
                         Event::Bell => {
                             // 可视铃:网格背景短暂闪烁(衰减见 build_grid)。
-                            self.bell_until = Some(Instant::now() + BELL_FLASH);
+                            self.tabs[self.active_tab].bell_until = Some(Instant::now() + BELL_FLASH);
                             ctx.request_redraw();
                         }
                         Event::ClipboardStore(_, text) => {
@@ -2734,7 +2844,7 @@ impl Handler for TayApp {
                         }
                         Event::Exit | Event::ChildExit(_) => {
                             log::info!("标签 shell 已退出");
-                            self.close_tab(self.active_tab,ctx);
+                            self.close_tab(self.active_index(),ctx);
                             break;
                         }
                         _ => {}
@@ -2748,15 +2858,12 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::Hide => self.hide(ctx),
                         crate::ipc::IpcCommand::Quit => {
                             log::info!("收到 quit");
-                            self.write_session_file();
-                            if let Some(sender) = &self.sender {
-                                let _ = sender.send(SessionCommand::Shutdown);
-                            }
-                            ctx.exit();
+                            self.shutdown(ctx);
+                            return;
                         }
                         crate::ipc::IpcCommand::NewTab => {self.new_tab(ctx);self.show(ctx);},
-                        crate::ipc::IpcCommand::NextTab => self.switch_tab((self.active_tab+1)%self.tabs.len(),ctx),
-                        crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_tab,ctx),
+                        crate::ipc::IpcCommand::NextTab => self.switch_tab((self.active_index()+1)%self.tabs.len(),ctx),
+                        crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_index(),ctx),
                         crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Settings => {self.settings_open=true;let (w,h)=ctx.surface_size();self.relayout(ctx,w,h,true);self.show(ctx);ctx.request_redraw();},
@@ -2875,14 +2982,14 @@ impl Handler for TayApp {
             }
 
             }
-            WEvent::CloseRequested => ctx.exit(),
+            WEvent::CloseRequested => self.shutdown(ctx),
 
             // 输出回退/尺寸变化(多显示器):重设高度并重新对齐 margin。
             // 未初始化(首轮 roundtrip 事件)时忽略,走 CanCreateSurfaces 路径。
             // 输出回退:窗口层已把 layer 角色重建到**新 wl_surface**。
             // 丢弃旧渲染器(旧 wl_surface 由窗口层保活),等新 surface
             // 的 configure 握手(Resized)后重建渲染器再呈现。
-            WEvent::SurfaceReplaced if self.sender.is_some() => {
+            WEvent::SurfaceReplaced if self.tabs[self.active_tab].sender.is_some() => {
                 log::info!("输出回退:重建 GPU surface,等待 configure");
                 self.renderer = None;
                 self.instance = None;
@@ -2890,7 +2997,7 @@ impl Handler for TayApp {
             }
             WEvent::SurfaceReplaced => {}
 
-            WEvent::OutputChanged if self.sender.is_some() => {
+            WEvent::OutputChanged if self.tabs[self.active_tab].sender.is_some() => {
                 self.request_layer_height(ctx);
                 // 窗口层重建 layer 角色后 margin 为全离屏,重提当前值。
                 let m = self.vis.margin();
@@ -2913,9 +3020,9 @@ impl Handler for TayApp {
                 }
                 // 可视铃:到期清除;未到期衰减重绘并唤醒到期时刻。
                 // 与动画并发时动画的 8ms 步进自带重绘,不覆盖其 deadline。
-                if let Some(until) = self.bell_until {
+                if let Some(until) = self.tabs[self.active_tab].bell_until {
                     if Instant::now() >= until {
-                        self.bell_until = None;
+                        self.tabs[self.active_tab].bell_until = None;
                         ctx.request_redraw();
                     } else if !self.vis.animating() {
                         ctx.set_anim_deadline(Some(until));
@@ -2942,7 +3049,237 @@ impl Handler for TayApp {
 
 #[cfg(test)]
 mod tests {
-    use super::GpuPhase;
+    use super::{GpuPhase, pointer_ctrl_state, restored_active_index};
+
+    fn headless_app() -> super::TayApp {
+        let (wake, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let (ipc_tx, ipc_rx) = crate::ipc::channel();
+        let (hotkey_tx, hotkey_rx) = std::sync::mpsc::sync_channel(64);
+        super::TayApp::new(
+            tay_config::Config::default(),
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            ipc_tx,
+            ipc_rx,
+            hotkey_tx,
+            hotkey_rx,
+            std::sync::Arc::new(wake),
+        )
+    }
+
+    fn wait_for_exit(tab: &super::TabSession, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if matches!(
+                tab.rx.try_recv(),
+                Ok(alacritty_terminal::event::Event::Exit
+                    | alacritty_terminal::event::Event::ChildExit(_))
+            ) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "session exit was not delivered"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn architecture_lifecycle_uses_real_pty() {
+        use crate::session::SessionCommand;
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "TAY_ARCHITECTURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = std::env::temp_dir().join(format!("tay-architecture-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::tests::architecture_lifecycle_uses_real_pty",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("XDG_STATE_HOME", &dir)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("PTY lifecycle regression timed out");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        let mut app = headless_app();
+        let saved = |shell: &str, title: &str| crate::persist::PersistTab {
+            shell: shell.into(),
+            title: title.into(),
+            cwd: Some("/tmp".into()),
+        };
+        assert!(app.restore_sessions(
+            40,
+            6,
+            &[
+                saved("/nonexistent/tay-test-shell", "failed-first"),
+                saved("/bin/sh", "A"),
+                saved("/nonexistent/tay-test-shell", "failed-middle"),
+                saved("/bin/sh", "B"),
+            ],
+            3
+        ));
+        assert_eq!(app.tabs.len(), 2);
+        let active = app.active_tab;
+        assert_eq!(app.tabs[active].title, "B");
+        let background = app.tabs.id_at(0).unwrap();
+        assert!(
+            app.tabs[background]
+                .sender
+                .as_ref()
+                .unwrap()
+                .send(SessionCommand::Input(b"exit\n".to_vec()))
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !app.background_exits().contains(&background) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.remove_session(background);
+        assert_eq!(app.active_tab, active);
+        assert_eq!(app.active_index(), 0);
+
+        // Real duplex blockage: output is consumed until the response high-water
+        // mark; shell intentionally never reads the terminal's answer stream.
+        let flood = app
+            .start_session_with(40, 6, "/bin/sh".into(), None)
+            .unwrap();
+        let flood_id = app.tabs.insert(flood);
+        assert!(app.tabs[flood_id].sender.as_ref().unwrap().send(SessionCommand::Input(
+            b"stty -echo -icanon; i=0; while [ $i -lt 200000 ]; do printf '\\033[6n'; i=$((i+1)); done; while :; do :; done\n".to_vec())));
+        wait_for_exit(&app.tabs[flood_id], Duration::from_secs(12));
+        app.remove_session(flood_id);
+
+        // Signals use exactly the same save/stop coordinator as IPC/window exit.
+        let sender = app.tabs[active].sender.as_ref().unwrap().clone();
+        assert!(sender.send(SessionCommand::Input(
+            b"trap '' HUP; printf '\\122\\105\\101\\104\\131'; while :; do :; done\n".to_vec()
+        )));
+        let slot = app.tabs[active].slot.clone().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let ready = slot.lock().unwrap().as_ref().is_some_and(|update| {
+                update
+                    .snapshot
+                    .cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .contains("READY")
+            });
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe {
+            libc::raise(libc::SIGTERM);
+        }
+        assert!(app.termination.requested());
+        let start = Instant::now();
+        app.finish_shutdown();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(!sender.send(SessionCommand::Input(b"late".to_vec())));
+        assert!(app.tabs[active].worker.as_ref().unwrap().is_finished());
+        let (saved, index) = crate::persist::load().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(index, 0);
+        assert_eq!(saved[0].shell, "/bin/sh");
+        assert_eq!(saved[0].cwd.as_deref(), Some("/tmp"));
+        app.finish_shutdown(); // idempotent, including already-joined workers
+        drop(app);
+        let blocked = crate::persist::path().parent().unwrap().join("blocked");
+        std::fs::write(&blocked, "regular file").unwrap();
+        // This isolated child has stopped all workers; no concurrent environment readers.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &blocked);
+        }
+        let mut app = headless_app();
+        let tab = app
+            .start_session_with(40, 6, "/bin/sh".into(), None)
+            .unwrap();
+        app.install_session(tab);
+        app.finish_shutdown(); // an unwritable state path cannot prevent cleanup
+        assert!(app.shutting_down);
+        assert!(
+            app.tabs[app.active_tab]
+                .worker
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        assert!(!crate::persist::path().exists());
+    }
+
+    #[test]
+    fn pointer_ctrl_tracks_modifier_only_changes_and_focus_loss() {
+        use tay_window::{Event, Mods};
+        let mut held = false;
+        for (event, expected) in [
+            (
+                Event::ModifiersChanged(Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                }),
+                true,
+            ),
+            (Event::PointerMoved { x: 1.0, y: 1.0 }, true),
+            (Event::ModifiersChanged(Mods::default()), false),
+            (
+                Event::ModifiersChanged(Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                }),
+                true,
+            ),
+            (Event::Focused(false), false),
+            (Event::Focused(true), false),
+        ] {
+            if let Some(ctrl) = pointer_ctrl_state(&event) {
+                held = ctrl;
+            }
+            assert_eq!(held, expected);
+        }
+    }
+
+    #[test]
+    fn restored_active_skips_failed_tabs_without_selecting_their_successors() {
+        assert_eq!(restored_active_index(&[0, 1, 2], 1), 1);
+        assert_eq!(restored_active_index(&[0, 2], 1), 0);
+        assert_eq!(restored_active_index(&[0, 2], 2), 1);
+        assert_eq!(restored_active_index(&[0], 23), 0);
+        assert_eq!(restored_active_index(&[], 0), 0);
+    }
 
     /// 六、状态转换测试:覆盖「输出回退、配置高度变化和 configure
     /// 交错」的完整事件序列,不只验证单个字段。

@@ -13,20 +13,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-tayd = { path = "../crates/tayd" }
-
-# parser_bytes 在模块内 include! tayd 的协议管线源码(见 target 顶部说明):
-# StreamScanner / CountingHandler 是 crate 私有项,外部 crate 无法直接调用。
-# 这些依赖与 crates/tayd/Cargo.toml 中对应版本保持一致。
-alacritty_terminal = "0.26"
-polling = "3"
-tay-config = { path = "../crates/tay-config" }
-tay-render = { path = "../crates/tay-render" }
-base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png"] }
-icy_sixel = "0.7.0"
-log = "0.4"
-unicode-width = "0.2"
+tayd = { path = "../crates/tayd", features = ["fuzzing"] }
 
 [[bin]]
 name = "parser_bytes"

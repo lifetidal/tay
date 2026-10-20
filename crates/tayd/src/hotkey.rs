@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 
 use ashpd::desktop::CreateSessionOptions;
 use ashpd::desktop::global_shortcuts::{BindShortcutsOptions, GlobalShortcuts, NewShortcut};
@@ -21,7 +21,7 @@ pub enum HotkeyTriggered {
 
 /// 启动热键线程(失败仅告警,不阻塞终端本体)。
 /// `tx` 给 UI 线程发触发通知,`wake` 唤醒事件循环(管道写 1 字节)。
-pub fn spawn(tx: Sender<HotkeyTriggered>, wake: Arc<UnixStream>, trigger: String) {
+pub fn spawn(tx: SyncSender<HotkeyTriggered>, wake: Arc<UnixStream>, trigger: String) {
     std::thread::Builder::new()
         .name("hotkey".into())
         .spawn(move || {
@@ -41,14 +41,14 @@ pub fn spawn(tx: Sender<HotkeyTriggered>, wake: Arc<UnixStream>, trigger: String
                     .find(|s| s.id() == "toggle")
                     .map(|s| s.trigger_description().to_string())
                     .unwrap_or_else(|| "not assigned; bind tay toggle in desktop settings".into());
-                let _ = tx.send(HotkeyTriggered::Status(format!(
+                let _ = tx.try_send(HotkeyTriggered::Status(format!(
                     "Global shortcut: {description}"
                 )));
                 let _ = (&*wake).write(&[0]);
                 log::info!("portal 热键已由系统确认");
                 while let Some(a) = activated.next().await {
                     if a.shortcut_id() == "toggle" {
-                        let _ = tx.send(HotkeyTriggered::Toggle);
+                        let _ = tx.try_send(HotkeyTriggered::Toggle);
                         let _ = (&*wake).write(&[0]);
                     }
                 }
@@ -56,7 +56,7 @@ pub fn spawn(tx: Sender<HotkeyTriggered>, wake: Arc<UnixStream>, trigger: String
             });
             if let Err(e) = result {
                 log::warn!("全局热键不可用(portal 失败): {e}");
-                let _ = tx.send(HotkeyTriggered::Status(format!(
+                let _ = tx.try_send(HotkeyTriggered::Status(format!(
                     "{trigger} unavailable: bind 'tay toggle' in desktop shortcuts"
                 )));
                 let _ = (&*wake).write(&[0]);

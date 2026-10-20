@@ -2,7 +2,7 @@
 
 ## Review 修复记录（2026-10-19）
 
-> 计数统一:当前全量验证为 **178 个测试通过**(fmt / clippy
+> 计数统一:当前全量验证为 **200 个测试通过**(fmt / clippy
 > -D warnings / git diff --check 全绿,2026-10-19 最后一次全量运行)。
 
 ### 后续锚点边界修复
@@ -294,6 +294,28 @@
 - **实机验证(隔离实例,scale 2 物理 3840×1188)**:时钟数字
   像素在栏右、滚动条竖条在 x≈3808、栏色深于终端——三项
   均确认。
+
+### 13. 并行会话新功能核查轮(2026-10-20,review)
+- **外观增量保存**(tay-config 重写):UI 保存不再整体重写
+  config.lua —— 原脚本包进函数(`TAY_BASE_BEGIN/END` 标记),
+  UI 字段集中到文件尾(`TAY_UI_FIELDS_BEGIN`);`save_appearance_
+  delta` 只合并**变化的外观字段**(未变字段保留更新过的手动
+  编辑);陈旧保护:保存前重读比较 + 临时文件(create_new
+  0600)+ sync + rename,期间变化即拒绝不覆盖;首次保存前
+  备份 config.lua.before-ui.bak;字符串转义(\"、\\、控制字符)。
+  测试 5 个(stale 拒绝/手动尾部存活/delta 保留手动主题/转义
+  与备份/roundtrip)。
+- **选区投影抽入 view.rs**:`selection_to_display`(鼠标锚点
+  优先、行序/反向拖选列序归一、折叠感知)+ vi 选区投影,
+  折叠测试 2 个 —— 此前该逻辑是 app 行内代码。
+- **时钟并入保留宽度**:layout 的 `clock_width` 计入 reserved,
+  标签页永不与时钟重叠(我此前版本的简化版)。
+- **会话侧调色板**:新增 `SessionCommand::SetColors` 与新
+  terminal.rs 模块 —— 配置颜色 → 会话 state.palette → 终端
+  格颜色在会话侧解析 → 快照携带最终 RGB,单一来源;所有
+  标签经 update_session_colors 同步。
+- 核查结论:**未发现新 bug**;全量 **200 测试通过**;fmt/
+  clippy -D warnings/git diff --check 全绿。
 
 ## 第十六轮(2026-10-19 凌晨续):收尾剩余验收项
 

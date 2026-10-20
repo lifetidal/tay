@@ -2579,6 +2579,7 @@ dependencies = [
  "proptest",
  "regex",
  "serde",
+ "signal-hook",
  "tay-config",
  "tay-render",
  "tay-window",
