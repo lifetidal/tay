@@ -166,9 +166,11 @@ pub struct SurfaceGeneration(pub u64);
 - 优先用内核已有接口:`Dimensions::total_lines` 的增量(历史增长)
   与 `cum` 在历史上限**以下**时互相印证(测试断言);
 - 历史上限**之后**内核不暴露单调计数(total_lines 封顶、storage
-  重编号不可观测),影子计数是唯一可行机制 —— **保留**,原因与
-  升级成本记入 §6 阶段 2c;不 vendor 内核补丁(0.26 升级时优先
-  换用内核暴露的滚动计数,若 alacritty 提供)。
+  重编号不可观测),影子计数是唯一可行机制 —— **保留**。
+  **2026-10-20 复核(alacritty_terminal 0.26,已升级)**:0.26 的
+  Grid 仍只暴露 `display_offset`/`history_size`/`max_scroll_limit`,
+  无封顶后单调滚动计数;`Dimensions::total_lines` 依旧封顶 ——
+  结论不变,影子计数继续保留,升级成本随内核版本复核。
 - 影子语义与内核逐条对齐并已有回归测试:DECAWM、宽字符、局部
   滚动区、行数截断、备用屏幕、历史淘汰(第七轮)。
 
@@ -241,9 +243,11 @@ marshal 完成)→ arboard 剪贴板实例随 App drop。
 - ✅ 折叠/徽章/图像/跳转/复制全部经 `SessionMeta::resolve` 唯一
   转换点;顺手修复:图像折叠隐藏此前把绝对行与 grid 相对区间
   比较(滚动后折叠隐藏失效);
-- 未完成:TerminalView 模块化(row_map/折叠/选区投影仍内联在
-  app.build_grid,未抽独立模块 —— 逻辑已与快照绑定,抽取纯属
-  结构整理)。
+- ✅ TerminalView 模块化(2026-10-20 补完):折叠区间/选区/徽章/
+  图像四组投影逻辑从 app.build_grid 抽入 view.rs 纯函数族
+  (`fold_ranges_to_grid` / `selection_to_display` /
+  `badges_to_display` / `images_to_display`),带单测;build_grid
+  只做组装(单元格上色、铃闪烁、覆盖层仍属 app 视图状态)。
 - 验收:UI 侧 0 处 term.lock()(✅,16 处全部迁移);快照/复制/
   跳锚点单测用真实网格回放(✅);慢 UI 队列有界(预算测试 ✅)。
 
@@ -294,3 +298,17 @@ marshal 完成)→ arboard 剪贴板实例随 App drop。
   text-input 行为未验证;
 - fish 4.9.3 不再内置 OSC 133(逐字节抓包确认),集成改钩子
   (docs/shell-integration.md 已更新)。
+
+## 9. 2026-10-20 新增特性(架构落点)
+
+| 特性 | 落点 | 说明 |
+|---|---|---|
+| 可视铃(BEL) | app.rs `bell_until` + build_grid 背景衰减混色 | AboutToWait + anim_deadline 驱动重绘;时长 140ms、强度 0.30 常量;配置开关留作后续 |
+| OSC 8 超链接 | session.rs 快照 `hyperlinks` 表(去重 Arc\<str\>)+ `SnapshotCell::hyperlink` 索引;渲染下划线;Ctrl+点击 xdg-open | Ctrl 状态由键盘事件 mods 追踪(指针事件不携带);悬停显示手形指针 |
+| 会话持久化 | `persist.rs`(纯函数,带单测)+ app.rs `write_session_file` / init 恢复分支 | 优雅退出写 `$XDG_STATE_HOME/tay/session.toml`(壳/cwd/标题骨架,不含网格内容);`tay resurrect` 以 `TAY_RESURRECT=1` 拉起 daemon 恢复;cwd 经 /proc/\<pid\>/cwd 实时读取 |
+| 模糊测试 | fuzz/(独立 workspace,不进主构建) | parser_bytes / sixel_dcs 两个 harness,复用 ptyloop 同源管线(build.rs include 副本);nightly + cargo-fuzz,冒烟 0 崩溃 |
+| 依赖审计 | audit.toml(5 条豁免,每条记录路径与升级条件)+ CI audit 任务 | 无 CVE 级漏洞;zvariant 系待 ashpd 迁移 zbus 6,lru 待 glyphon 更新 |
+
+其中「会话持久化」只恢复标签骨架:滚动历史、图像、命令块的
+完整恢复需要内核侧状态导出(alacritty Term 不可序列化),列为
+后续里程碑;崩溃退出不会更新会话文件(只在优雅 quit 时写)。
