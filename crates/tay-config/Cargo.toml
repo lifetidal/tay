@@ -9,3 +9,4 @@ license.workspace = true
 serde.workspace = true
 toml.workspace = true
 dirs.workspace = true
+mlua = { version = "0.12.2", features = ["lua54", "vendored"] }

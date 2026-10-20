@@ -1,11 +1,10 @@
 [Unit]
 Description=Tay 下拉终端 daemon
-Documentation=man:tay(1)
 PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=tayd
+ExecStart=/usr/bin/tayd
 Restart=on-failure
 # Wayland 连接失败时快速失败重启。
 RestartSec=2

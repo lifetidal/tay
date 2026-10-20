@@ -5,8 +5,9 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn socket_path() -> PathBuf {
@@ -17,8 +18,7 @@ fn socket_path() -> PathBuf {
 }
 
 fn send(cmd: &str) -> Result<String, String> {
-    let mut stream =
-        UnixStream::connect(socket_path()).map_err(|_| "daemon 未运行".to_string())?;
+    let mut stream = UnixStream::connect(socket_path()).map_err(|_| "daemon 未运行".to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|e| e.to_string())?;
@@ -31,59 +31,35 @@ fn send(cmd: &str) -> Result<String, String> {
 }
 
 /// 拉起 daemon(tayd 需在 PATH 或与 tay 同目录)。
-fn spawn_daemon() {
-    let exe = std::env::current_exe().ok();
-    let candidates: Vec<&str> = if let Some(exe) = &exe {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("tayd");
-            if p.exists() {
-                return spawn(&p);
-            }
-        }
-        vec!["tayd"]
-    } else {
-        vec!["tayd"]
-    };
-    for c in candidates {
-        if let Ok(out) = Command::new(c).arg("--daemon").spawn() {
-            let _ = out;
-            return;
-        }
-    }
-    eprintln!("tay: 找不到 tayd,无法拉起 daemon");
-    std::process::exit(1);
-}
-
-fn spawn(path: &std::path::Path) {
-    let _ = Command::new(path).spawn();
+fn spawn_daemon() -> Result<Child, String> {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("tayd")))
+        .filter(|p| p.exists());
+    let path = sibling.unwrap_or_else(|| PathBuf::from("tayd"));
+    let log_path = socket_path().with_file_name("tayd.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("无法创建日志 {}: {e}", log_path.display()))?;
+    let stderr = log.try_clone().map_err(|e| e.to_string())?;
+    Command::new(&path)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(log)
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| format!("无法启动 {}: {e}", path.display()))
 }
 
 /// `tay config`:生成默认配置(缺失时)+ 显示合成器热键片段。
 fn cmd_config() {
-    let path = config_path();
+    let path = tay_config::Config::config_path();
     let created = if path.exists() {
         false
     } else {
-        let default = r##"# Tay 配置(全部可选,保存后 2 秒内热重载)
-# 注意:顶层键需在 [font]/[colors] 表之前(TOML 语法要求)。
-
-shell = ""            # 空 = $SHELL
-height_percent = 45   # 呼出高度占输出百分比
-animation_ms = 150    # 滑入动画时长,0 = 关闭
-hide_on_focus_out = true
-start_hidden = true
-output = ""           # 呼出输出名(如 "DP-1");空 = 合成器默认
-
-[font]
-family = "JetBrainsMono Nerd Font"
-size = 12.0
-
-[colors]
-foreground = "#d4d4d4"
-background = "#0f1114"
-cursor = "#00a884"
-selection = "#395e9c"
-"##;
+        let default = tay_config::Config::default().to_lua();
         std::fs::create_dir_all(path.parent().unwrap()).ok();
         std::fs::write(&path, default).is_ok()
     };
@@ -100,7 +76,14 @@ selection = "#395e9c"
 fn cmd_doctor() {
     println!("== Tay 环境检查 ==");
     let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
-    println!("Wayland:      {}", if wayland { "✓" } else { "✗(Tay 需要 Wayland)" });
+    println!(
+        "Wayland:      {}",
+        if wayland {
+            "✓"
+        } else {
+            "✗(Tay 需要 Wayland)"
+        }
+    );
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     println!("桌面:         {desktop}");
     println!("配置:         {}", config_path().display());
@@ -110,20 +93,47 @@ fn cmd_doctor() {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    println!("等宽字体:     {}", if font_ok { "✓(fontconfig)" } else { "?" });
+    println!(
+        "等宽字体:     {}",
+        if font_ok { "✓(fontconfig)" } else { "?" }
+    );
     // daemon 状态。
     let daemon = UnixStream::connect(socket_path()).is_ok();
-    println!("daemon:       {}", if daemon { "✓ 运行中" } else { "未运行(tay toggle 会自动拉起)" });
+    println!(
+        "daemon:       {}",
+        if daemon {
+            "✓ 运行中"
+        } else {
+            "未运行(tay toggle 会自动拉起)"
+        }
+    );
     // portal。
     let portal = Command::new("gdbus")
-        .args(["call", "--session", "--dest", "org.freedesktop.portal.Desktop",
-               "--object-path", "/org/freedesktop/portal/desktop",
-               "--method", "org.freedesktop.DBus.Properties.Get",
-               "org.freedesktop.portal.GlobalShortcuts", "version"])
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.portal.Desktop",
+            "--object-path",
+            "/org/freedesktop/portal/desktop",
+            "--method",
+            "org.freedesktop.DBus.Properties.Get",
+            "org.freedesktop.portal.GlobalShortcuts",
+            "version",
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    println!("热键 portal:   {}", if portal { "✓(F12 首次需系统确认)" } else { "不可用(见下)" });
+    // 热键按配置显示(config.lua 的 global_shortcut),不再是硬编码 F12。
+    let shortcut = tay_config::Config::load().global_shortcut;
+    println!(
+        "热键 portal:   {}",
+        if portal {
+            format!("✓({shortcut} 首次需系统确认)")
+        } else {
+            "不可用(见下)".into()
+        }
+    );
     if !portal {
         println!();
         print_hotkey_snippets();
@@ -140,36 +150,68 @@ fn print_hotkey_snippets() {
     println!("Hyprland:");
     println!("    bind = ,F12, exec, tay toggle");
     println!("labwc:");
-    println!("    <keybind key=\"F12\"><action name=\"Execute\" command=\"tay toggle\" /></keybind>");
+    println!(
+        "    <keybind key=\"F12\"><action name=\"Execute\" command=\"tay toggle\" /></keybind>"
+    );
 }
 
 fn config_path() -> std::path::PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".config")).unwrap_or_default()
-        })
-        .join("tay")
-        .join("config.toml")
+    tay_config::Config::config_path()
 }
 
+fn cmd_keys() -> std::io::Result<()> {
+    let config = tay_config::Config::try_load()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "配置: {}", config_path().display())?;
+    writeln!(
+        out,
+        "全局呼出请求: {} (以桌面实际授权为准)",
+        config.global_shortcut
+    )?;
+    for binding in &config.keys {
+        writeln!(
+            out,
+            "{:<16} {:<12} {}",
+            binding.mods, binding.key, binding.action
+        )?;
+    }
+    Ok(())
+}
+
+// The daemon intentionally outlives this short-lived client; on client exit
+// it is reparented to the system's process reaper. Waiting would hang `tay`.
+#[allow(clippy::zombie_processes)]
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "toggle".into());
     let cmd = match cmd.as_str() {
-        "toggle" | "show" | "hide" | "quit" => cmd,
+        "toggle" | "show" | "hide" | "quit" | "pin" | "new-tab" | "next-tab" | "close-tab"
+        | "settings" | "maximize" | "restore" => cmd,
         "config" => {
             cmd_config();
             return;
-        },
+        }
+        "keys" => {
+            if let Err(e) = cmd_keys()
+                && e.kind() != std::io::ErrorKind::BrokenPipe
+            {
+                eprintln!("tay keys: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         "doctor" => {
             cmd_doctor();
             return;
-        },
+        }
         "--daemon" => return, // 被 CLI 拉起时:正常初始化 daemon
         _ => {
-            eprintln!("用法: tay [toggle|show|hide|quit|config|doctor](默认 toggle)");
+            eprintln!(
+                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|settings|maximize|restore|config|keys|doctor](默认 toggle)"
+            );
             std::process::exit(2);
-        },
+        }
     };
 
     match send(&cmd) {
@@ -178,25 +220,46 @@ fn main() {
                 eprintln!("tay: {resp}");
                 std::process::exit(1);
             }
-        },
+        }
         Err(_) => {
             // 冷启动:拉起 daemon 后重试(§4.3 降级路径)。
-            spawn_daemon();
-            let deadline = Instant::now() + Duration::from_secs(3);
+            if matches!(cmd.as_str(), "hide" | "quit") {
+                return;
+            }
+            let mut child = spawn_daemon().unwrap_or_else(|e| {
+                eprintln!("tay: {e}");
+                std::process::exit(1);
+            });
+            // A cold toggle means show, even when start_hidden=false.
+            let startup_cmd = if cmd == "toggle" { "show" } else { &cmd };
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 std::thread::sleep(Duration::from_millis(50));
-                if let Ok(resp) = send(&cmd) {
+                if let Ok(resp) = send(startup_cmd) {
                     if resp != "ok" {
                         eprintln!("tay: {resp}");
                         std::process::exit(1);
                     }
                     return;
                 }
+                if let Ok(Some(status)) = child.try_wait() {
+                    // A competing launcher can win the single-instance lock.
+                    if !status.success() {
+                        eprintln!(
+                            "tay: daemon 启动失败({status}); 日志: {}",
+                            socket_path().with_file_name("tayd.log").display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
                 if Instant::now() > deadline {
-                    eprintln!("tay: daemon 启动超时");
+                    eprintln!(
+                        "tay: daemon 启动超时; 日志: {}",
+                        socket_path().with_file_name("tayd.log").display()
+                    );
                     std::process::exit(1);
                 }
             }
-        },
+        }
     }
 }

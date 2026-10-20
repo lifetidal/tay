@@ -40,6 +40,15 @@
 
 ## 4. 总体架构
 
+> 2026-10-19 第八轮起,线程拓扑、状态唯一所有者、跨线程消息、
+> 坐标模型与转换、失效规则、surface 生命周期与分阶段迁移计划
+> 的**单一事实来源**是 [docs/architecture.md](docs/architecture.md),
+> 本节保留总览。八轮要点:Term 与 SessionMeta(累计滚动位移 +
+> 版本号)合入**同一把锁** —— 任何一次网格读取都配对产生它的
+> 锚点版本;块存储改为显式 `CommandBlock` + `BlockId` +
+> `HistoryAnchor`;窗口层以 `SurfacePhase` 状态机 + 世代校验
+> 替代布尔组合;deadline 计算为纯函数(受控时钟测试)。
+
 ### 4.1 常驻 daemon + 薄客户端
 
 ```
@@ -104,7 +113,7 @@ IPC(≤1ms) → xdg-activation / XMapWindow + raise(≤5ms) → 动画首帧(≤
 | 剪贴板 | arboard(wl-clipboard-rs 后端) | daemon 常驻使 Wayland 剪贴板存活问题消失 |
 | Portal | **ashpd** 0.13 | GlobalShortcuts portal 的 Rust 事实标准封装 |
 | layer-shell | SCTK + wayland-protocols-wlr 手写 | 仅此一处需要手写 Wayland 协议,量小 |
-| 配置 | TOML,XDG 路径,热重载 | 零配置哲学;Lua 作为远期可选 |
+| 配置 | Lua(config.lua,沙箱求值,WezTerm 式),XDG 路径,热重载 | 零配置哲学;旧 TOML 自动迁移 |
 | 文本整形 | cosmic-text(harfbuzz 系) | 连字(ligature)、CJK、字体回退、bidi 一站式 |
 
 **关键决策:UI 框架不用 GTK4/iced,理由与代价**
@@ -182,7 +191,7 @@ Wayland 上「全局热键」和「窗口定位」都没有统一答案,必须�
 ### 8.2 终端本体
 - CJK 与 IME 一等公民(中文输入、预编辑浮层渲染、死键);
 - 连字、Nerd Font 回退、灰度/次像素 AA 双模式;
-- 主题系统(内置暗色 + 亮色,TOML 自定义);滚动回退 + 增量搜索 + vim 复制模式(对标 WezTerm copy mode)。
+- 主题系统(内置暗色 + 亮色,Lua 自定义);滚动回退 + 增量搜索 + vim 复制模式(对标 WezTerm copy mode)。
 
 ### 8.3 快速选择(QuickSelect)
 - 一键触发,为 URL/路径/sha/git hash 等打标签后跳转或复制(WezTerm 有 14 类内置 pattern 可对标);
@@ -191,7 +200,30 @@ Wayland 上「全局热键」和「窗口定位」都没有统一答案,必须�
 ### 8.4 命令块(OSC 133 消费侧)
 - 每条命令输出为一个块:退出码徽章、折叠、单独复制、跳转到上一条提示符;
 - Zellij 0.45+ 已证明这套能力(`SelectCommandAtScrollPosition` 等)对用户价值极高;
-- 这是与 Warp 最大的体验对标点,且**全部基于开放协议**。
+- 这是与 Warp 最大的体验对标点,且**全部基于开放协议**;
+- 加固轮(2026-10-17)补充:alt-screen 守卫(全屏应用的 133 不产块)、
+  `C` 边界跟踪(按块复制只复制纯输出)、bash/zsh 集成片段见
+  docs/shell-integration.md;
+- **锚点生命周期**(2026-10-17 第二轮加固):锚点是网格绝对行号,
+  滚动不失效;清屏/重置、resize/reflow、历史淘汰三类事件使锚点
+  失效 —— 检测后**自动清空块与图像锚点**,下一条 prompt 重建;
+  不再出现「跳转/复制到错位内容」。
+  复制语义与无末尾换行限制见 docs/shell-integration.md。
+- **锚点失效世代**(2026-10-19 第十七轮定点修复):选择/复制/跳转
+  等依赖历史锚点的请求**携带来源快照的失效世代**(`AnchorEpoch`),
+  会话执行前校验 —— 清屏/resize/主备屏幕切换后的旧请求明确返回
+  过期(UI 轻量反馈,不覆盖已有剪贴板);**普通输出滚屏不推进
+  世代**,持续输出下选择复制照常工作。输入侧同步落地**统一预算**
+  (跨线程消息 + PTY 待写队列一个计数器,原子预留、按实际写入
+  释放):`send` 返回 true 即「已接受」,不因内部第二次预算检查
+  丢失输入。
+- **累计滚动位移精确计数**(2026-10-19 第六/七轮加固):稳定绝对行
+  = grid 行 + cum_scroll,由 CountingHandler 按 Term 语义精确计数:
+  wrap 触底(DECAWM 关闭时不换行、不计数)、linefeed 触底、显式
+  滚动(CSI S/T、CSI M/L)仅**全屏滚动区域**且按**内核截断后的
+  实际行数**计入 —— 局部滚动区操作不移动历史,不能作为整个
+  历史坐标系的平移。影子(wrap_pending、scroll_region)跨 PTY
+  chunk 存活,resize/RIS 归位。
 
 ### 8.5 远期(不入首个版本)
 - AI 集成:仅以开放方式做(如 ollama 本地模型的「解释这段输出」),不做账号体系;
@@ -206,7 +238,7 @@ Wayland 上「全局热键」和「窗口定位」都没有统一答案,必须�
 | **M0 内核就绪** ✅ | alacritty_terminal + winit + wgpu/glyphon 渲染出可用终端 | fish 全功能、CJK 输入、连字、150fps 滚动 —— **实测 avg 0.75ms/帧 ≈ 1339fps**(2026-10-16,KDE Wayland + AMD) |
 | **M1 下拉成形(Wayland 独占)** ✅ | SCTK + wlr-layer-shell 手写窗口层(替换 winit)、daemon/IPC/CLI、portal 热键、margin 动画、失焦隐藏 | **热呼出 16ms/1ms**(验收 <50ms);`tay toggle` 全链路;滚动 1123fps 无退化 —— 2026-10-16 实测。X11 路线暂缓(用户决策),winit 版保留于 git 历史 |
 | **M2 Wayland 覆盖** | layer-shell(wlroots/KDE)+ GlobalShortcuts portal + GNOME 扩展伴侣 | 在 sway、Hyprland、KDE、GNOME 上全部一键呼出 |
-| **M3 体验差异化** ✅ | OSC 133 命令块(徽章/跳转/按块复制/折叠,fish 零配置)、QuickSelect、vi 复制模式 + 增量搜索、主题热重载 | 全部验收,2026-10-16 实测 |
+| **M3 体验差异化** ✅ | OSC 133 命令块(徽章/跳转/按块复制/折叠,bash/zsh/fish 钩子集成)、QuickSelect、vi 复制模式 + 增量搜索、主题热重载 | 全部验收,2026-10-16 实测 |
 | **M4 生态**(进行中) | ~~kitty graphics~~ ✅(PNG/RGBA/RGB、多图、滚动锚定)、sixel/iTerm2、打包、配置向导 | kitty graphics 实测通过;其余进行中 |
 
 ## 10. 风险与对策
@@ -230,7 +262,7 @@ tay/
 │   ├── tay-window/      # 窗口层抽象(winit 适配 / SCTK 兜底)
 │   ├── tay-render/      # wgpu + glyphon 渲染管线
 │   ├── tay-integration/ # portal / layer-shell / XGrabKey / EWMH
-│   ├── tay-config/      # TOML 配置、默认值、热重载
+│   ├── tay-config/      # Lua 配置(沙箱求值)、默认值、热重载、TOML 迁移
 │   └── tay-protocol/    # OSC 133 消费、图像协议编解码、QuickSelect
 ├── extensions/          # GNOME Shell 扩展伴侣
 └── docs/
@@ -243,7 +275,7 @@ tay/
 | 决策 | 结论 |
 |---|---|
 | 窗口层 | **winit ≥ 0.31 起步**;抽象接口按 WezTerm `window` crate 的形状设计,保留换轨自研 SCTK 的余地 |
-| 配置语言 | **TOML 起步**;**Lua(WezTerm 式可编程配置)列入远期**,M4 之后评估 |
+| 配置语言 | **Lua 已落地**(2026-10-19,WezTerm 式;mlua 沙箱,无 os/io);TOML 保留为迁移格式 |
 | 许可证 | **GPL-3.0**(与 cosmic-term 同款;alacritty_terminal 为 Apache-2.0,组合已证实可行) |
 | 命名 | **Tay** |
 

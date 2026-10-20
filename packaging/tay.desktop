@@ -6,5 +6,5 @@ Comment=一键呼出 / 隐藏 Tay 终端
 Exec=tay toggle
 Icon=utilities-terminal
 Terminal=false
-Categories=System;Utility;TerminalEmulator;
+Categories=System;TerminalEmulator;
 Keywords=terminal;quake;dropdown;

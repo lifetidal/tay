@@ -12,3 +12,6 @@ wayland-protocols-wlr.workspace = true
 wayland-protocols.workspace = true
 log.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+xkbcommon = "0.8"

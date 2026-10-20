@@ -3,3 +3,4 @@
 *.jpeg
 *.jpg
 Cargo.lock.orig
+/dist/

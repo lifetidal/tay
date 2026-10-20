@@ -11,3 +11,4 @@ path = "src/main.rs"
 
 [dependencies]
 log.workspace = true
+tay-config = { version = "0.1.0", path = "../tay-config" }

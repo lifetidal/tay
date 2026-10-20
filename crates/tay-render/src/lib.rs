@@ -3,25 +3,25 @@
 //! 输入是设备无关的 [`Grid`](Grid 为终端网格快照,tayd 从 alacritty_terminal
 //! 提取),输出一个 wgpu 渲染帧。本 crate 不依赖 alacritty_terminal。
 
-
 use std::borrow::Cow;
+use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 pub use wgpu;
 
 use glyphon::cosmic_text::{
-    Attrs, AttrsOwned, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache,
-    UnderlineStyle, Weight,
+    Attrs, Buffer, Color, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style,
+    SwashCache, UnderlineStyle, Weight,
 };
-use glyphon::{
-    Cache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
-};
+use glyphon::{Cache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use tay_config::{Config, Rgb};
 use wgpu::util::DeviceExt;
 
 /// 一个终端单元格的渲染快照。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     pub c: char,
+    pub zerowidth: Option<Arc<str>>,
     pub fg: Rgb,
     pub bg: Rgb,
     pub bold: bool,
@@ -37,6 +37,21 @@ pub enum CursorShape {
     Underline,
     Beam,
     Hidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowIconKind {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct WindowIcon {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+    pub kind: WindowIconKind,
 }
 
 /// 选区(单元格坐标,col,row,含两端)。
@@ -85,7 +100,8 @@ pub struct RenderImage {
     pub h: u32,
     /// z:负 = 文本之下,正 = 文本之上。
     pub z: i32,
-    pub rgba: Vec<u8>,
+    /// 像素共享句柄(一次解码,放置/渲染共享引用 —— 架构 §6)。
+    pub rgba: std::sync::Arc<[u8]>,
 }
 
 /// 终端网格快照。
@@ -96,6 +112,7 @@ pub struct Grid {
     pub cells: Vec<Cell>,
     pub cursor: (usize, usize),
     pub cursor_shape: CursorShape,
+    pub window_icons: Vec<WindowIcon>,
     pub selection: Option<SelectionRange>,
     pub preedit: Option<Preedit>,
     /// 行尾徽章(行号 = 显示行)。
@@ -126,6 +143,7 @@ pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
     surface: wgpu::Surface<'static>,
 
     font_system: FontSystem,
@@ -134,9 +152,14 @@ pub struct Renderer {
     text: TextRenderer,
     viewport: Viewport,
     /// 一行一个终端行的文本缓冲。
-    buffer: Buffer,
+    glyph_buffers: std::collections::HashMap<GlyphKey, CachedGlyph>,
+    glyph_draws: Vec<GlyphDraw>,
+    font_metrics: Metrics,
+    preedit_buffer: Buffer,
+    preedit_pos: Option<(usize, usize)>,
 
     family: String,
+    font_weight: u16,
     /// 单元格尺寸(物理像素)。
     pub cell: (f32, f32),
     padding: f32,
@@ -145,6 +168,11 @@ pub struct Renderer {
 
     fg_default: Color,
     bg_default: Rgb,
+    /// 光标/选区色(config colors.cursor / colors.selection,
+    /// 热重载即时生效 —— 此前硬编码,用户在 Lua 里改这两个
+    /// 颜色不生效,2026-10-19 修复)。
+    cursor_color: Rgb,
+    selection_color: Rgb,
     /// surface 为 sRGB 格式时,自绘颜色需先转 linear(硬件写入时自动编码)。
     srgb: bool,
 
@@ -154,11 +182,12 @@ pub struct Renderer {
     img_pipeline: wgpu::RenderPipeline,
     uv_quad: wgpu::Buffer,
     img_sampler: wgpu::Sampler,
-    /// 内容 hash → (纹理, bind group, w, h, 实例缓冲)。
+    /// (图像 id, 像素数据指针)→ (纹理, bind group, w, h, 实例缓冲)。
     /// 每图独立实例缓冲:共用一个会在单帧多图时发生写-读竞态。
-    img_cache: std::collections::HashMap<u64, (wgpu::Texture, wgpu::BindGroup, u32, u32, wgpu::Buffer)>,
-    /// 当前帧图像实例(hash, rect, z)。
-    current_images: Vec<(u64, [f32; 4], i32)>,
+    /// 键 = 数据身份(共享句柄指针),同一数据零哈希零上传。
+    img_cache: ImageCache,
+    /// 当前帧图像实例((id, ptr), rect, z)。
+    current_images: Vec<((u32, usize), [f32; 4], i32)>,
     unit_quad: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     locals_buf: wgpu::Buffer,
@@ -178,14 +207,11 @@ struct ShotState {
 }
 
 /// FNV-1a(图像内容 hash,避免逐帧重传纹理)。
-fn fnv1a(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
+/// 图像纹理缓存条目。
+type ImageCache = std::collections::HashMap<
+    (u32, usize),
+    (wgpu::Texture, wgpu::BindGroup, u32, u32, wgpu::Buffer),
+>;
 
 /// sRGB 分量 → linear(surface 为 sRGB 格式时硬件会在写入时再编码回去)。
 fn srgb_to_linear(c: f32) -> f32 {
@@ -198,7 +224,11 @@ fn srgb_to_linear(c: f32) -> f32 {
 
 /// 终端颜色 → 写入帧缓冲的颜色(sRGB surface 需转 linear)。
 fn to_linear(rgb: Rgb, srgb: bool) -> [f32; 4] {
-    let (r, g, b) = (rgb.0 as f32 / 255.0, rgb.1 as f32 / 255.0, rgb.2 as f32 / 255.0);
+    let (r, g, b) = (
+        rgb.0 as f32 / 255.0,
+        rgb.1 as f32 / 255.0,
+        rgb.2 as f32 / 255.0,
+    );
     if srgb {
         [srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b), 1.0]
     } else {
@@ -206,13 +236,193 @@ fn to_linear(rgb: Rgb, srgb: bool) -> [f32; 4] {
     }
 }
 
-fn attrs_for(family: &str, fg: Rgb, bold: bool, italic: bool, underline: bool) -> Attrs<'_> {
+#[derive(Clone, Debug)]
+struct GlyphDraw {
+    cell: Cell,
+    col: usize,
+    row: usize,
+    width: usize,
+}
+type GlyphKey = (char, Option<Arc<str>>, u32, u8);
+
+struct CachedGlyph {
+    buffer: Buffer,
+    ink: Option<GlyphInk>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlyphInk {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl GlyphDraw {
+    fn key(&self) -> GlyphKey {
+        (
+            self.cell.c,
+            self.cell.zerowidth.clone(),
+            self.cell.fg.to_u32(),
+            self.cell.bold as u8 | (self.cell.italic as u8) << 1 | (self.cell.underline as u8) << 2,
+        )
+    }
+}
+
+fn is_icon(c: char) -> bool {
+    matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+}
+
+/// Fit raster ink, not advance width; column origins never accumulate advances.
+fn fit_glyph(ink: Option<GlyphInk>, c: char, columns: usize, cell: (f32, f32)) -> (f32, f32, f32) {
+    let Some(ink) = ink else {
+        return (0.0, 0.0, 1.0);
+    };
+    // Powerline separators intentionally bleed over cell edges for seamless joins.
+    if matches!(c as u32, 0xe0b0..=0xe0d7) {
+        return (0.0, 0.0, 1.0);
+    }
+    let width = ink.right - ink.left;
+    let height = ink.bottom - ink.top;
+    let scale = (columns as f32 * cell.0 / width.max(1.0))
+        .min(cell.1 / height.max(1.0))
+        .min(1.0);
+    let dx = if scale < 1.0 {
+        (columns as f32 * cell.0 - width * scale) * 0.5 - ink.left * scale
+    } else if ink.left < 0.0 {
+        -ink.left
+    } else {
+        (columns as f32 * cell.0 - ink.right).min(0.0)
+    };
+    let dy = if scale < 1.0 {
+        (cell.1 - height * scale) * 0.5 - ink.top * scale
+    } else if ink.top < 0.0 {
+        -ink.top
+    } else {
+        (cell.1 - ink.bottom).min(0.0)
+    };
+    (dx, dy, scale)
+}
+
+fn text_cells(grid: &Grid, cursor_color: Rgb) -> Vec<GlyphDraw> {
+    use unicode_width::UnicodeWidthChar;
+    let mut cells = grid.cells.clone();
+    let mut put = |row: usize, col: usize, text: &str, color: Option<Rgb>| {
+        if row >= grid.rows {
+            return;
+        }
+        let mut x = col;
+        for ch in text.chars() {
+            let width = ch.width().unwrap_or(1).max(1);
+            if x + width > grid.cols {
+                break;
+            }
+            let cell = &mut cells[row * grid.cols + x];
+            cell.c = ch;
+            cell.zerowidth = None;
+            cell.wide_spacer = false;
+            if let Some(fg) = color {
+                cell.fg = fg;
+                cell.bold = true;
+            }
+            for off in 1..width {
+                cells[row * grid.cols + x + off].wide_spacer = true;
+            }
+            x += width;
+        }
+    };
+    for overlay in &grid.overlays {
+        put(overlay.row, overlay.col, &overlay.text, None);
+    }
+    for badge in &grid.badges {
+        put(
+            badge.row,
+            grid.cols.saturating_sub(badge.text.width()),
+            &badge.text,
+            Some(badge.color),
+        );
+    }
+    let mut draws = Vec::new();
+    for row in 0..grid.rows {
+        for col in 0..grid.cols {
+            let mut cell = cells[row * grid.cols + col].clone();
+            if cell.wide_spacer {
+                continue;
+            }
+            let width = if col + 1 < grid.cols
+                && (cells[row * grid.cols + col + 1].wide_spacer
+                    || (is_icon(cell.c) && {
+                        let next = &cells[row * grid.cols + col + 1];
+                        next.c == ' '
+                            && next.zerowidth.is_none()
+                            && !next.underline
+                            && next.bg == cell.bg
+                            && grid.cursor != (col + 1, row)
+                    })) {
+                2
+            } else {
+                1
+            };
+            if grid.preedit.as_ref().is_some_and(|p| {
+                p.row == row && col < p.col + p.text.width() && col + width > p.col
+            }) {
+                continue;
+            }
+            if grid.cursor_shape == CursorShape::Block
+                && grid.preedit.is_none()
+                && grid.cursor == (col, row)
+            {
+                cell.fg = contrast_text(cursor_color);
+            }
+            if cell.c == ' ' && cell.zerowidth.is_none() && !cell.underline {
+                continue;
+            }
+            draws.push(GlyphDraw {
+                cell,
+                col,
+                row,
+                width,
+            });
+        }
+    }
+    draws
+}
+
+fn contrast_text(bg: Rgb) -> Rgb {
+    if (bg.0 as u32 * 299 + bg.1 as u32 * 587 + bg.2 as u32 * 114) > 150000 {
+        Rgb(18, 22, 28)
+    } else {
+        Rgb(245, 247, 250)
+    }
+}
+
+fn attrs_for(
+    family: &str,
+    weight: u16,
+    fg: Rgb,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+) -> Attrs<'_> {
+    let mut features = FontFeatures::new();
+    for tag in [b"liga", b"clig", b"calt", b"kern"] {
+        features.disable(FeatureTag::new(tag));
+    }
     Attrs::new()
-        .family(Family::Name(family))
+        .font_features(features)
+        .family(if family.eq_ignore_ascii_case("monospace") {
+            Family::Monospace
+        } else {
+            Family::Name(family)
+        })
         .color(Color::rgb(fg.0, fg.1, fg.2))
-        .weight(if bold { Weight::BOLD } else { Weight::NORMAL })
+        .weight(if bold { Weight::BOLD } else { Weight(weight) })
         .style(if italic { Style::Italic } else { Style::Normal })
-        .underline(if underline { UnderlineStyle::Single } else { UnderlineStyle::None })
+        .underline(if underline {
+            UnderlineStyle::Single
+        } else {
+            UnderlineStyle::None
+        })
 }
 
 impl Renderer {
@@ -253,6 +463,14 @@ impl Renderer {
             .or_else(|| caps.formats.first().copied())
             .ok_or("surface 无可用格式")?;
 
+        let alpha_mode = [
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+        ]
+        .into_iter()
+        .find(|m| caps.alpha_modes.contains(m))
+        .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+        log::info!("Surface alpha mode: {alpha_mode:?}");
         surface.configure(
             &device,
             &wgpu::SurfaceConfiguration {
@@ -261,7 +479,7 @@ impl Renderer {
                 width: size.0.max(1),
                 height: size.1.max(1),
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                alpha_mode,
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
@@ -270,17 +488,24 @@ impl Renderer {
 
         // —— 字体与单元格测量 ——
         let mut font_system = FontSystem::new();
-        let font_size_px = (config.font.size * 96.0 / 72.0 * scale_factor as f32) as f32;
-        let metrics = Metrics::new(font_size_px, font_size_px * 1.25);
+        let font_size_px = config.font.size * 96.0 / 72.0 * scale_factor as f32;
+        let metrics = Metrics::new(font_size_px, (font_size_px * 1.25).round());
         let mut probe = Buffer::new(&mut font_system, metrics);
         probe.set_size(None, None);
-        let probe_attrs = attrs_for(&config.font.family, config.colors.foreground, false, false, false);
+        let probe_attrs = attrs_for(
+            &config.font.family,
+            config.font.weight,
+            config.colors.foreground,
+            false,
+            false,
+            false,
+        );
         probe.set_text("M", &probe_attrs, Shaping::Advanced, None);
         probe.shape_until_scroll(&mut font_system, false);
         let mut cell_w = font_size_px * 0.6; // 兜底:等宽近似
         let mut cell_h = metrics.line_height;
         if let Some(run) = probe.layout_runs().next() {
-            cell_w = run.glyphs.iter().map(|g| g.w).sum::<f32>().max(1.0);
+            cell_w = run.glyphs.iter().map(|g| g.w).sum::<f32>().round().max(1.0);
             cell_h = run.line_height.max(1.0);
         }
         log::info!(
@@ -288,12 +513,11 @@ impl Renderer {
             config.font.family
         );
 
-        let mut buffer = Buffer::new(&mut font_system, Metrics::new(font_size_px, cell_h));
+        let mut preedit_buffer = Buffer::new(&mut font_system, Metrics::new(font_size_px, cell_h));
+        preedit_buffer.set_wrap(glyphon::cosmic_text::Wrap::None);
+        preedit_buffer.set_hinting(glyphon::cosmic_text::Hinting::Enabled);
+        preedit_buffer.set_monospace_width(Some(cell_w));
         let swash_cache = SwashCache::new();
-        buffer.set_size(
-            Some(size.0 as f32),
-            Some(size.1 as f32),
-        );
 
         // —— glyphon ——
         let cache = Cache::new(&device);
@@ -402,7 +626,9 @@ impl Renderer {
         });
         let img_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tay image"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("image.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "image.wgsl"
+            ))),
         });
         let img_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tay image pipeline"),
@@ -496,16 +722,22 @@ impl Renderer {
             device,
             queue,
             format,
+            alpha_mode,
             surface,
             font_system,
             swash_cache,
             atlas,
             text,
             viewport,
-            buffer,
+            glyph_buffers: Default::default(),
+            glyph_draws: Vec::new(),
+            font_metrics: Metrics::new(font_size_px, cell_h),
+            preedit_buffer,
+            preedit_pos: None,
             family: config.font.family.clone(),
+            font_weight: config.font.weight,
             cell: (cell_w, cell_h),
-            padding: config.padding,
+            padding: config.padding * scale_factor as f32,
             size,
             fg_default: Color::rgb(
                 config.colors.foreground.0,
@@ -513,6 +745,8 @@ impl Renderer {
                 config.colors.foreground.2,
             ),
             bg_default: config.colors.background,
+            cursor_color: config.colors.cursor,
+            selection_color: config.colors.selection,
             srgb: format.is_srgb(),
             bg_pipeline,
             img_pipeline,
@@ -536,6 +770,10 @@ impl Renderer {
         Ok(renderer)
     }
 
+    pub fn padding(&self) -> f32 {
+        self.padding
+    }
+
     pub fn cell_size(&self) -> (f32, f32) {
         self.cell
     }
@@ -548,6 +786,50 @@ impl Renderer {
             config.colors.foreground.2,
         );
         self.bg_default = config.colors.background;
+        self.cursor_color = config.colors.cursor;
+        self.selection_color = config.colors.selection;
+    }
+
+    /// 更新字体与字号，复用 GPU 和会话；调用方同步重算网格。
+    pub fn update_font(&mut self, config: &Config, scale: f64) {
+        let px = config.font.size * 96.0 / 72.0 * scale as f32;
+        let metrics = Metrics::new(px, (px * 1.25).round());
+        let mut probe = Buffer::new(&mut self.font_system, metrics);
+        probe.set_size(None, None);
+        probe.set_text(
+            "M",
+            &attrs_for(
+                &config.font.family,
+                config.font.weight,
+                config.colors.foreground,
+                false,
+                false,
+                false,
+            ),
+            Shaping::Advanced,
+            None,
+        );
+        probe.shape_until_scroll(&mut self.font_system, false);
+        let width = probe
+            .layout_runs()
+            .next()
+            .map(|r| r.glyphs.iter().map(|g| g.w).sum::<f32>())
+            .unwrap_or(px * 0.6)
+            .round()
+            .max(1.0);
+        self.cell = (width, metrics.line_height);
+        self.family = config.font.family.clone();
+        self.font_weight = config.font.weight;
+        self.font_metrics = metrics;
+        self.glyph_buffers.clear();
+        self.preedit_buffer.set_metrics(metrics);
+        self.preedit_buffer.set_monospace_width(Some(width));
+    }
+
+    /// 热重载单元格内边距(不重建字形系统;网格列数由调用方按新
+    /// pad 重算,此处只更新坐标偏移)。
+    pub fn update_padding(&mut self, padding: f32) {
+        self.padding = padding;
     }
 
     pub fn surface_size(&self) -> (u32, u32) {
@@ -585,22 +867,28 @@ impl Renderer {
                 width: w,
                 height: h,
                 present_mode: wgpu::PresentMode::Fifo,
-                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                alpha_mode: self.alpha_mode,
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 view_formats: vec![],
                 desired_maximum_frame_latency: 2,
             },
         );
-        self.buffer.set_size(Some(w as f32), Some(h as f32));
+
         self.apply_locals();
     }
 
     fn apply_locals(&mut self) {
-        let locals = Locals { resolution: [self.size.0 as f32, self.size.1 as f32] };
-        self.queue.write_buffer(&self.locals_buf, 0, bytemuck::cast_slice(&[locals]));
+        let locals = Locals {
+            resolution: [self.size.0 as f32, self.size.1 as f32],
+        };
+        self.queue
+            .write_buffer(&self.locals_buf, 0, bytemuck::cast_slice(&[locals]));
         self.viewport.update(
             &self.queue,
-            glyphon::Resolution { width: self.size.0, height: self.size.1 },
+            glyphon::Resolution {
+                width: self.size.0,
+                height: self.size.1,
+            },
         );
     }
 
@@ -611,32 +899,45 @@ impl Renderer {
         self.rebuild_images(grid);
     }
 
-    /// 上传新图像纹理(内容 hash 缓存)。
+    /// 上传新图像纹理(架构 §6:数据身份 = Arc 指针,零哈希零
+    /// 上传;缓存按当前可见集保留,删除/替换的图像纹理随帧释放)。
     fn rebuild_images(&mut self, grid: &Grid) {
         self.current_images = grid
             .images
             .iter()
             .map(|img| {
-                let hash = fnv1a(&img.rgba);
+                let key = (
+                    img.id,
+                    std::sync::Arc::as_ptr(&img.rgba) as *const () as usize,
+                );
                 let rect = [
                     img.col as f32 * self.cell.0 + self.padding,
                     img.row as f32 * self.cell.1 + self.padding,
                     img.cols as f32 * self.cell.0,
                     img.rows as f32 * self.cell.1,
                 ];
-                (hash, rect, img.z)
+                (key, rect, img.z)
             })
             .collect();
+        // 只保留本帧可见图像的缓存项(删除/替换 → 旧纹理随帧释放)。
+        let visible: std::collections::HashSet<(u32, usize)> =
+            self.current_images.iter().map(|(k, _, _)| *k).collect();
+        self.img_cache.retain(|k, _| visible.contains(k));
         for img in &grid.images {
-            let hash = fnv1a(&img.rgba);
-            if self.img_cache.contains_key(&hash) {
+            let key = (
+                img.id,
+                std::sync::Arc::as_ptr(&img.rgba) as *const () as usize,
+            );
+            if self.img_cache.contains_key(&key) {
                 continue;
             }
             if self.img_cache.len() > 64 {
-                // 逐出最老的(hash map 无顺序,直接清一半)。
-                let keys: Vec<u64> = self.img_cache.keys().copied().take(32).collect();
+                // 缓存上限:移除不在可见集里的最旧项(可见集已保留)。
+                let keys: Vec<(u32, usize)> = self.img_cache.keys().copied().take(32).collect();
                 for k in keys {
-                    self.img_cache.remove(&k);
+                    if !visible.contains(&k) {
+                        self.img_cache.remove(&k);
+                    }
                 }
             }
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -660,7 +961,7 @@ impl Renderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &img.rgba,
+                &img.rgba[..],
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(img.w * 4),
@@ -675,9 +976,7 @@ impl Renderer {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tay kitty image bind"),
-                layout: &self
-                    .img_pipeline
-                    .get_bind_group_layout(0),
+                layout: &self.img_pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -699,121 +998,98 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.img_cache.insert(hash, (texture, bind, img.w, img.h, inst));
+            self.img_cache
+                .insert(key, (texture, bind, img.w, img.h, inst));
         }
     }
 
-    /// 网格 → cosmic-text:每行按样式分段,(row 之间用 `\n` span 分行)。
+    /// Shape each distinct styled character once; placement always uses the
+    /// terminal cell, never accumulated font advances (including fallback fonts).
     fn rebuild_text(&mut self, grid: &Grid) {
-        let family = self.family.clone();
-        let default_attrs = attrs_for(&family, grid_default_fg(grid), false, false, false);
-
-        // 光标格(块状)文本取反色。
-        let cursor_cell = grid.cursor_shape == CursorShape::Block;
-        let cursor_pos = grid.cursor;
-
-        let mut spans: Vec<(String, AttrsOwned)> = Vec::new();
-        let mut cur: Option<(String, AttrsOwned)> = None;
-        let push_run = |spans: &mut Vec<(String, AttrsOwned)>, cur: &mut Option<(String, AttrsOwned)>| {
-            if let Some(t) = cur.take() {
-                spans.push(t);
-            }
-        };
-
-        for row in 0..grid.rows {
-            // 行字符缓冲(宽字符占位格跳过),overlay 直接替换字符。
-            let mut row_chars: Vec<char> = grid.cells[row * grid.cols..(row + 1) * grid.cols]
-                .iter()
-                .filter(|c| !c.wide_spacer)
-                .map(|c| c.c)
-                .collect();
-            let row_overlays: Vec<&Overlay> =
-                grid.overlays.iter().filter(|o| o.row == row).collect();
-            if !row_overlays.is_empty() {
-                let base_cols = row_chars.len();
-                for o in &row_overlays {
-                    for (i, ch) in o.text.chars().enumerate() {
-                        let pos = o.col + i;
-                        if pos < base_cols {
-                            row_chars[pos] = ch;
-                        }
-                    }
-                }
-            }
-            let mut col = 0; // 当前字符序号(同时是列号,宽字符占 2 列在 M3 不精确处理)
-            for cell in &grid.cells[row * grid.cols..(row + 1) * grid.cols] {
-                if cell.wide_spacer {
-                    continue;
-                }
-                // 预编辑文本插在光标格之后(光标保持可见)。
-                if grid.preedit.as_ref().is_some_and(|p| p.row == row && p.col == col) {
-                    push_run(&mut spans, &mut cur);
-                    let pre = grid.preedit.as_ref().unwrap();
-                    let attrs = Attrs::new()
-                        .family(Family::Name(&family))
-                        .color(Color::rgb(0xff, 0xb4, 0x5c))
-                        .underline(UnderlineStyle::Single);
-                    spans.push((pre.text.clone(), AttrsOwned::new(&attrs)));
-                }
-                let cell = cell;
-                if cell.wide_spacer {
-                    continue;
-                }
-                // 块状光标格:文本用底色、底色用光标色。
-                let fg = if cursor_cell && (col, row) == cursor_pos {
-                    cell.bg
-                } else {
-                    cell.fg
-                };
-                let attrs = attrs_for(&family, fg, cell.bold, cell.italic, cell.underline);
-                let ch = row_chars.get(col).copied().unwrap_or(cell.c);
-                match &mut cur {
-                    Some((text, a)) if *a == AttrsOwned::new(&attrs) => text.push(ch),
-                    _ => {
-                        push_run(&mut spans, &mut cur);
-                        cur = Some((ch.to_string(), AttrsOwned::new(&attrs)));
-                    },
-                }
-                col += 1;
-            }
-            push_run(&mut spans, &mut cur);
-
-            // 行尾徽章:替换行末字符(通常是提示符行尾的空格)。
-            if let Some(badge) = grid.badges.iter().find(|b| b.row == row) {
-                let need = badge.text.chars().count();
-                let mut to_drop = need;
-                while to_drop > 0 {
-                    let Some((text, _)) = spans.last_mut() else { break };
-                    let d = text.chars().count().min(to_drop);
-                    let keep = text.chars().count() - d;
-                    *text = text.chars().take(keep).collect();
-                    to_drop -= d;
-                    if text.is_empty() {
-                        spans.pop();
-                    }
-                }
-                if to_drop == 0 {
-                    let attrs = Attrs::new()
-                        .family(Family::Name(&family))
-                        .color(Color::rgb(badge.color.0, badge.color.1, badge.color.2))
-                        .weight(Weight::BOLD);
-                    spans.push((badge.text.clone(), AttrsOwned::new(&attrs)));
-                }
-            }
-
-            if row + 1 < grid.rows {
-                spans.push(("\n".into(), AttrsOwned::new(&default_attrs)));
-            }
+        if self.glyph_buffers.len() > 4096 {
+            self.glyph_buffers.clear();
         }
-
-        let default_attrs_borrowed = default_attrs;
-        self.buffer.set_rich_text(
-            spans.iter().map(|(s, a)| (s.as_str(), a.as_attrs())),
-            &default_attrs_borrowed,
+        self.glyph_draws = text_cells(grid, self.cursor_color);
+        for draw in &self.glyph_draws {
+            let key = draw.key();
+            if self.glyph_buffers.contains_key(&key) {
+                continue;
+            }
+            let mut buffer = Buffer::new(&mut self.font_system, self.font_metrics);
+            buffer.set_wrap(glyphon::cosmic_text::Wrap::None);
+            buffer.set_hinting(glyphon::cosmic_text::Hinting::Enabled);
+            let mut cluster = draw.cell.c.to_string();
+            if let Some(extra) = &draw.cell.zerowidth {
+                cluster.push_str(extra);
+            }
+            buffer.set_text(
+                &cluster,
+                &attrs_for(
+                    &self.family,
+                    self.font_weight,
+                    draw.cell.fg,
+                    draw.cell.bold,
+                    draw.cell.italic,
+                    draw.cell.underline,
+                ),
+                Shaping::Advanced,
+                None,
+            );
+            buffer.shape_until_scroll(&mut self.font_system, false);
+            let mut ink: Option<GlyphInk> = None;
+            for run in buffer.layout_runs() {
+                for glyph in run.glyphs {
+                    let physical = glyph.physical((0.0, 0.0), 1.0);
+                    if let Some(image) = self
+                        .swash_cache
+                        .get_image(&mut self.font_system, physical.cache_key)
+                    {
+                        let p = image.placement;
+                        if p.width == 0 || p.height == 0 {
+                            continue;
+                        }
+                        let left = physical.x as f32 + p.left as f32;
+                        let top = run.line_y.round() + physical.y as f32 - p.top as f32;
+                        let extent = GlyphInk {
+                            left,
+                            top,
+                            right: left + p.width as f32,
+                            bottom: top + p.height as f32,
+                        };
+                        ink = Some(match ink {
+                            Some(i) => GlyphInk {
+                                left: i.left.min(extent.left),
+                                top: i.top.min(extent.top),
+                                right: i.right.max(extent.right),
+                                bottom: i.bottom.max(extent.bottom),
+                            },
+                            None => extent,
+                        });
+                    }
+                }
+            }
+            self.glyph_buffers.insert(key, CachedGlyph { buffer, ink });
+        }
+        self.preedit_pos = grid
+            .preedit
+            .as_ref()
+            .filter(|p| p.row < grid.rows && p.col < grid.cols)
+            .map(|p| (p.col, p.row));
+        self.preedit_buffer.set_text(
+            grid.preedit.as_ref().map(|p| p.text.as_str()).unwrap_or(""),
+            &attrs_for(
+                &self.family,
+                self.font_weight,
+                grid_default_fg(grid),
+                false,
+                false,
+                true,
+            ),
             Shaping::Advanced,
             None,
         );
-        self.buffer.shape_until_scroll(&mut self.font_system, false);
+        self.preedit_buffer
+            .shape_until_scroll(&mut self.font_system, false);
     }
 
     /// 单元格底色 + 选区 + 光标 → 四边形实例。
@@ -831,6 +1107,10 @@ impl Renderer {
                 let start = col;
                 while col + 1 < grid.cols && grid.cells[base + col + 1].bg == bg {
                     col += 1;
+                }
+                if bg == self.bg_default {
+                    col += 1;
+                    continue;
                 }
                 self.quads.push(Quad {
                     rect: [
@@ -860,8 +1140,13 @@ impl Renderer {
                     (0, grid.cols)
                 };
                 self.quads.push(Quad {
-                    rect: [x0 as f32 * cw + pad, row as f32 * ch + pad, (x1 - x0) as f32 * cw, ch],
-                    color: to_linear(Rgb::new(0x39, 0x5e, 0x9c), self.srgb),
+                    rect: [
+                        x0 as f32 * cw + pad,
+                        row as f32 * ch + pad,
+                        (x1 - x0) as f32 * cw,
+                        ch,
+                    ],
+                    color: to_linear(self.selection_color, self.srgb),
                 });
             }
         }
@@ -880,23 +1165,80 @@ impl Renderer {
         }
 
         // 光标。
-        if grid.cursor_shape != CursorShape::Hidden {
+        if grid.cursor_shape != CursorShape::Hidden
+            && grid.cursor.0 < grid.cols
+            && grid.cursor.1 < grid.rows
+            && grid.preedit.is_none()
+        {
             let (cx, cy) = grid.cursor;
+            let cursor_w = if cx + 1 < grid.cols && grid.cells[cy * grid.cols + cx + 1].wide_spacer
+            {
+                2.0 * cw
+            } else {
+                cw
+            };
             let (x, y, w, h) = match grid.cursor_shape {
-                CursorShape::Block => (cx as f32 * cw + pad, cy as f32 * ch + pad, cw, ch),
+                CursorShape::Block => (cx as f32 * cw + pad, cy as f32 * ch + pad, cursor_w, ch),
                 CursorShape::Underline => (
                     cx as f32 * cw + pad,
                     (cy + 1) as f32 * ch + pad - ch * 0.12,
-                    cw,
-                    ch * 0.12,
+                    cursor_w,
+                    (ch * 0.08).max(2.0),
                 ),
-                CursorShape::Beam => (cx as f32 * cw + pad, cy as f32 * ch + pad, cw * 0.1, ch),
+                CursorShape::Beam => (
+                    cx as f32 * cw + pad,
+                    cy as f32 * ch + pad,
+                    (cw * 0.1).max(2.0),
+                    ch,
+                ),
                 CursorShape::Hidden => unreachable!(),
             };
             self.quads.push(Quad {
                 rect: [x, y, w, h],
-                color: to_linear(Rgb::new(0x00, 0xa8, 0x84), self.srgb),
+                color: to_linear(self.cursor_color, self.srgb),
             });
+        }
+
+        // Vector window controls: independent of fonts and font fallback.
+        for icon in &grid.window_icons {
+            let side = (ch * 0.5).round().max(8.0);
+            let x = (pad + (icon.start + icon.end) as f32 * cw * 0.5 - side * 0.5).round();
+            let y = (pad + icon.row as f32 * ch + (ch - side) * 0.5).round();
+            let stroke = (ch * 0.05).round().max(1.0);
+            let color = to_linear(grid.cells[icon.row * grid.cols + icon.start].fg, self.srgb);
+            let mut line = |x1: f32, y1: f32, x2: f32, y2: f32| {
+                let count = ((x2 - x1).abs().max((y2 - y1).abs())).ceil().max(1.0) as usize;
+                for i in 0..=count {
+                    let t = i as f32 / count as f32;
+                    self.quads.push(Quad {
+                        rect: [
+                            (x1 + (x2 - x1) * t).round(),
+                            (y1 + (y2 - y1) * t).round(),
+                            stroke,
+                            stroke,
+                        ],
+                        color,
+                    });
+                }
+            };
+            let mut square = |x: f32, y: f32, size: f32| {
+                line(x, y, x + size, y);
+                line(x + size, y, x + size, y + size);
+                line(x + size, y + size, x, y + size);
+                line(x, y + size, x, y);
+            };
+            match icon.kind {
+                WindowIconKind::Maximize => square(x, y, side),
+                WindowIconKind::Restore => {
+                    square(x + side * 0.2, y, side * 0.8);
+                    square(x, y + side * 0.2, side * 0.8);
+                }
+                WindowIconKind::Minimize => line(x, y + side * 0.7, x + side, y + side * 0.7),
+                WindowIconKind::Close => {
+                    line(x, y, x + side, y + side);
+                    line(x + side, y, x, y + side);
+                }
+            }
         }
 
         // 上传实例(超出容量则扩容)。
@@ -909,24 +1251,74 @@ impl Renderer {
                 mapped_at_creation: false,
             });
         }
-        self.queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.quads));
+        self.queue
+            .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.quads));
     }
 
     /// 渲染一帧到 `texture`(当前 surface 纹理)并 present。
     pub fn render(&mut self, texture: wgpu::SurfaceTexture, alpha: f32) -> Result<(), String> {
-        let view = texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tay frame") });
-
-        let text_area = TextArea {
-            buffer: &self.buffer,
-            left: self.padding,
-            top: self.padding,
-            scale: 1.0,
-            bounds: TextBounds::default(),
-            default_color: self.fg_default,
-            custom_glyphs: &[],
+        let alpha = if self.alpha_mode == wgpu::CompositeAlphaMode::Opaque {
+            1.0
+        } else {
+            alpha.clamp(0.0, 1.0)
         };
+        let mut background = to_linear(self.bg_default, self.srgb);
+        if self.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
+            for channel in &mut background[..3] {
+                *channel *= alpha;
+            }
+        }
+        let view = texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tay frame"),
+            });
+
+        let mut areas: Vec<TextArea<'_>> = self
+            .glyph_draws
+            .iter()
+            .map(|draw| {
+                let left = self.padding + draw.col as f32 * self.cell.0;
+                let top = self.padding + draw.row as f32 * self.cell.1;
+                let cached = &self.glyph_buffers[&draw.key()];
+                let (dx, dy, scale) = fit_glyph(cached.ink, draw.cell.c, draw.width, self.cell);
+                TextArea {
+                    buffer: &cached.buffer,
+                    left: left + dx,
+                    top: top + dy,
+                    scale,
+                    bounds: TextBounds {
+                        left: left.floor() as i32,
+                        top: top.floor() as i32,
+                        right: (left + draw.width as f32 * self.cell.0).ceil() as i32,
+                        bottom: (top + self.cell.1).ceil() as i32,
+                    },
+                    default_color: self.fg_default,
+                    custom_glyphs: &[],
+                }
+            })
+            .collect();
+        if let Some((col, row)) = self.preedit_pos {
+            let left = self.padding + col as f32 * self.cell.0;
+            let top = self.padding + row as f32 * self.cell.1;
+            areas.push(TextArea {
+                buffer: &self.preedit_buffer,
+                left,
+                top,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: left.floor() as i32,
+                    top: top.floor() as i32,
+                    right: self.size.0 as i32,
+                    bottom: (top + self.cell.1).ceil() as i32,
+                },
+                default_color: self.fg_default,
+                custom_glyphs: &[],
+            });
+        }
         self.text
             .prepare(
                 &self.device,
@@ -934,7 +1326,7 @@ impl Renderer {
                 &mut self.font_system,
                 &mut self.atlas,
                 &self.viewport,
-                [text_area],
+                areas,
                 &mut self.swash_cache,
             )
             .map_err(|e| format!("文本准备失败: {e}"))?;
@@ -948,9 +1340,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: to_linear(self.bg_default, self.srgb)[0] as f64,
-                            g: to_linear(self.bg_default, self.srgb)[1] as f64,
-                            b: to_linear(self.bg_default, self.srgb)[2] as f64,
+                            r: background[0] as f64,
+                            g: background[1] as f64,
+                            b: background[2] as f64,
                             a: alpha as f64,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -995,15 +1387,18 @@ impl Renderer {
 
     /// 画 kitty 图像(`above` = 文本之上)。
     fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, above: bool) {
-        let rects: Vec<(u64, [f32; 4])> = self
+        let rects: Vec<((u32, usize), [f32; 4])> = self
             .current_images
             .iter()
             .filter(|(_, _, z)| (*z > 0) == above)
-            .map(|(hash, rect, _)| (*hash, *rect))
+            .map(|(key, rect, _)| (*key, *rect))
             .collect();
-        for (hash, rect) in rects {
-            let Some((_, bind, _, _, inst)) = self.img_cache.get(&hash) else { continue };
-            self.queue.write_buffer(inst, 0, bytemuck::cast_slice(&[rect]));
+        for (key, rect) in rects {
+            let Some((_, bind, _, _, inst)) = self.img_cache.get(&key) else {
+                continue;
+            };
+            self.queue
+                .write_buffer(inst, 0, bytemuck::cast_slice(&[rect]));
             pass.set_pipeline(&self.img_pipeline);
             pass.set_bind_group(0, bind, &[]);
             pass.set_vertex_buffer(0, self.uv_quad.slice(..));
@@ -1039,7 +1434,11 @@ impl Renderer {
                     rows_per_image: Some(h),
                 },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit(Some(encoder.finish()));
         let slice = buf.slice(..);
@@ -1052,7 +1451,10 @@ impl Renderer {
             log::error!("截图读回失败");
             return;
         }
-        let data = slice.get_mapped_range().map_err(|e| log::error!("映射截图缓冲失败: {e}")).ok();
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| log::error!("映射截图缓冲失败: {e}"))
+            .ok();
         let Some(data) = data else { return };
         // 去掉行填充;Bgra 格式交换 R/B。
         let swap = matches!(
@@ -1067,7 +1469,18 @@ impl Renderer {
                 rgba[dst + x * 4] = data[src + x * 4 + if swap { 2 } else { 0 }];
                 rgba[dst + x * 4 + 1] = data[src + x * 4 + 1];
                 rgba[dst + x * 4 + 2] = data[src + x * 4 + if swap { 0 } else { 2 }];
-                rgba[dst + x * 4 + 3] = 255;
+                let alpha = data[src + x * 4 + 3];
+                rgba[dst + x * 4 + 3] = alpha;
+                if self.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied
+                    && alpha > 0
+                    && alpha < 255
+                {
+                    for channel in 0..3 {
+                        rgba[dst + x * 4 + channel] = ((rgba[dst + x * 4 + channel] as u32 * 255)
+                            / alpha as u32)
+                            .min(255) as u8;
+                    }
+                }
             }
         }
         drop(data);
@@ -1082,5 +1495,145 @@ impl Renderer {
 
 /// 网格首格的默认前景色(空行 span 用)。
 fn grid_default_fg(grid: &Grid) -> Rgb {
-    grid.cells.first().map(|c| c.fg).unwrap_or(Rgb::new(0xd4, 0xd4, 0xd4))
+    grid.cells
+        .first()
+        .map(|c| c.fg)
+        .unwrap_or(Rgb::new(0xd4, 0xd4, 0xd4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn symbol_ink_fits_without_moving_terminal_column_origins() {
+        let icon = GlyphInk {
+            left: 0.0,
+            top: 5.0,
+            right: 34.0,
+            bottom: 32.0,
+        };
+        let (x, y, scale) = fit_glyph(Some(icon), '\u{f120}', 1, (19.0, 40.0));
+        assert!(scale < 1.0);
+        assert!(x + icon.left * scale >= 0.0);
+        assert!(x + icon.right * scale <= 19.001);
+        assert!(y + icon.top * scale >= 0.0 && y + icon.bottom * scale <= 40.001);
+        assert_eq!(
+            fit_glyph(Some(icon), '\u{f120}', 2, (19.0, 40.0)),
+            (0.0, 0.0, 1.0)
+        );
+        let italic = GlyphInk {
+            left: -3.0,
+            top: 6.0,
+            right: 14.0,
+            bottom: 32.0,
+        };
+        assert_eq!(
+            fit_glyph(Some(italic), 'j', 1, (19.0, 40.0)),
+            (3.0, 0.0, 1.0)
+        );
+        let powerline = GlyphInk {
+            left: -2.0,
+            top: -2.0,
+            right: 20.0,
+            bottom: 41.0,
+        };
+        assert_eq!(
+            fit_glyph(Some(powerline), '\u{e0b0}', 1, (19.0, 40.0)),
+            (0.0, 0.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn clusters_survive_draw_cache_and_icons_only_use_empty_neighbor_cells() {
+        let cell = Cell {
+            c: 'e',
+            zerowidth: Some("\u{301}".into()),
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+        };
+        let mut grid = Grid {
+            cols: 4,
+            rows: 1,
+            cells: vec![cell; 4],
+            cursor: (3, 0),
+            cursor_shape: CursorShape::Hidden,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+        };
+        grid.cells[1].zerowidth = Some("\u{308}".into());
+        let draws = text_cells(&grid, Rgb(0, 255, 0));
+        assert_ne!(draws[0].key(), draws[1].key());
+        assert_eq!(draws[0].cell.zerowidth.as_deref(), Some("\u{301}"));
+        grid.cells[0].c = '\u{f120}';
+        grid.cells[0].zerowidth = None;
+        grid.cells[1].c = ' ';
+        grid.cells[1].zerowidth = None;
+        assert_eq!(text_cells(&grid, Rgb(0, 255, 0))[0].width, 2);
+        grid.cells[1].c = 'a';
+        assert_eq!(text_cells(&grid, Rgb(0, 255, 0))[0].width, 1);
+        grid.cells[1].c = ' ';
+        grid.cursor = (1, 0);
+        assert_eq!(text_cells(&grid, Rgb(0, 255, 0))[0].width, 1);
+        grid.cursor = (3, 0);
+        grid.cells[1].bg = Rgb(255, 0, 0);
+        assert_eq!(text_cells(&grid, Rgb(0, 255, 0))[0].width, 1);
+    }
+
+    #[test]
+    fn text_and_cursor_share_grid_positions_with_wide_and_bold_cells() {
+        let cell = Cell {
+            c: 'i',
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+            zerowidth: None,
+        };
+        let mut cells = vec![cell; 8];
+        cells[2].c = '中';
+        cells[3].c = ' ';
+        cells[3].wide_spacer = true;
+        cells[4].bold = true;
+        let mut grid = Grid {
+            cols: 8,
+            rows: 1,
+            cells,
+            cursor: (4, 0),
+            cursor_shape: CursorShape::Block,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+        };
+        let draws = text_cells(&grid, Rgb(0, 160, 128));
+        assert_eq!(
+            draws.iter().map(|d| d.col).collect::<Vec<_>>(),
+            vec![0, 1, 2, 4, 5, 6, 7]
+        );
+        assert_eq!(draws[2].width, 2);
+        assert_eq!(draws[3].cell.fg, contrast_text(Rgb(0, 160, 128)));
+        grid.preedit = Some(Preedit {
+            text: "你好".into(),
+            col: 2,
+            row: 0,
+            cursor_bytes: None,
+        });
+        let draws = text_cells(&grid, Rgb(0, 160, 128));
+        assert_eq!(
+            draws.iter().map(|d| d.col).collect::<Vec<_>>(),
+            vec![0, 1, 6, 7]
+        );
+    }
 }

@@ -13,3 +13,5 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 image = { workspace = true, features = ["png"] }
 log.workspace = true
+
+unicode-width = "0.2"
