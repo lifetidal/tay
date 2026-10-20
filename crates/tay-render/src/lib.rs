@@ -45,6 +45,7 @@ pub enum WindowIconKind {
     Maximize,
     Restore,
     Close,
+    Settings,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct WindowIcon {
@@ -104,6 +105,74 @@ pub struct RenderImage {
     pub rgba: std::sync::Arc<[u8]>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelCorners {
+    All,
+    Opposite,
+}
+
+/// 栏内圆角面板：背景由网格着色，这里绘制圆角遮罩及活动标记。
+#[derive(Clone, Debug)]
+pub struct ChromePanel {
+    pub row: usize,
+    pub start: usize,
+    pub end: usize,
+    pub background: Rgb,
+    pub accent: Option<Rgb>,
+    pub corners: PanelCorners,
+}
+
+/// position = 历史偏移比例：0 最新，1 最旧。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scrollbar {
+    pub top: f32,
+    pub extent: f32,
+    pub position: f32,
+    pub size: f32,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct ScrollbarGeometry {
+    pub x: f32,
+    pub width: f32,
+    pub top: f32,
+    pub height: f32,
+    pub thumb_top: f32,
+    pub thumb_height: f32,
+}
+impl Scrollbar {
+    pub fn geometry(self, right: f32, cell_height: f32, padding: f32) -> Option<ScrollbarGeometry> {
+        if self.size >= 1.0 || self.extent <= 0.0 {
+            return None;
+        }
+        let height = self.extent * cell_height;
+        let thumb_height = (self.size * height)
+            .max(24.0)
+            .min((height - 2.0).max(height * 0.5));
+        let top = padding + self.top * cell_height;
+        let width = (cell_height * 0.65).clamp(12.0, 28.0);
+        Some(ScrollbarGeometry {
+            x: (right - width).max(0.0),
+            width,
+            top,
+            height,
+            thumb_top: top + (1.0 - self.position.clamp(0.0, 1.0)) * (height - thumb_height),
+            thumb_height,
+        })
+    }
+}
+impl ScrollbarGeometry {
+    pub fn contains(self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.top && y < self.top + self.height
+    }
+    pub fn offset(self, y: f32, grab: f32, history: usize) -> usize {
+        let travel = self.height - self.thumb_height;
+        if travel <= 0.0 {
+            return 0;
+        }
+        ((1.0 - ((y - self.top - grab) / travel).clamp(0.0, 1.0)) * history as f32).round() as usize
+    }
+}
+
 /// 终端网格快照。
 pub struct Grid {
     pub cols: usize,
@@ -113,6 +182,10 @@ pub struct Grid {
     pub cursor: (usize, usize),
     pub cursor_shape: CursorShape,
     pub window_icons: Vec<WindowIcon>,
+    pub chrome_panels: Vec<ChromePanel>,
+    /// 顶部标签栏占用的网格行数；文字与图标在此高度内居中。
+    pub tab_bar_rows: usize,
+    pub scrollbar: Option<Scrollbar>,
     pub selection: Option<SelectionRange>,
     pub preedit: Option<Preedit>,
     /// 行尾徽章(行号 = 显示行)。
@@ -154,6 +227,7 @@ pub struct Renderer {
     /// 一行一个终端行的文本缓冲。
     glyph_buffers: std::collections::HashMap<GlyphKey, CachedGlyph>,
     glyph_draws: Vec<GlyphDraw>,
+    tab_bar_rows: usize,
     font_metrics: Metrics,
     preedit_buffer: Buffer,
     preedit_pos: Option<(usize, usize)>,
@@ -731,6 +805,7 @@ impl Renderer {
             viewport,
             glyph_buffers: Default::default(),
             glyph_draws: Vec::new(),
+            tab_bar_rows: 0,
             font_metrics: Metrics::new(font_size_px, cell_h),
             preedit_buffer,
             preedit_pos: None,
@@ -894,6 +969,7 @@ impl Renderer {
 
     /// 用新的网格快照重建文本缓冲与四边形。渲染帧之前调用。
     pub fn update(&mut self, grid: &Grid) {
+        self.tab_bar_rows = grid.tab_bar_rows;
         self.rebuild_text(grid);
         self.rebuild_quads(grid);
         self.rebuild_images(grid);
@@ -1125,7 +1201,64 @@ impl Renderer {
             }
         }
 
-        // 选区。
+        // 圆角栏内面板遮罩及活动标签标记。
+        for panel in &grid.chrome_panels {
+            let x = pad + panel.start as f32 * cw;
+            let y = pad + panel.row as f32 * ch;
+            let w = (panel.end - panel.start) as f32 * cw;
+            let ch = if panel.row == 0 {
+                ch * grid.tab_bar_rows.max(1) as f32
+            } else {
+                ch
+            };
+            let inset = (ch * 0.1).max(1.0);
+            let radius = (ch * 0.28).min(w * 0.5);
+            let mask = to_linear(panel.background, self.srgb);
+            for rect in [[x, y, w, inset], [x, y + ch - inset, w, inset]] {
+                self.quads.push(Quad { rect, color: mask });
+            }
+            for step in 0..radius.ceil() as usize {
+                let dy = step as f32 + 0.5;
+                let cut =
+                    (radius - (radius * radius - (radius - dy).powi(2)).max(0.0).sqrt()).max(0.0);
+                // 半圆角：左上与右下保留曲线，另两个角不裁剪。
+                for rect in [
+                    [x, y + inset + step as f32, cut, 1.0],
+                    [x + w - cut, y + ch - inset - step as f32 - 1.0, cut, 1.0],
+                ] {
+                    self.quads.push(Quad { rect, color: mask });
+                }
+                if panel.corners == PanelCorners::All {
+                    for rect in [
+                        [x + w - cut, y + inset + step as f32, cut, 1.0],
+                        [x, y + ch - inset - step as f32 - 1.0, cut, 1.0],
+                    ] {
+                        self.quads.push(Quad { rect, color: mask });
+                    }
+                }
+            }
+            if let Some(color) = panel.accent {
+                self.quads.push(Quad {
+                    rect: [
+                        x + if panel.corners == PanelCorners::All {
+                            radius
+                        } else {
+                            1.0
+                        },
+                        y + ch - inset - 2.0,
+                        (w - radius
+                            - if panel.corners == PanelCorners::All {
+                                radius
+                            } else {
+                                1.0
+                            })
+                        .max(0.0),
+                        2.0,
+                    ],
+                    color: to_linear(color, self.srgb),
+                });
+            }
+        }
         if let Some(sel) = grid.selection {
             let (sx, sy) = sel.start;
             let (ex, ey) = sel.end;
@@ -1199,11 +1332,40 @@ impl Renderer {
             });
         }
 
+        if let Some(geometry) = grid
+            .scrollbar
+            .and_then(|sb| sb.geometry(self.size.0 as f32, ch, pad))
+        {
+            self.quads.push(Quad {
+                rect: [
+                    geometry.x + geometry.width * 0.3,
+                    geometry.top,
+                    geometry.width * 0.4,
+                    geometry.height,
+                ],
+                color: to_linear(self.bg_default, self.srgb),
+            });
+            self.quads.push(Quad {
+                rect: [
+                    geometry.x + geometry.width * 0.3,
+                    geometry.thumb_top,
+                    geometry.width * 0.4,
+                    geometry.thumb_height,
+                ],
+                color: to_linear(self.cursor_color, self.srgb),
+            });
+        }
+
         // Vector window controls: independent of fonts and font fallback.
         for icon in &grid.window_icons {
-            let side = (ch * 0.5).round().max(8.0);
+            let icon_height = if icon.row == 0 {
+                ch * grid.tab_bar_rows.max(1) as f32
+            } else {
+                ch
+            };
+            let side = (ch * 0.65).round().max(8.0);
             let x = (pad + (icon.start + icon.end) as f32 * cw * 0.5 - side * 0.5).round();
-            let y = (pad + icon.row as f32 * ch + (ch - side) * 0.5).round();
+            let y = (pad + icon.row as f32 * ch + (icon_height - side) * 0.5).round();
             let stroke = (ch * 0.05).round().max(1.0);
             let color = to_linear(grid.cells[icon.row * grid.cols + icon.start].fg, self.srgb);
             let mut line = |x1: f32, y1: f32, x2: f32, y2: f32| {
@@ -1228,6 +1390,31 @@ impl Renderer {
                 line(x, y + size, x, y);
             };
             match icon.kind {
+                WindowIconKind::Settings => {
+                    let cx = x + side / 2.0;
+                    let cy = y + side / 2.0;
+                    let point = |i: usize| {
+                        let angle = i as f32 * std::f32::consts::TAU / 64.0;
+                        let radius = if i % 8 < 4 { side * 0.48 } else { side * 0.36 };
+                        (cx + radius * angle.cos(), cy + radius * angle.sin())
+                    };
+                    for i in 0..64 {
+                        let (ax, ay) = point(i);
+                        let (bx, by) = point(i + 1);
+                        line(ax, ay, bx, by);
+                    }
+                    for i in 0..32 {
+                        let a = i as f32 * std::f32::consts::TAU / 32.0;
+                        let b = (i + 1) as f32 * std::f32::consts::TAU / 32.0;
+                        let r = side * 0.16;
+                        line(
+                            cx + r * a.cos(),
+                            cy + r * a.sin(),
+                            cx + r * b.cos(),
+                            cy + r * b.sin(),
+                        );
+                    }
+                }
                 WindowIconKind::Maximize => square(x, y, side),
                 WindowIconKind::Restore => {
                     square(x + side * 0.2, y, side * 0.8);
@@ -1282,7 +1469,13 @@ impl Renderer {
             .iter()
             .map(|draw| {
                 let left = self.padding + draw.col as f32 * self.cell.0;
-                let top = self.padding + draw.row as f32 * self.cell.1;
+                let top = self.padding
+                    + draw.row as f32 * self.cell.1
+                    + if draw.row == 0 {
+                        self.tab_bar_rows.saturating_sub(1) as f32 * self.cell.1 * 0.5
+                    } else {
+                        0.0
+                    };
                 let cached = &self.glyph_buffers[&draw.key()];
                 let (dx, dy, scale) = fit_glyph(cached.ink, draw.cell.c, draw.width, self.cell);
                 TextArea {
@@ -1505,6 +1698,55 @@ fn grid_default_fg(grid: &Grid) -> Rgb {
 mod tests {
     use super::*;
     #[test]
+    fn scrollbar_geometry_and_drag_agree_at_both_ends() {
+        for ch in [12.0, 24.0, 48.0] {
+            for position in [0.0, 0.5, 1.0] {
+                let g = Scrollbar {
+                    top: 3.0,
+                    extent: 20.0,
+                    position,
+                    size: 0.01,
+                }
+                .geometry(800.0, ch, 10.0)
+                .unwrap();
+                assert!(
+                    g.thumb_top >= g.top
+                        && g.thumb_top + g.thumb_height <= g.top + g.height + 0.001
+                );
+                let grab = g.thumb_height / 2.0;
+                assert_eq!(
+                    g.offset(g.thumb_top + grab, grab, 1000),
+                    (position * 1000.0).round() as usize
+                );
+                assert_eq!(g.offset(-100.0, grab, 1000), 1000);
+                assert_eq!(g.offset(10000.0, grab, 1000), 0);
+                assert!(g.contains(799.0, g.top));
+                assert!(!g.contains(g.x - 1.0, g.top));
+            }
+        }
+        let tiny = Scrollbar {
+            top: 1.0,
+            extent: 1.0,
+            position: 0.0,
+            size: 0.001,
+        }
+        .geometry(800.0, 12.0, 0.0)
+        .unwrap();
+        assert!(tiny.thumb_height < tiny.height);
+        assert_eq!(tiny.offset(-10.0, 0.0, 1000), 1000);
+        assert_eq!(tiny.offset(1000.0, 0.0, 1000), 0);
+        assert!(
+            Scrollbar {
+                top: 0.0,
+                extent: 20.0,
+                position: 0.0,
+                size: 1.0
+            }
+            .geometry(800.0, 20.0, 0.0)
+            .is_none()
+        );
+    }
+    #[test]
     fn symbol_ink_fits_without_moving_terminal_column_origins() {
         let icon = GlyphInk {
             left: 0.0,
@@ -1567,6 +1809,9 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            scrollbar: None,
         };
         grid.cells[1].zerowidth = Some("\u{308}".into());
         let draws = text_cells(&grid, Rgb(0, 255, 0));
@@ -1616,6 +1861,9 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            scrollbar: None,
         };
         let draws = text_cells(&grid, Rgb(0, 160, 128));
         assert_eq!(

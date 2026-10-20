@@ -166,10 +166,16 @@ pub struct SessionUpdate {
 pub enum SessionCommand {
     /// 键盘/粘贴/IME 文本。
     Input(Vec<u8>),
+    ProtocolQuery(alacritty_terminal::event::Event),
+    SetColors(tay_config::Colors),
     /// resize:PTY 与终端内核一并更新。
     Resize(WindowSize),
     /// 鼠标滚轮/触控板滚动(display_offset)。
     ScrollDisplay(Scroll),
+    ScrollToOffset {
+        offset: usize,
+        epoch: AnchorEpoch,
+    },
     /// 跳到历史绝对锚点(会话侧解析 + 世代校验 + 淘汰校验,
     /// 过期目标 no-op)。`epoch` = 锚点来源快照的失效世代。
     ScrollToAnchor {
@@ -242,6 +248,7 @@ pub enum CopyOutcome {
 /// (架构 §3)。UI 经快照的 COW 共享引用读取。
 pub struct SessionState<U: EventListener> {
     pub term: Term<U>,
+    pub palette: tay_config::Colors,
     pub meta: SessionMeta,
     pub blocks: Arc<crate::blocks::CommandBlockStore>,
     pub images: Arc<Vec<KittyImageEntry>>,
@@ -251,6 +258,7 @@ impl<U: EventListener> SessionState<U> {
     pub fn new(term: Term<U>) -> Self {
         Self {
             term,
+            palette: tay_config::Colors::default(),
             meta: SessionMeta::default(),
             blocks: Arc::new(crate::blocks::CommandBlockStore::default()),
             images: Arc::new(Vec::new()),

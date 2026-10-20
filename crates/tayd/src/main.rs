@@ -10,6 +10,7 @@
 //! - `TAY_FOLD=1` — 第 14 帧自动折叠第一条命令的输出(截图验证用)
 //! - `TAY_IME=文本` — 第 11 帧注入 IME Commit(中文输入链路验证)
 //! - `TAY_REBIND=1` — 第 15 帧强制 surface 重建(输出回退路径验证)
+//! - `TAY_SCROLLBAR=1` — 有历史后模拟滑块拖动、跨标题栏松开及轨道点击
 //! - `TAY_SCROLL=1` — 第 16 帧注入滚轮滚动(ScrollDisplay 链路验证)
 //! - `TAY_SEL=1` — 第 17 帧合成拖选并复制(选择→CopyAnchors 链路验证)
 //! - `TAY_PASTE=1` — 第 18/19 帧注入两次 300 KiB 粘贴(统一输入预算
@@ -29,6 +30,7 @@ mod kitty;
 mod ptyloop;
 mod quickselect;
 mod session;
+mod terminal;
 mod view;
 mod visibility;
 

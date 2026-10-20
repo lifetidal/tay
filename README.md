@@ -133,13 +133,38 @@ docs/architecture.md。
 
 ### 标签页与外观设置
 
-顶部标签的 `x` 关闭该会话；关闭最后一个标签会隐藏窗口，后台保留呼出快捷键，下次呼出创建新会话。右上角 `—` 隐藏并保留会话，`□` 最大化/还原高度，`×` 关闭窗口并结束全部会话。`+ Tab` 新建独立 Shell。
+顶部标签的 `x` 关闭该会话；关闭最后一个标签会隐藏窗口，后台保留呼出快捷键，下次呼出创建新会话。右上角 `—` 隐藏并保留会话，`□` 最大化/还原高度，`×` 关闭窗口并结束全部会话。标签后的 `+` 新建独立 Shell。
 
 - `Ctrl+Shift+T` 新建，`Ctrl+Shift+W` 关闭，`Ctrl+Tab` / `Ctrl+Shift+Tab` 切换。
-- `Ctrl++` / `Ctrl+-` 或 `A+` / `A-` 调整字号；`Ctrl+0` 恢复 12pt。
-- `Ctrl+,` 或 `Settings` 打开设置。点击 `Font`、`Background`、`Text color` 编辑；`Ctrl+A` 清空原值，回车保存，Esc 取消。颜色格式为 `#RRGGBB`，推荐使用已安装的等宽字体，通用字体名可填写 `monospace`。
+- `Ctrl++` / `Ctrl+-` 或 `A+` / `A-` 调整字号；`Ctrl+0` 恢复 Lua 配置中的基础字号。
+- `Ctrl+,` 或齿轮按钮 打开设置。点击 `Font`、`Background`、`Text color` 编辑；`Ctrl+A` 清空原值，回车保存，Esc 取消。颜色格式为 `#RRGGBB`，推荐使用已安装的等宽字体，通用字体名可填写 `monospace`。
 - 外观立即生效并保存至配置文件。
 - 全局呼出使用桌面的 GlobalShortcuts portal，默认申请 F12；需在系统授权窗口确认。`Hotkeys` 显示授权状态，KDE 下同时打开快捷键设置。若桌面未提供该 portal，可在系统快捷键中绑定 `tay toggle`。窗口有焦点时 F12 可直接隐藏。
+
+标签条采用加高布局，文字与图标垂直居中，展开设置后显示额外控件。Lua 配色与布局保存后自动热重载：
+
+```lua
+return {
+  theme = "midnight",
+  tab_bar = {
+    visible = true,        -- false = 极简模式(栏隐藏、终端占满全高;
+                           --   设置面板展开时临时显示;快捷键不受影响)
+    compact = true, tab_width = 24, -- 12–40 个显示列
+    background = "#111d30", active_background = "#246fba",
+    active_foreground = "#ffffff", inactive_foreground = "#b2c6e0",
+    hover_background = "#263c59", accent = "#83d7ed",
+    clock_background = "#244155", clock_foreground = "#cae7ef",
+    icon_foreground = "#93a8be", icon_hover_foreground = "#a4dce8",
+    danger_foreground = "#ee9fa7",
+    -- 颜色均可省略:未显式配置的 tab_bar 颜色从主题自动推导
+    -- (换 theme 时操作栏自动协调,推荐省略全部颜色)。
+  },
+}
+```
+
+标签使用左上、右下圆角（其余直角）的分离形状与粗体，设置按钮为矢量齿轮，时钟独立预留位置，配色可通过上述 Lua 字段修改。右缘滚动条支持拖动滑块和点击轨道定位；备用屏幕应用中不显示历史滚动条。
+
+完整冰蓝预设见 [config/desktop.lua](config/desktop.lua)，包含字体、透明度和快捷键。
 
 命令行也支持 `tay new-tab`、`tay next-tab`、`tay close-tab`、`tay settings`、`tay maximize`、`tay restore`。
 

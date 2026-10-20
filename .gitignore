@@ -4,3 +4,6 @@
 *.jpg
 Cargo.lock.orig
 /dist/
+
+!packaging/icons/tay.png
+!packaging/icons/tay-terminal.png

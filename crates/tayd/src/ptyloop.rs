@@ -160,6 +160,7 @@ pub fn spawn<U>(
     listener: U,
     pty: tty::Pty,
     snapshot_slot: Arc<Mutex<Option<SessionUpdate>>>,
+    initial_cell: (u32, u32),
 ) -> std::io::Result<TermSender>
 where
     U: EventListener + Send + 'static,
@@ -178,10 +179,10 @@ where
                 state,
                 listener,
                 pty,
-                rx,
-                wake_rx,
+                SessionInbox { rx, wake_rx },
                 snapshot_slot,
                 inflight_thread,
+                initial_cell,
             );
         })
         .map_err(std::io::Error::other)?;
@@ -217,6 +218,10 @@ where
 ///   由 region_is_full 按行数比对识别。
 struct CountingHandler<'a, U: EventListener> {
     term: &'a mut Term<U>,
+    palette: Option<&'a tay_config::Colors>,
+    cell: (u32, u32),
+    responses: Vec<String>,
+    response_listener: Option<&'a U>,
     /// 本次 advance 累计的历史滚动量。
     pub scrolled: i32,
     /// Term 的 input_needs_wrap 影子(跨 chunk 连续)。
@@ -254,6 +259,16 @@ impl<'a, U: EventListener> CountingHandler<'a, U> {
         match *self.scroll_region {
             None => true,
             Some((start, end, _)) => start == 0 && end == rows,
+        }
+    }
+}
+
+impl<U: EventListener> CountingHandler<'_, U> {
+    fn respond(&mut self, text: String) {
+        if let Some(listener) = self.response_listener {
+            listener.send_event(Event::PtyWrite(text));
+        } else {
+            self.responses.push(text);
         }
     }
 }
@@ -530,7 +545,18 @@ impl<U: EventListener> Handler for CountingHandler<'_, U> {
         self.term.set_color(a16, a17);
     }
     fn dynamic_color_sequence(&mut self, a18: String, a19: usize, a20: &str) {
-        self.term.dynamic_color_sequence(a18, a19, a20);
+        if let Some(config) = self.palette {
+            if let Some(c) =
+                crate::terminal::palette(a19, self.term.renderable_content().colors, config)
+            {
+                self.respond(format!(
+                    "\x1b]{};rgb:{1:02x}{1:02x}/{2:02x}{2:02x}/{3:02x}{3:02x}{4}",
+                    a18, c.0, c.1, c.2, a20
+                ));
+            }
+        } else {
+            self.term.dynamic_color_sequence(a18, a19, a20);
+        }
     }
     fn reset_color(&mut self, a21: usize) {
         self.term.reset_color(a21);
@@ -551,7 +577,15 @@ impl<U: EventListener> Handler for CountingHandler<'_, U> {
         self.term.pop_title();
     }
     fn text_area_size_pixels(&mut self) {
-        self.term.text_area_size_pixels();
+        if self.palette.is_some() {
+            self.respond(format!(
+                "\x1b[4;{};{}t",
+                self.rows() as u32 * self.cell.1,
+                self.cols() as u32 * self.cell.0
+            ));
+        } else {
+            self.term.text_area_size_pixels();
+        }
     }
     fn text_area_size_chars(&mut self) {
         self.term.text_area_size_chars();
@@ -764,17 +798,23 @@ impl ResizeMerger {
     }
 }
 
+struct SessionInbox {
+    rx: Receiver<SessionCommand>,
+    wake_rx: UnixStream,
+}
+
 fn run<U>(
     mut state: SessionState<U>,
     listener: U,
     mut pty: tty::Pty,
-    rx: Receiver<SessionCommand>,
-    mut wake_rx: UnixStream,
+    inbox: SessionInbox,
     snapshot_slot: Arc<Mutex<Option<SessionUpdate>>>,
     inflight: Arc<std::sync::atomic::AtomicUsize>,
+    initial_cell: (u32, u32),
 ) where
     U: EventListener,
 {
+    let SessionInbox { rx, mut wake_rx } = inbox;
     let poller = match Poller::new() {
         Ok(p) => p,
         Err(e) => {
@@ -809,7 +849,7 @@ fn run<U>(
     }
 
     let mut parser: ansi::Processor = ansi::Processor::new();
-    let mut cell: (u32, u32) = (8, 16);
+    let mut cell = initial_cell;
     let mut scanner = StreamScanner::default();
     let mut buf = vec![0u8; 16 * 1024];
     let mut events = polling::Events::new();
@@ -865,12 +905,19 @@ fn run<U>(
                                     match ev {
                                         StreamEvent::Text(bytes) => {
                                             let mut h = CountingHandler {
+                                                palette: Some(&state.palette),
+                                                cell,
+                                                responses: Vec::new(),
+                                                response_listener: Some(&listener),
                                                 term: &mut state.term,
                                                 scrolled: 0,
                                                 wrap_pending: &mut wrap_pending,
                                                 scroll_region: &mut scroll_region,
                                             };
                                             parser.advance(&mut h, &bytes);
+                                            for response in h.responses.drain(..) {
+                                                listener.send_event(Event::PtyWrite(response));
+                                            }
                                             // Term 归本线程所有:网格与锚点
                                             // 天然同一版本(架构 §3)。
                                             state.meta.cum_scroll += h.scrolled;
@@ -1007,6 +1054,10 @@ fn run<U>(
                                                 };
                                                 if let Some(seq) = move_seq {
                                                     let mut h = CountingHandler {
+                                                        palette: None,
+                                                        cell: (8, 16),
+                                                        responses: Vec::new(),
+                                                        response_listener: None,
                                                         term: &mut state.term,
                                                         scrolled: 0,
                                                         wrap_pending: &mut wrap_pending,
@@ -1067,7 +1118,6 @@ fn run<U>(
 
         // UI 消息:事件之后统一处理(不再依赖 WAKE_KEY 分支,避免
         // `rx.try_recv()` 探测性检查吞掉刚到的消息)。
-        let mut handled_msg = false;
         // 连续 Resize 合并(ResizeMerger,纯逻辑见单测):只保留
         // 最新值,遇其它命令或排空结束时应用 —— 命令 FIFO 保持
         // (后续复制/搜索/输入看到新布局与失效世代),连续的
@@ -1076,7 +1126,6 @@ fn run<U>(
         loop {
             match rx.try_recv() {
                 Ok(msg) => {
-                    handled_msg = true;
                     let is_resize = matches!(msg, SessionCommand::Resize(_));
                     let resize = match &msg {
                         SessionCommand::Resize(ws) => Some(*ws),
@@ -1093,6 +1142,14 @@ fn run<U>(
                         );
                     }
                     match msg {
+                        SessionCommand::SetColors(colors) => state.palette = colors,
+                        SessionCommand::ProtocolQuery(event) => {
+                            if let Some(response) =
+                                crate::terminal::query_response(&state, &event, cell)
+                            {
+                                listener.send_event(Event::PtyWrite(response));
+                            }
+                        }
                         SessionCommand::Input(bytes) => {
                             // 出队**不**释放预算:统一预算覆盖跨线程
                             // 消息与 PTY 待写数据,额度只在字节实际
@@ -1114,6 +1171,25 @@ fn run<U>(
                         }
                         SessionCommand::Resize(_) => {
                             // 已并入 merger,此处只占位。
+                        }
+                        SessionCommand::ScrollToOffset { offset, epoch } => {
+                            if epoch == state.meta.invalidate_epoch
+                                && !state.term.mode().contains(TermMode::ALT_SCREEN)
+                            {
+                                let history = state
+                                    .term
+                                    .total_lines()
+                                    .saturating_sub(state.term.screen_lines());
+                                let delta = offset.min(history) as i64
+                                    - state.term.grid().display_offset() as i64;
+                                state
+                                    .term
+                                    .scroll_display(alacritty_terminal::grid::Scroll::Delta(
+                                        delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+                                    ));
+                                state.bump();
+                                publish(&snapshot_slot, &state, &listener);
+                            }
                         }
                         SessionCommand::ScrollDisplay(scroll) => {
                             state.term.scroll_display(scroll);
@@ -1206,9 +1282,33 @@ fn run<U>(
             );
         }
 
-        // 同步超时推进(无数据且无消息;原版语义)。
-        if events.is_empty() && !handled_msg {
-            parser.stop_sync(&mut state.term);
+        // Deadline expiry must not depend on an otherwise idle event queue.
+        if parser
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|at| at <= Instant::now())
+        {
+            let mut h = CountingHandler {
+                term: &mut state.term,
+                palette: Some(&state.palette),
+                cell,
+                responses: Vec::new(),
+                response_listener: Some(&listener),
+                scrolled: 0,
+                wrap_pending: &mut wrap_pending,
+                scroll_region: &mut scroll_region,
+            };
+            parser.stop_sync(&mut h);
+            state.meta.cum_scroll += h.scrolled;
+            for response in h.responses.drain(..) {
+                listener.send_event(Event::PtyWrite(response));
+            }
+            state.meta.revision.0 += 1;
+            let alt = state.term.mode().contains(TermMode::ALT_SCREEN);
+            if alt != alt_screen_active {
+                alt_screen_active = alt;
+                state.advance_epoch();
+            }
             publish(&snapshot_slot, &state, &listener);
         }
 
@@ -1842,6 +1942,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mixed_protocol_replies_preserve_query_order() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl EventListener for Capture {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+        }
+        struct D;
+        impl Dimensions for D {
+            fn columns(&self) -> usize {
+                10
+            }
+            fn screen_lines(&self) -> usize {
+                5
+            }
+            fn total_lines(&self) -> usize {
+                5
+            }
+        }
+        let capture = Capture(Arc::new(Mutex::new(Vec::new())));
+        let mut term = Term::new(Default::default(), &D, capture.clone());
+        let palette = tay_config::Colors::default();
+        let mut wrap = false;
+        let mut region = None;
+        let mut h = CountingHandler {
+            term: &mut term,
+            palette: Some(&palette),
+            cell: (8, 16),
+            responses: Vec::new(),
+            response_listener: Some(&capture),
+            scrolled: 0,
+            wrap_pending: &mut wrap,
+            scroll_region: &mut region,
+        };
+        let mut parser: ansi::Processor = Default::default();
+        parser.advance(&mut h, b"\x1b]11;?\x07\x1b[6n\x1b[14t");
+        let responses = capture.0.lock().unwrap();
+        assert_eq!(responses.len(), 3);
+        assert!(responses[0].starts_with("\x1b]11;rgb:"));
+        assert_eq!(responses[1], "\x1b[1;1R");
+        assert_eq!(responses[2], "\x1b[4;80;80t");
+    }
+    #[test]
+    fn query_colors_are_captured_at_the_exact_escape_sequence() {
+        let mut term = test_term();
+        let config = tay_config::Colors::default();
+        let mut wrap = false;
+        let mut region = None;
+        let mut parser: ansi::Processor = Default::default();
+        let mut h = CountingHandler {
+            term: &mut term,
+            palette: Some(&config),
+            cell: (19, 40),
+            responses: Vec::new(),
+            response_listener: None,
+            scrolled: 0,
+            wrap_pending: &mut wrap,
+            scroll_region: &mut region,
+        };
+        parser.advance(
+            &mut h,
+            b"\x1b]11;#112233\x07\x1b]11;?\x07\x1b]11;#aabbcc\x07\x1b]11;?\x07",
+        );
+        assert!(h.responses[0].contains("1111/2222/3333"));
+        assert!(h.responses[1].contains("aaaa/bbbb/cccc"));
+    }
+    #[test]
+    fn sync_timeout_flush_keeps_scroll_accounting() {
+        let mut term = test_term();
+        let mut wrap = false;
+        let mut region = None;
+        let mut parser: ansi::Processor = Default::default();
+        let mut h = CountingHandler {
+            term: &mut term,
+            palette: None,
+            cell: (8, 16),
+            responses: Vec::new(),
+            response_listener: None,
+            scrolled: 0,
+            wrap_pending: &mut wrap,
+            scroll_region: &mut region,
+        };
+        parser.advance(&mut h, b"\x1b[?2026h");
+        for _ in 0..20 {
+            parser.advance(&mut h, b"line\r\n");
+        }
+        assert_eq!(h.scrolled, 0);
+        parser.stop_sync(&mut h);
+        use alacritty_terminal::grid::Dimensions;
+        assert!(h.scrolled > 0);
+        assert_eq!(h.scrolled as usize, h.term.history_size());
+    }
+    #[test]
     fn text_passthrough() {
         let mut sc = StreamScanner::default();
         let evs = sc.scan(b"hello");
@@ -2121,6 +2318,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], term: &mut Term<VoidListener>, cum: &mut i32| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,
@@ -2239,6 +2440,10 @@ mod tests {
         let mut wrap_pending = false;
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut h = crate::ptyloop::CountingHandler {
+            palette: None,
+            cell: (8, 16),
+            responses: Vec::new(),
+            response_listener: None,
             term: &mut term,
             scrolled: 0,
             wrap_pending: &mut wrap_pending,
@@ -2288,6 +2493,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], term: &mut Term<VoidListener>, cum: &mut i32| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,
@@ -2349,6 +2558,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], term: &mut Term<VoidListener>, cum: &mut i32| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,
@@ -2417,6 +2630,10 @@ mod tests {
         bytes: &[u8],
     ) -> i32 {
         let mut h = CountingHandler {
+            palette: None,
+            cell: (8, 16),
+            responses: Vec::new(),
+            response_listener: None,
             term,
             scrolled: 0,
             wrap_pending,
@@ -2666,6 +2883,10 @@ mod tests {
             let mut cum: i32 = 0;
             for c in chunks {
                 let mut h = CountingHandler {
+                    palette: None,
+                    cell: (8, 16),
+                    responses: Vec::new(),
+                    response_listener: None,
                     term: &mut term,
                     scrolled: 0,
                     wrap_pending: &mut wrap_pending,
@@ -2740,6 +2961,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], state: &mut SessionState<VoidListener>| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term: &mut state.term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,
@@ -2834,6 +3059,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], state: &mut SessionState<VoidListener>| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term: &mut state.term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,
@@ -2891,6 +3120,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], state: &mut SessionState<VoidListener>| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term: &mut state.term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,
@@ -3273,6 +3506,10 @@ mod tests {
         let mut scroll_region: Option<(i32, i32, i32)> = None;
         let mut feed = |bytes: &[u8], state: &mut SessionState<VoidListener>| {
             let mut h = CountingHandler {
+                palette: None,
+                cell: (8, 16),
+                responses: Vec::new(),
+                response_listener: None,
                 term: &mut state.term,
                 scrolled: 0,
                 wrap_pending: &mut wrap_pending,

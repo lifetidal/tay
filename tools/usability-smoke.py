@@ -29,12 +29,12 @@ def write_script(text):
     temporary.replace(cfg)
 
 
-def write_config(size):
+def write_config(size, compact=True):
     write_script(f'''-- Keep handwritten logic and comments.
 local size = {size}
 return {{
   shell = "/bin/sh", start_hidden = false, hide_on_focus_out = false,
-  animation_ms = 0,
+  animation_ms = 0, tab_bar = {{ compact = {str(compact).lower()} }},
   font = {{ family = "monospace", size = size }},
   colors = {{ background = "#172a22", foreground = "#e8dbc1" }},
 }}
@@ -85,6 +85,12 @@ try:
     before = log_text().count("网格调整")
     run("restore")
     wait_for(lambda: log_text().count("网格调整") > before, "restore resize")
+    before = log_text().count("网格调整")
+    write_config(12, compact=False)
+    wait_for(lambda: log_text().count("网格调整") > before, "expanded tab bar hot reload")
+    before = log_text().count("网格调整")
+    write_config(12, compact=True)
+    wait_for(lambda: log_text().count("网格调整") > before, "compact tab bar hot reload")
     for command in ["new-tab", "new-tab", "next-tab", "close-tab", "next-tab", "settings"]:
         run(command)
         time.sleep(0.1)

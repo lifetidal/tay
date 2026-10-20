@@ -283,7 +283,74 @@ fn default_keys() -> Vec<KeyBinding> {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
+pub struct TabBar {
+    /// 显示操作栏;false = 极简模式(终端占满全高;设置面板
+    /// 展开时临时显示)。快捷键与全局热键不受影响。
+    pub visible: bool,
+    pub compact: bool,
+    pub tab_width: u32,
+    pub background: Rgb,
+    pub active_background: Rgb,
+    pub active_foreground: Rgb,
+    pub inactive_foreground: Rgb,
+    pub hover_background: Rgb,
+    pub accent: Rgb,
+    pub icon_foreground: Rgb,
+    pub icon_hover_foreground: Rgb,
+    pub danger_foreground: Rgb,
+    pub clock_background: Rgb,
+    pub clock_foreground: Rgb,
+}
+impl Default for TabBar {
+    /// 默认 = 默认配色的推导值(与「未显式配置」语义一致:
+    /// `Config::default()` 与 `from_lua("return {}")` 的栏完全
+    /// 相同,换主题自动协调)。
+    fn default() -> Self {
+        Self::from_colors(&Colors::default())
+    }
+}
+
+impl TabBar {
+    /// 从终端配色推导(未在 Lua 中显式配置 tab_bar 颜色时使用):
+    /// 栏与主题自动协调 —— **栏底比终端更暗**(VS Code/kitty
+    /// 风格,视觉上"嵌"进终端)、活动标签 = 光标色淡染、
+    /// 强调色 = 光标色。显式配置的字段覆盖推导值。
+    pub fn from_colors(colors: &Colors) -> Self {
+        let bg = colors.background;
+        let bar = blend(bg, Rgb::new(0, 0, 0), 0.05);
+        Self {
+            visible: true,
+            compact: true,
+            tab_width: 24,
+            background: bar,
+            active_background: blend(colors.cursor, bar, 0.68),
+            active_foreground: colors.foreground,
+            inactive_foreground: blend(colors.foreground, bar, 0.32),
+            hover_background: blend(bar, Rgb::new(0xff, 0xff, 0xff), 0.07),
+            accent: colors.cursor,
+            icon_foreground: blend(colors.foreground, bar, 0.22),
+            icon_hover_foreground: colors.cursor,
+            danger_foreground: colors.ansi[9],
+            clock_background: colors.cursor,
+            clock_foreground: bar,
+        }
+    }
+}
+
+/// 通道线性插值(0..1,钳制)。
+fn blend(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let lerp = |x: u8, y: u8| {
+        ((x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0)) as u8
+    };
+    Rgb::new(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Config {
+    pub tab_bar: TabBar,
     pub font: Font,
     pub colors: Colors,
     pub keys: Vec<KeyBinding>,
@@ -311,6 +378,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            tab_bar: TabBar::default(),
             font: Font::default(),
             colors: Colors::default(),
             keys: default_keys(),
@@ -563,6 +631,56 @@ impl Config {
                 cfg.colors.ansi[i] = parse_hex(color).ok_or("ansi 颜色需要 #RRGGBB")?;
             }
         }
+        let mut tab_bar_given = false;
+        if let Some(tb) = get_table(&t, "tab_bar")? {
+            tab_bar_given = true;
+            if let Some(v) = get_bool(&tb, "visible")? {
+                cfg.tab_bar.visible = v;
+            }
+            if let Some(v) = get_bool(&tb, "compact")? {
+                cfg.tab_bar.compact = v;
+            }
+            if let Some(v) = get_uint(&tb, "tab_width")? {
+                cfg.tab_bar.tab_width = v;
+            }
+            if let Some(v) = get_color(&tb, "background")? {
+                cfg.tab_bar.background = v;
+            }
+            if let Some(v) = get_color(&tb, "active_background")? {
+                cfg.tab_bar.active_background = v;
+            }
+            if let Some(v) = get_color(&tb, "active_foreground")? {
+                cfg.tab_bar.active_foreground = v;
+            }
+            if let Some(v) = get_color(&tb, "inactive_foreground")? {
+                cfg.tab_bar.inactive_foreground = v;
+            }
+            if let Some(v) = get_color(&tb, "hover_background")? {
+                cfg.tab_bar.hover_background = v;
+            }
+            if let Some(v) = get_color(&tb, "clock_background")? {
+                cfg.tab_bar.clock_background = v;
+            }
+            if let Some(v) = get_color(&tb, "clock_foreground")? {
+                cfg.tab_bar.clock_foreground = v;
+            }
+            if let Some(v) = get_color(&tb, "icon_foreground")? {
+                cfg.tab_bar.icon_foreground = v;
+            }
+            if let Some(v) = get_color(&tb, "icon_hover_foreground")? {
+                cfg.tab_bar.icon_hover_foreground = v;
+            }
+            if let Some(v) = get_color(&tb, "danger_foreground")? {
+                cfg.tab_bar.danger_foreground = v;
+            }
+            if let Some(v) = get_color(&tb, "accent")? {
+                cfg.tab_bar.accent = v;
+            }
+        }
+        if !tab_bar_given {
+            // 未显式配置:栏颜色从主题推导,换主题自动协调。
+            cfg.tab_bar = TabBar::from_colors(&cfg.colors);
+        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -572,6 +690,9 @@ impl Config {
     /// 明确报错好过静默错乱)。
     fn validate(&self) -> Result<(), String> {
         let mut errs: Vec<String> = Vec::new();
+        if !(12..=40).contains(&self.tab_bar.tab_width) {
+            errs.push("tab_bar.tab_width 需要 12–40".into());
+        }
         let mut check = |ok: bool, msg: &str| {
             if !ok {
                 errs.push(msg.to_string());
@@ -716,6 +837,7 @@ impl Config {
 -- 界面外观调整也写入本文件；原始脚本、注释和逻辑保留。
 
 return {{
+  tab_bar = {{visible={visible}, compact={compact}, tab_width={tw}, background={tb_background:?}, active_background={tb_active_background:?}, active_foreground={tb_active_foreground:?}, inactive_foreground={tb_inactive_foreground:?}, hover_background={tb_hover_background:?}, accent={tb_accent:?}, icon_foreground={tb_icon_foreground:?}, icon_hover_foreground={tb_icon_hover_foreground:?}, danger_foreground={tb_danger_foreground:?}, clock_background={tb_clock_background:?}, clock_foreground={tb_clock_foreground:?}}},
   theme = {theme:?},
   global_shortcut = {shortcut:?},
   disable_default_key_bindings = {disable},
@@ -751,6 +873,71 @@ return {{
   }},
 }}
 "#,
+            visible = self.tab_bar.visible,
+            compact = self.tab_bar.compact,
+            tw = self.tab_bar.tab_width,
+            tb_background = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.background.0, self.tab_bar.background.1, self.tab_bar.background.2
+            ),
+            tb_active_background = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.active_background.0,
+                self.tab_bar.active_background.1,
+                self.tab_bar.active_background.2
+            ),
+            tb_active_foreground = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.active_foreground.0,
+                self.tab_bar.active_foreground.1,
+                self.tab_bar.active_foreground.2
+            ),
+            tb_inactive_foreground = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.inactive_foreground.0,
+                self.tab_bar.inactive_foreground.1,
+                self.tab_bar.inactive_foreground.2
+            ),
+            tb_hover_background = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.hover_background.0,
+                self.tab_bar.hover_background.1,
+                self.tab_bar.hover_background.2
+            ),
+            tb_clock_background = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.clock_background.0,
+                self.tab_bar.clock_background.1,
+                self.tab_bar.clock_background.2
+            ),
+            tb_clock_foreground = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.clock_foreground.0,
+                self.tab_bar.clock_foreground.1,
+                self.tab_bar.clock_foreground.2
+            ),
+            tb_icon_foreground = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.icon_foreground.0,
+                self.tab_bar.icon_foreground.1,
+                self.tab_bar.icon_foreground.2
+            ),
+            tb_icon_hover_foreground = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.icon_hover_foreground.0,
+                self.tab_bar.icon_hover_foreground.1,
+                self.tab_bar.icon_hover_foreground.2
+            ),
+            tb_danger_foreground = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.danger_foreground.0,
+                self.tab_bar.danger_foreground.1,
+                self.tab_bar.danger_foreground.2
+            ),
+            tb_accent = format!(
+                "#{:02x}{:02x}{:02x}",
+                self.tab_bar.accent.0, self.tab_bar.accent.1, self.tab_bar.accent.2
+            ),
             theme = self.theme,
             shortcut = self.global_shortcut,
             disable = self.disable_default_key_bindings,
@@ -1200,12 +1387,29 @@ mod tests {
     /// Lua 模板 roundtrip:to_lua 写出的文件必然可重新加载出
     /// 同一配置(模板生成/迁移共用同一序列化)。
     #[test]
+    fn tab_bar_config_roundtrips_and_rejects_invalid_styles() {
+        let c = Config::from_lua(
+            "return {tab_bar={compact=false,tab_width=30,background='#101820',accent='#aaccff',clock_background='#e8bc65',clock_foreground='#101010',icon_foreground='#92a8ba',icon_hover_foreground='#bbe3ee',danger_foreground='#e69ba2'}}",
+        )
+        .unwrap();
+        assert!(!c.tab_bar.compact);
+        assert_eq!(c.tab_bar.tab_width, 30);
+        assert_eq!(Config::from_lua(&c.to_lua()).unwrap(), c);
+        for source in [
+            "return {tab_bar={compact=1}}",
+            "return {tab_bar={tab_width=4}}",
+            "return {tab_bar={accent='blue'}}",
+        ] {
+            assert!(Config::from_lua(source).is_err());
+        }
+    }
+    #[test]
     fn desktop_preset_and_custom_bindings_are_valid() {
         let cfg = Config::from_lua(include_str!("../../../config/desktop.lua")).unwrap();
-        assert_eq!(cfg.theme, "wezterm");
+        assert_eq!(cfg.theme, "midnight");
         assert_eq!(cfg.global_shortcut, "CTRL+grave");
         assert_eq!(cfg.keys.len(), Config::default().keys.len());
-        assert_eq!(cfg.colors.background, Rgb(31, 31, 40));
+        assert_eq!(cfg.colors.background, Rgb(11, 17, 27));
         assert!(Config::from_lua("return { keys={{key='t',mods='CTRL',action='oops'}} }").is_err());
         assert!(Config::from_lua("return { keys={{key='t',mods='CTRL',action='new-tab'},{key='T',mods='CTRL',action='hide'}} }").is_err());
         assert_eq!(Config::from_lua(&cfg.to_lua()).unwrap(), cfg);
@@ -1266,6 +1470,30 @@ mod tests {
         assert_eq!(c.indexed(232), Rgb(8, 8, 8));
         assert_eq!(c.indexed(255), Rgb(238, 238, 238));
         assert!(Config::from_lua("return { theme='unknown' }").is_err());
+    }
+
+    /// 未显式配置 tab_bar 颜色时从主题推导(换主题自动协调);
+    /// 显式字段覆盖推导值;visible=false 极简模式 roundtrip。
+    #[test]
+    fn tab_bar_derives_from_theme_unless_explicit() {
+        let cfg = Config::from_lua("return { theme='midnight' }").unwrap();
+        let derived = TabBar::from_colors(&cfg.colors);
+        assert_eq!(cfg.tab_bar, derived, "未配置时栏颜色 = 主题推导");
+        assert_eq!(cfg.tab_bar.background, derived.background);
+        assert_eq!(cfg.tab_bar.accent, cfg.colors.cursor, "强调色 = 光标色");
+        // 显式覆盖。
+        let cfg = Config::from_lua("return { tab_bar={background='#123456'} }").unwrap();
+        assert_eq!(cfg.tab_bar.background, Rgb(0x12, 0x34, 0x56));
+        assert_eq!(
+            cfg.tab_bar.active_background,
+            TabBar::default().active_background,
+            "未显式字段保持默认(不是主题推导——显式配置表按字段合并)"
+        );
+        // 极简模式 roundtrip。
+        let cfg = Config::from_lua("return { tab_bar={visible=false} }").unwrap();
+        assert!(!cfg.tab_bar.visible);
+        let back = Config::from_lua(&cfg.to_lua()).unwrap();
+        assert!(!back.tab_bar.visible);
     }
 
     #[test]

@@ -14,12 +14,10 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::Point;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::color::Colors as TermColors;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vi_mode::ViMotion;
-use alacritty_terminal::vte::ansi::{Color, CursorShape as ACursorShape, CursorStyle, NamedColor};
+use alacritty_terminal::vte::ansi::{CursorShape as ACursorShape, CursorStyle};
 
 use crate::ptyloop::TermSender;
 use crate::session::{
@@ -30,8 +28,24 @@ use tay_config::{Config, Rgb};
 use tay_render::wgpu;
 use tay_window::{Ctx, Event as WEvent, Handler, ImeEvent, KeyKind, MouseButtonIdx};
 
-fn dim(c: Rgb) -> Rgb {
-    Rgb::new(c.0 / 2, c.1 / 2, c.2 / 2)
+/// 栏内时钟(HH:MM,本地时区;libc localtime,无第三方依赖)。
+/// 每分钟随一次唤醒重绘更新(见 render 的 request_wake_at)。
+fn clock_text() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as libc::time_t)
+        .unwrap_or(0);
+    // SAFETY:localtime_r 写本地栈上 tm;buf 为独立缓冲。
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return String::new();
+    }
+    let mut buf = [0u8; 16];
+    let n = unsafe { libc::strftime(buf.as_mut_ptr().cast(), buf.len(), c"%H:%M".as_ptr(), &tm) };
+    if n == 0 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 /// alacritty_terminal 要求的网格尺寸(其 (usize,usize) 实现仅测试可见)。
@@ -54,43 +68,13 @@ impl Dimensions for Dims {
     }
 }
 
-/// 解析单元格颜色:term 调色板(OSC 4 可覆盖)→ 标准 16 色 / 配置色。
-fn resolve(c: Color, colors: &TermColors, cfg: &Config) -> Rgb {
-    let from_palette = |i: usize, fallback: Rgb| -> Rgb {
-        colors[i]
-            .map(|r| Rgb::new(r.r, r.g, r.b))
-            .unwrap_or(fallback)
-    };
-    match c {
-        Color::Named(n) => match n {
-            NamedColor::Foreground | NamedColor::BrightForeground => cfg.colors.foreground,
-            NamedColor::Background => cfg.colors.background,
-            NamedColor::Cursor => cfg.colors.cursor,
-            NamedColor::DimForeground => dim(cfg.colors.foreground),
-            NamedColor::DimBlack
-            | NamedColor::DimRed
-            | NamedColor::DimGreen
-            | NamedColor::DimYellow
-            | NamedColor::DimBlue
-            | NamedColor::DimMagenta
-            | NamedColor::DimCyan
-            | NamedColor::DimWhite => {
-                let base = n as usize - NamedColor::DimBlack as usize;
-                from_palette(n as usize, dim(cfg.colors.ansi[base]))
-            }
-            _ => from_palette(n as usize, cfg.colors.ansi[n as usize % 16]),
-        },
-        Color::Spec(r) => Rgb::new(r.r, r.g, r.b),
-        Color::Indexed(i) => from_palette(i as usize, cfg.colors.indexed(i)),
-    }
-}
-
 /// 终端事件转发:PTY 线程 → UI 线程。
 #[derive(Clone)]
 struct Listener {
     tx: mpsc::Sender<Event>,
     wake: Arc<UnixStream>,
     sender: Arc<Mutex<Option<TermSender>>>,
+    pending: Arc<Mutex<Vec<Event>>>,
 }
 
 impl Listener {
@@ -99,7 +83,28 @@ impl Listener {
             tx,
             wake,
             sender: Arc::new(Mutex::new(None)),
+            pending: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+}
+
+impl Listener {
+    fn respond(sender: &TermSender, event: Event) {
+        match event {
+            Event::PtyWrite(text) => {
+                let _ = sender.send_response(text.into_bytes());
+            }
+            event => {
+                let _ = sender.send(SessionCommand::ProtocolQuery(event));
+            }
+        }
+    }
+    fn attach(&self, sender: TermSender) {
+        let mut sink = self.sender.lock().unwrap();
+        for event in self.pending.lock().unwrap().drain(..) {
+            Self::respond(&sender, event);
+        }
+        *sink = Some(sender);
     }
 }
 
@@ -110,9 +115,14 @@ impl EventListener for Listener {
             // 送达 —— 丢弃协议应答会卡住应用;经 send_response
             // 绕过输入预算上限但计入在途(统一记账,会话侧按实际
             // 写入释放)。
-            Event::PtyWrite(text) => {
-                if let Some(s) = self.sender.lock().unwrap().as_ref() {
-                    let _ = s.send_response(text.into_bytes());
+            event @ (Event::PtyWrite(_)
+            | Event::ColorRequest(..)
+            | Event::TextAreaSizeRequest(_)) => {
+                let sender = self.sender.lock().unwrap();
+                if let Some(s) = sender.as_ref() {
+                    Self::respond(s, event);
+                } else {
+                    self.pending.lock().unwrap().push(event);
                 }
             }
             event => {
@@ -167,6 +177,8 @@ pub struct TayApp {
     /// 过期,绝不把新文本当旧选择复制(第八轮定点修复)。
     sel_epoch: AnchorEpoch,
     dragging: bool,
+    scrollbar_drag: Option<(f32, AnchorEpoch)>,
+    scrollbar_smoke: Option<u8>,
     scroll_px: f32,
 
     // —— M1:呼出状态(P3c:状态机拆到 visibility.rs)——
@@ -329,6 +341,8 @@ impl TayApp {
             sel: None,
             sel_epoch: AnchorEpoch::default(),
             dragging: false,
+            scrollbar_drag: None,
+            scrollbar_smoke: std::env::var_os("TAY_SCROLLBAR").map(|_| 0),
             scroll_px: 0.0,
             vis: crate::visibility::VisibilityController::new(480),
             quick: None,
@@ -402,6 +416,8 @@ impl TayApp {
 
     /// 收起。
     fn hide(&mut self, ctx: &mut Ctx<'_>) {
+        self.scrollbar_drag = None;
+        self.dragging = false;
         ctx.request_keyboard(false, false);
         match self.vis.hide(self.config.animation_ms) {
             crate::visibility::VisOutcome::None => {}
@@ -506,7 +522,7 @@ impl TayApp {
         let pad = renderer.padding();
         let cols = ((size.0 as f32 - 2.0 * pad) / cw).floor().max(2.0) as usize;
         let rows = (((size.1 as f32 - 2.0 * pad) / ch).floor() as usize)
-            .saturating_sub(crate::chrome::ROWS)
+            .saturating_sub(crate::chrome::rows(&self.config, self.settings_open))
             .max(1);
         log::info!("网格 {cols}×{rows} @ {cw:.1}×{ch:.1}px 单元格");
         self.dims = Some((cols, rows));
@@ -527,7 +543,7 @@ impl TayApp {
             }),
             ..Default::default()
         };
-        let state = SessionState::new(Term::new(
+        let mut state = SessionState::new(Term::new(
             term_config,
             &Dims { cols, rows },
             listener.clone(),
@@ -545,6 +561,7 @@ impl TayApp {
             cell_width: cw.round() as u16,
             cell_height: ch.round() as u16,
         };
+        state.palette = self.config.colors.clone();
         let opts = PtyOptions {
             shell: Some(Shell::new(self.config.shell_command(), vec![])),
             ..Default::default()
@@ -554,9 +571,15 @@ impl TayApp {
         // 会话线程,UI 只留句柄。
         let slot: Arc<Mutex<Option<SessionUpdate>>> = Arc::new(Mutex::new(None));
         let (reply_tx, reply_rx) = mpsc::channel();
-        let sender = crate::ptyloop::spawn(state, listener.clone(), pty, slot.clone())
-            .map_err(|e| format!("PTY 事件循环创建失败: {e}"))?;
-        *listener.sender.lock().unwrap() = Some(sender.clone());
+        let sender = crate::ptyloop::spawn(
+            state,
+            listener.clone(),
+            pty,
+            slot.clone(),
+            (ws.cell_width as u32, ws.cell_height as u32),
+        )
+        .map_err(|e| format!("PTY 事件循环创建失败: {e}"))?;
+        listener.attach(sender.clone());
         Ok(TabSession {
             sender,
             slot,
@@ -591,6 +614,7 @@ impl TayApp {
         self.quick = None;
         self.preedit = None;
         self.dragging = false;
+        self.scrollbar_drag = None;
         self.vi_search_query = None;
         self.scroll_px = 0.0;
         self.status_msg = None;
@@ -712,12 +736,24 @@ impl TayApp {
             self.active_tab,
             self.settings_open,
             &self.config,
+            &clock_text(),
         )
     }
 
     fn save_appearance(&mut self, ctx: &mut Ctx<'_>, previous: &Config) {
         if let Err(e) = self.config.save_appearance_delta(previous) {
             self.status(format!("设置已应用但保存失败: {e}"), ctx);
+        }
+    }
+
+    fn update_session_colors(&self) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(SessionCommand::SetColors(self.config.colors.clone()));
+        }
+        for tab in self.tabs.iter().flatten() {
+            let _ = tab
+                .sender
+                .send(SessionCommand::SetColors(self.config.colors.clone()));
         }
     }
 
@@ -728,6 +764,7 @@ impl TayApp {
             let (w, h) = r.surface_size();
             self.relayout(ctx, w, h, true);
         }
+        self.update_session_colors();
         self.save_appearance(ctx, previous);
         ctx.request_redraw();
     }
@@ -744,8 +781,11 @@ impl TayApp {
                 self.request_layer_height(ctx);
             }
             Action::CloseWindow => ctx.exit(),
+            Action::Clock => { /* 非交互:点击无操作 */ }
             Action::Hotkeys => {
                 self.settings_open = false;
+                let (w, h) = ctx.surface_size();
+                self.relayout(ctx, w, h, true);
                 self.status(
                     format!("{} | Desktop command: tay toggle", self.hotkey_status),
                     ctx,
@@ -762,6 +802,8 @@ impl TayApp {
             Action::Settings => {
                 self.settings_open = !self.settings_open;
                 self.editing = None;
+                let (w, h) = ctx.surface_size();
+                self.relayout(ctx, w, h, true);
             }
             Action::Smaller | Action::Larger => {
                 let previous = self.config.clone();
@@ -886,7 +928,7 @@ impl TayApp {
             let pad = r.padding();
             ctx.set_ime_cursor_area(
                 col as f32 * cw + pad,
-                (row + crate::chrome::ROWS) as f32 * ch + pad,
+                (row + crate::chrome::rows(&self.config, self.settings_open)) as f32 * ch + pad,
                 cw,
                 ch,
             );
@@ -910,9 +952,10 @@ impl TayApp {
         let pad = r.padding();
         let cols = ((width as f32 - 2.0 * pad) / cw).floor().max(2.0) as usize;
         let rows = (((height as f32 - 2.0 * pad) / ch).floor() as usize)
-            .saturating_sub(crate::chrome::ROWS)
+            .saturating_sub(crate::chrome::rows(&self.config, self.settings_open))
             .max(1);
         if Some((cols, rows)) != self.dims {
+            self.scrollbar_drag = None;
             log::info!("网格调整 {cols}×{rows}");
             self.dims = Some((cols, rows));
             // 行号重排:显示坐标选区/QuickSelect 同属旧布局
@@ -966,7 +1009,8 @@ impl TayApp {
         let (cols, rows) = self.dims?;
         let pad = self.renderer.as_ref()?.padding() as f64;
         let c = ((x - pad) / cw as f64).floor();
-        let r = ((y - pad) / ch as f64).floor() - crate::chrome::ROWS as f64;
+        let r = ((y - pad) / ch as f64).floor()
+            - crate::chrome::rows(&self.config, self.settings_open) as f64;
         if c < 0.0 || r < 0.0 || c as usize >= cols || r as usize >= rows {
             None
         } else {
@@ -1059,16 +1103,8 @@ impl TayApp {
                 let base = gi as usize * cols;
                 for col in 0..cols {
                     let sc = &s.cells[base + col];
-                    cells[row * cols + col] = tay_render::Cell {
-                        c: sc.c,
-                        fg: resolve(sc.fg, &s.colors, &self.config),
-                        bg: resolve(sc.bg, &s.colors, &self.config),
-                        bold: sc.flags.contains(Flags::BOLD),
-                        italic: sc.flags.contains(Flags::ITALIC),
-                        underline: sc.flags.contains(Flags::UNDERLINE),
-                        wide_spacer: sc.flags.contains(Flags::WIDE_CHAR_SPACER),
-                        zerowidth: sc.zerowidth.clone(),
-                    };
+                    cells[row * cols + col] =
+                        crate::terminal::render_cell(sc, &s.colors, &self.config.colors);
                 }
             }
         }
@@ -1249,6 +1285,51 @@ impl TayApp {
             overlays,
             images,
             window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            scrollbar: self.build_scrollbar(rows),
+        }
+    }
+
+    /// 滚动条指示器(终端区,不含操作栏):视口位置与占比。
+    /// 无滚动历史(total ≤ rows)时返回 None。
+    fn build_scrollbar(&self, term_rows: usize) -> Option<tay_render::Scrollbar> {
+        let snap = self.snapshot.as_ref()?;
+        if snap.mode.contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let total = snap.total_lines.max(term_rows);
+        let chrome_rows = crate::chrome::rows(&self.config, self.settings_open) as f32;
+        if total <= term_rows {
+            return None;
+        }
+        let span = (total - term_rows) as f32;
+        Some(tay_render::Scrollbar {
+            top: chrome_rows,
+            extent: term_rows as f32,
+            position: (snap.display_offset as f32 / span).min(1.0),
+            size: (term_rows as f32 / total as f32).min(1.0),
+        })
+    }
+
+    fn scrollbar_geometry(&self) -> Option<tay_render::ScrollbarGeometry> {
+        let renderer = self.renderer.as_ref()?;
+        let (_, rows) = self.dims?;
+        self.build_scrollbar(rows)?.geometry(
+            renderer.surface_size().0 as f32,
+            renderer.cell_size().1,
+            renderer.padding(),
+        )
+    }
+    fn drag_scrollbar(&self, y: f32, grab: f32, epoch: AnchorEpoch) {
+        if let (Some(geometry), Some(snapshot), Some(sender), Some((_, rows))) = (
+            self.scrollbar_geometry(),
+            &self.snapshot,
+            &self.sender,
+            self.dims,
+        ) {
+            let offset = geometry.offset(y, grab, snapshot.total_lines.saturating_sub(rows));
+            let _ = sender.send(SessionCommand::ScrollToOffset { offset, epoch });
         }
     }
 
@@ -1643,6 +1724,68 @@ impl TayApp {
             ctx.force_rebind();
         }
 
+        // Isolated smoke test dispatches the same pointer events as Wayland.
+        if let (Some(stage), Some(g), Some(snapshot), Some((_, rows))) = (
+            self.scrollbar_smoke,
+            self.scrollbar_geometry(),
+            self.snapshot.clone(),
+            self.dims,
+        ) {
+            let history = snapshot.total_lines.saturating_sub(rows);
+            if stage == 0 && history > 200 {
+                let x = (g.x + 6.0) as f64;
+                let y = (g.thumb_top + g.thumb_height / 2.0) as f64;
+                self.on_event(
+                    ctx,
+                    WEvent::PointerButton {
+                        button: MouseButtonIdx::Left,
+                        pressed: true,
+                        x,
+                        y,
+                    },
+                );
+                self.on_event(ctx, WEvent::PointerMoved { x: 0.0, y: 0.0 });
+                self.on_event(
+                    ctx,
+                    WEvent::PointerButton {
+                        button: MouseButtonIdx::Left,
+                        pressed: false,
+                        x: 0.0,
+                        y: 0.0,
+                    },
+                );
+                assert!(self.scrollbar_drag.is_none());
+                assert!(!self.dragging);
+                self.scrollbar_smoke = Some(1);
+            } else if stage == 1 && snapshot.display_offset >= history.saturating_sub(3) {
+                log::info!("TAY_SCROLLBAR: drag to oldest and release over header passed");
+                let x = (g.x + 6.0) as f64;
+                let y = (g.top + g.height - 1.0) as f64;
+                self.on_event(
+                    ctx,
+                    WEvent::PointerButton {
+                        button: MouseButtonIdx::Left,
+                        pressed: true,
+                        x,
+                        y,
+                    },
+                );
+                self.on_event(
+                    ctx,
+                    WEvent::PointerButton {
+                        button: MouseButtonIdx::Left,
+                        pressed: false,
+                        x,
+                        y,
+                    },
+                );
+                self.scrollbar_smoke = Some(2);
+            } else if stage == 2 && snapshot.display_offset == 0 {
+                log::info!("TAY_SCROLLBAR: track click to latest passed");
+                self.scrollbar_smoke = Some(3);
+            }
+        }
+
         // TAY_SCROLL:第 16 帧注入滚轮滚动(ScrollDisplay 命令
         // 链路实机验证)。
         if self.scroll_at_start && self.frames == 16 {
@@ -1765,6 +1908,9 @@ impl TayApp {
         let message = if let Some((field, value)) = &self.editing {
             format!("Edit {field:?}: {value}_  Enter=save  Esc=cancel  Ctrl+A=replace")
         } else if let Some(action) = self.chrome_hover.filter(|a| {
+            if self.settings_open {
+                return false;
+            }
             matches!(
                 a,
                 crate::chrome::Action::Hide
@@ -1788,14 +1934,27 @@ impl TayApp {
                 self.config.binding_hint("settings")
             )
         };
-        crate::chrome::decorate(
-            &mut grid,
-            &items,
-            &message,
-            &self.config,
-            self.chrome_hover,
-            self.maximized,
-        );
+        // 极简模式(tab_bar.visible = false)跳过操作栏:终端占满
+        // 全高;设置面板展开时临时恢复(rows > 0)。
+        let chrome_rows = crate::chrome::rows(&self.config, self.settings_open);
+        if chrome_rows > 0 {
+            // 栏内时钟:唤醒下一次分钟边界(+1s 余量)重绘;其余
+            // 时间随既有重绘更新,空闲不额外唤醒(0% CPU 目标)。
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let next_min = Duration::from_secs(61 - since.as_secs() % 60);
+            ctx.request_wake_at(Instant::now() + next_min);
+            crate::chrome::decorate(
+                &mut grid,
+                &items,
+                &message,
+                &self.config,
+                self.chrome_hover,
+                self.maximized,
+                self.settings_open,
+            );
+        }
         let alpha = self.config.opacity.clamp(0.0, 1.0);
         {
             let renderer = self.renderer.as_mut().expect("renderer 未初始化");
@@ -1874,6 +2033,49 @@ impl Drop for TayApp {
 
 impl Handler for TayApp {
     fn on_event(&mut self, ctx: &mut Ctx<'_>, event: WEvent) {
+        match &event {
+            WEvent::PointerMoved { y, .. } if self.scrollbar_drag.is_some() => {
+                let (grab, epoch) = self.scrollbar_drag.unwrap();
+                self.drag_scrollbar(*y as f32, grab, epoch);
+                return;
+            }
+            WEvent::PointerButton {
+                button: MouseButtonIdx::Left,
+                pressed: false,
+                ..
+            } if self.scrollbar_drag.is_some() => {
+                self.scrollbar_drag = None;
+                self.dragging = false;
+                ctx.set_pointer_over_control(false);
+                return;
+            }
+            WEvent::PointerButton {
+                button: MouseButtonIdx::Left,
+                pressed: true,
+                x,
+                y,
+            } => {
+                if let Some(geometry) = self
+                    .scrollbar_geometry()
+                    .filter(|g| g.contains(*x as f32, *y as f32))
+                    && let Some(snapshot) = &self.snapshot
+                {
+                    let grab = if (*y as f32) >= geometry.thumb_top
+                        && (*y as f32) < geometry.thumb_top + geometry.thumb_height
+                    {
+                        *y as f32 - geometry.thumb_top
+                    } else {
+                        geometry.thumb_height / 2.0
+                    };
+                    let epoch = snapshot.meta.invalidate_epoch;
+                    self.scrollbar_drag = Some((grab, epoch));
+                    self.dragging = false;
+                    self.drag_scrollbar(*y as f32, grab, epoch);
+                    return;
+                }
+            }
+            _ => {}
+        }
         if let WEvent::PointerMoved { x, y } = &event
             && let Some(r) = &self.renderer
         {
@@ -1881,7 +2083,10 @@ impl Handler for TayApp {
             let pad = r.padding() as f64;
             let col = ((*x - pad) / cw as f64).floor();
             let row = ((*y - pad) / ch as f64).floor();
-            let hovered = if col >= 0.0 && row >= 0.0 && row < crate::chrome::ROWS as f64 {
+            let hovered = if col >= 0.0
+                && row >= 0.0
+                && row < crate::chrome::rows(&self.config, self.settings_open) as f64
+            {
                 crate::chrome::hit(
                     &self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80)),
                     row as usize,
@@ -1890,7 +2095,12 @@ impl Handler for TayApp {
             } else {
                 None
             };
-            ctx.set_pointer_over_control(hovered.is_some());
+            ctx.set_pointer_over_control(
+                hovered.is_some_and(|a| a != crate::chrome::Action::Clock)
+                    || self
+                        .scrollbar_geometry()
+                        .is_some_and(|g| g.contains(*x as f32, *y as f32)),
+            );
             if hovered != self.chrome_hover {
                 self.chrome_hover = hovered;
                 ctx.request_redraw();
@@ -1908,8 +2118,8 @@ impl Handler for TayApp {
             let pad = r.padding() as f64;
             let row = ((*y - pad) / ch as f64).floor();
             let col = ((*x - pad) / cw as f64).floor();
-            if row >= 0.0 && row < (crate::chrome::ROWS as f64) {
-                if *pressed && col >= 0.0 && !(row as usize == 2 && self.editing.is_some()) {
+            if row >= 0.0 && row < (crate::chrome::rows(&self.config, self.settings_open) as f64) {
+                if *pressed && col >= 0.0 && !(row as usize == 3 && self.editing.is_some()) {
                     let items = self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80));
                     if let Some(a) = crate::chrome::hit(&items, row as usize, col as usize) {
                         self.chrome_action(a, ctx);
@@ -2441,7 +2651,7 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_tab,ctx),
                         crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
-                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;let (w,h)=ctx.surface_size();self.relayout(ctx,w,h,true);self.show(ctx);ctx.request_redraw();},
                         crate::ipc::IpcCommand::Pin => {
                             let pinned = self.vis.toggle_pin();
                             log::info!(
@@ -2518,13 +2728,15 @@ impl Handler for TayApp {
                                     let height_changed =
                                         fresh.height_percent != self.config.height_percent;
                                     let padding_changed = fresh.padding != self.config.padding;
+                                    let chrome_changed=fresh.tab_bar.compact!=self.config.tab_bar.compact || fresh.tab_bar.visible!=self.config.tab_bar.visible;
                                     self.config = *fresh;
+                                    self.update_session_colors();
 
                                     // 即时生效字段。
                                     if let Some(r) = &mut self.renderer {
                                         r.update_colors(&self.config);
                                         if font_changed { r.update_font(&self.config,ctx.scale_factor()); }
-                                        if padding_changed || font_changed {
+                                        if padding_changed || font_changed || chrome_changed {
                                             // pad 变 → 网格列数重算(force)。
                                             r.update_padding(self.config.padding * ctx.scale_factor() as f32);
                                             let (w, h) = r.surface_size();

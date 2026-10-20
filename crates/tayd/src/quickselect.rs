@@ -19,24 +19,22 @@ pub struct Match {
 
 /// 从可见网格提取匹配项并分配标签。
 pub fn build(grid: &Grid) -> Vec<Match> {
-    // 逐行文本 + 字节序号 → 字符序号映射:regex 匹配偏移是字节序号,
-    // 而渲染器的 overlay 按字符序号替换行内字符(row_chars[pos] = ch),
-    // 多字节字符(CJK)前的匹配项若按字节序号当字符用,标签会替换错字。
-    // 宽字符不需要换算显示列:cosmic-text 整行排版,宽字符自然占 2 列,
-    // 替换行内字符后标签自动落在正确的像素位置。
+    // regex 使用字节偏移；overlay 使用终端显示列，跳过宽字符占位格。
     let row_texts: Vec<(String, Vec<usize>)> = (0..grid.rows)
         .map(|r| {
             let mut text = String::new();
             let mut col_of_byte: Vec<usize> = Vec::new();
-            let mut char_idx = 0usize;
             for i in 0..grid.cols {
                 let cell = &grid.cells[r * grid.cols + i];
                 if cell.wide_spacer {
                     continue; // 宽字符占位格:本身无字符。
                 }
-                col_of_byte.extend(std::iter::repeat_n(char_idx, cell.c.len_utf8()));
-                char_idx += 1;
+                col_of_byte.extend(std::iter::repeat_n(i, cell.c.len_utf8()));
                 text.push(cell.c);
+                if let Some(extra) = &cell.zerowidth {
+                    col_of_byte.extend(std::iter::repeat_n(i, extra.len()));
+                    text.push_str(extra);
+                }
             }
             (text, col_of_byte)
         })
@@ -71,8 +69,7 @@ pub fn build(grid: &Grid) -> Vec<Match> {
         for (start, len, is_url) in kept {
             matches.push(Match {
                 row,
-                // 字节序号 → 字符序号(渲染器 overlay 语义;宽字符由
-                // cosmic-text 排版,像素位置自动正确)。
+                // 字节偏移映射回包含宽字符占位格的终端列。
                 col: col_of_char[start],
                 text: text[start..start + len].to_string(),
                 is_url,
@@ -148,9 +145,20 @@ mod tests {
             overlays: Vec::new(),
             images: Vec::new(),
             window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            scrollbar: None,
         }
     }
 
+    #[test]
+    fn combining_characters_are_preserved_in_paths() {
+        let mut grid = grid_with("./cafe.txt https://a.b");
+        grid.cells[5].zerowidth = Some(std::sync::Arc::from("\u{301}"));
+        let matches = build(&grid);
+        assert_eq!(matches[0].text, "./cafe\u{301}.txt");
+        assert_eq!(matches[1].col, 11);
+    }
     #[test]
     fn finds_url_and_sha_and_path() {
         let g = grid_with("see https://example.com/x and deadbeef123 and /etc/passwd ok");
@@ -207,11 +215,14 @@ mod tests {
             overlays: Vec::new(),
             images: Vec::new(),
             window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            scrollbar: None,
         };
         let m = build(&g);
         assert_eq!(m.len(), 1);
-        // 'h' 是第 3 个字符("你"+空格+h):字符序号 2,不是字节序号 4。
-        assert_eq!(m[0].col, 2);
+        // A wide character occupies two terminal columns: h starts at column 3.
+        assert_eq!(m[0].col, 3);
         assert_eq!(m[0].text, "https://a.b");
     }
 }

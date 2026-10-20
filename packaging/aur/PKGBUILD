@@ -30,6 +30,7 @@ package() {
     install -Dm755 target/release/tayd "$pkgdir/usr/bin/tayd"
     install -Dm755 target/release/tay "$pkgdir/usr/bin/tay"
     install -Dm644 packaging/tay.desktop "$pkgdir/usr/share/applications/tay.desktop"
+    install -Dm644 packaging/icons/tay.png "$pkgdir/usr/share/pixmaps/tay.png"
     install -Dm644 packaging/tayd.service "$pkgdir/usr/lib/systemd/user/tayd.service"
     install -Dm644 DESIGN.md "$pkgdir/usr/share/doc/tay/DESIGN.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/tay/LICENSE"

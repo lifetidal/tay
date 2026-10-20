@@ -1,15 +1,38 @@
 //! 可见操作栏。布局与点击共享同一组范围，避免画面与命中不一致。
 //!
-//! 美化原则(2026-10-19):颜色全部由终端配色(config.lua 的
-//! colors 表)推导 —— 底色 = 背景轻微提亮,文字 = 前景,选中标签 =
-//! 光标色混底色 + 加粗 + 下划线,关闭 × = 暖红,次要行(控件/设置)
-//! = 前景 45% 混底色。列宽一律按**字符数**计(× 等多字节字符
-//! 不破坏布局与命中)。
+//! 标签条支持 Lua 配色、单行布局与按显示列截断的 Unicode 标题。
 use tay_config::{Config, Rgb};
 use tay_render::{Cell, Grid};
 use unicode_width::UnicodeWidthChar;
 
-pub const ROWS: usize = 3;
+pub const ROWS: usize = 4;
+pub fn rows(config: &Config, settings: bool) -> usize {
+    if settings {
+        // 设置面板展开时临时显示完整栏(即使平时隐藏)。
+        ROWS
+    } else if !config.tab_bar.visible {
+        // 极简模式:操作栏隐藏,终端占满全高(kitty 风格;
+        // 标签/快捷键仍可用)。
+        0
+    } else if config.tab_bar.compact {
+        2
+    } else {
+        ROWS
+    }
+}
+fn truncate(text: &str, width: usize) -> String {
+    let mut used = 0;
+    text.chars()
+        .filter(|c| !c.is_control())
+        .take_while(|c| {
+            used += c.width().unwrap_or(0);
+            used <= width
+        })
+        .collect()
+}
+fn width(text: &str) -> usize {
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
@@ -30,6 +53,8 @@ pub enum Action {
     Maximize,
     CloseWindow,
     Edit(Field),
+    /// 时钟(右对齐,非交互;点击无操作)。
+    Clock,
 }
 #[derive(Clone)]
 pub struct Item {
@@ -54,25 +79,37 @@ fn blend(a: Rgb, b: Rgb, t: f32) -> Rgb {
     Rgb::new(lerp(a.0, b.0, t), lerp(a.1, b.1, t), lerp(a.2, b.2, t))
 }
 
-/// 布局(纯函数):标签页一行 + 控件一行 + 设置一行(开启时)。
-/// 列宽按字符数计,start/end 与 text 的字符数严格一致。
+/// 标签栏占两行并垂直居中；展开设置后再显示两行控件。
+/// 标签列宽按 Unicode 显示列计算，布局与点击共享范围。
 pub fn layout(
     cols: usize,
     titles: &[String],
     active: usize,
     settings: bool,
     config: &Config,
+    clock: &str,
 ) -> Vec<Item> {
     let mut items = Vec::new();
     let mut x = 0usize;
 
     // —— 行 0:标签页(分页;活动标签始终在本页)——
     let control_width = if cols >= 40 { 4 } else { 3 };
-    let reserved = control_width * 3;
-    let page = (cols.saturating_sub(reserved) / 26).max(1);
+    let window_reserved = control_width * 3;
+    let extra = if config.tab_bar.compact && cols >= 18 {
+        6
+    } else {
+        0
+    };
+    let clock_width = if !clock.is_empty() && cols >= window_reserved + extra + 14 {
+        width(clock) + 2
+    } else {
+        0
+    };
+    let reserved = window_reserved + extra + clock_width;
+    let page = (cols.saturating_sub(reserved) / config.tab_bar.tab_width as usize).max(1);
     let first = (active / page) * page;
     for (i, title) in titles.iter().enumerate().skip(first).take(page) {
-        let name: String = title.chars().filter(char::is_ascii).take(12).collect();
+        let name = truncate(title, config.tab_bar.tab_width.saturating_sub(8) as usize);
         let label = format!(
             "{}:{}",
             i + 1,
@@ -85,8 +122,11 @@ pub fn layout(
         if available == 0 {
             break;
         }
-        tab_text = tab_text.chars().take(available).collect();
-        let tab_w = tab_text.chars().count();
+        tab_text = truncate(
+            &tab_text,
+            available.min(config.tab_bar.tab_width as usize - close_w),
+        );
+        let tab_w = width(&tab_text);
         items.push(Item {
             row: 0,
             start: x,
@@ -105,13 +145,45 @@ pub fn layout(
             selected: i == active,
         });
         x += close_w;
+        x += 1;
     }
-    if cols >= reserved {
+    if extra > 0 {
+        for (n, (text, action)) in [(" + ", Action::New), ("   ", Action::Settings)]
+            .into_iter()
+            .enumerate()
+        {
+            let start = if n == 0 {
+                x.min(cols - reserved)
+            } else {
+                cols - window_reserved - clock_width - 3
+            };
+            items.push(Item {
+                row: 0,
+                start,
+                end: start + 3,
+                text: text.into(),
+                action,
+                selected: settings && action == Action::Settings,
+            });
+        }
+    }
+    if cols >= window_reserved {
+        if clock_width > 0 {
+            let start = cols - window_reserved - clock_width;
+            items.push(Item {
+                row: 0,
+                start,
+                end: start + clock_width,
+                text: format!(" {clock} "),
+                action: Action::Clock,
+                selected: false,
+            });
+        }
         for (index, action) in [Action::Hide, Action::Maximize, Action::CloseWindow]
             .into_iter()
             .enumerate()
         {
-            let start = cols - reserved + index * control_width;
+            let start = cols - window_reserved + index * control_width;
             items.push(Item {
                 row: 0,
                 start,
@@ -143,23 +215,24 @@ pub fn layout(
         ]
     };
     x = 0;
-    for (label, action) in controls {
-        let text = format!(" {label} ");
-        let w = text.chars().count();
-        if x + w > cols {
-            break;
+    if !config.tab_bar.compact || settings {
+        for (label, action) in controls {
+            let text = format!(" {label} ");
+            let w = text.chars().count();
+            if x + w > cols {
+                break;
+            }
+            items.push(Item {
+                row: 1,
+                start: x,
+                end: x + w,
+                text,
+                action,
+                selected: false,
+            });
+            x += w;
         }
-        items.push(Item {
-            row: 1,
-            start: x,
-            end: x + w,
-            text,
-            action,
-            selected: false,
-        });
-        x += w;
     }
-
     // —— 行 2:设置(开启时)——
     if settings {
         x = 0;
@@ -193,18 +266,23 @@ pub fn layout(
             x += w;
         }
     }
+    for item in &mut items {
+        if item.row > 0 {
+            item.row += 1;
+        }
+    }
     items
 }
 
 pub fn hit(items: &[Item], row: usize, col: usize) -> Option<Action> {
+    let row = if row == 1 { 0 } else { row };
     items
         .iter()
         .find(|i| i.row == row && col >= i.start && col < i.end)
         .map(|i| i.action)
 }
 
-/// 把操作栏叠加到渲染网格顶部(前 3 行),终端内容与光标/选区/
-/// 预编辑/徽章/图像随之下移。颜色由终端配色推导,见模块文档。
+/// 按实际栏高平移终端内容、光标、选区、预编辑与图像。
 pub fn decorate(
     grid: &mut Grid,
     items: &[Item],
@@ -212,24 +290,15 @@ pub fn decorate(
     config: &Config,
     hovered: Option<Action>,
     maximized: bool,
+    settings: bool,
 ) {
-    let bg = blend(config.colors.background, Rgb::new(0xff, 0xff, 0xff), 0.07);
-    let fg = config.colors.foreground;
-    let dim = blend(fg, bg, 0.15);
-    let accent = if config.theme == "wezterm" {
-        config.colors.ansi[8]
-    } else {
-        blend(config.colors.cursor, bg, 0.32)
-    };
-    let close = config.colors.ansi[1];
-    let button_bg = blend(bg, fg, 0.15);
-    let on = |color: Rgb| {
-        if color.0 as u32 * 299 + color.1 as u32 * 587 + color.2 as u32 * 114 > 150000 {
-            Rgb(18, 22, 28)
-        } else {
-            Rgb(245, 247, 250)
-        }
-    };
+    let rows = rows(config, settings);
+    grid.tab_bar_rows = if rows > 0 { 2 } else { 0 };
+    let style = &config.tab_bar;
+    let bg = style.background;
+    let fg = style.active_foreground;
+    let dim = style.inactive_foreground;
+    let close = style.danger_foreground;
     let base = Cell {
         c: ' ',
         fg: dim,
@@ -240,55 +309,102 @@ pub fn decorate(
         wide_spacer: false,
         zerowidth: None,
     };
-    let mut header = vec![base.clone(); ROWS * grid.cols];
+    let mut header = vec![base.clone(); rows * grid.cols];
     for item in items {
-        for (i, c) in item.text.chars().enumerate() {
-            if i >= item.end - item.start {
+        if item.row >= rows {
+            continue;
+        }
+        let is_tab = matches!(item.action, Action::Tab(_) | Action::Close(_));
+        let mut style_cell = base.clone();
+        style_cell.fg = if item.selected { fg } else { dim };
+        style_cell.bg = if item.selected {
+            style.active_background
+        } else {
+            if is_tab { style.hover_background } else { bg }
+        };
+        style_cell.bold = true;
+        style_cell.underline = false;
+        match item.action {
+            Action::New | Action::Settings => style_cell.fg = style.icon_hover_foreground,
+            Action::Close(_) | Action::Hide | Action::Maximize | Action::CloseWindow => {
+                style_cell.fg = style.icon_foreground
+            }
+            _ => {}
+        }
+        if item.action == Action::Clock {
+            style_cell.bg = style.clock_background;
+            style_cell.fg = style.clock_foreground;
+            style_cell.bold = true;
+        }
+        if hovered == Some(item.action) && item.action != Action::Clock {
+            if matches!(item.action, Action::Close(_) | Action::CloseWindow) {
+                style_cell.bg = blend(style_cell.bg, close, 0.22);
+                style_cell.fg = close;
+            } else if matches!(item.action, Action::Tab(_)) {
+                style_cell.bg = if item.selected {
+                    style.active_background
+                } else {
+                    style.hover_background
+                };
+                style_cell.fg = style.active_foreground;
+            } else {
+                style_cell.bg = style.hover_background;
+                style_cell.fg = style.icon_hover_foreground;
+            }
+        } else if !is_tab && item.row > 0 {
+            style_cell.fg = style.icon_foreground;
+        }
+        for col in item.start..item.end.min(grid.cols) {
+            header[item.row * grid.cols + col] = style_cell.clone();
+        }
+        let mut col = item.start;
+        for c in item.text.chars() {
+            let w = c.width().unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if col + w > item.end.min(grid.cols) {
                 break;
             }
-            let cell = &mut header[item.row * grid.cols + item.start + i];
-            cell.c = c;
-            let button = !matches!(item.action, Action::Tab(_));
-            cell.fg = fg;
-            cell.bg = if button {
-                button_bg
-            } else if config.theme == "wezterm" {
-                Rgb(49, 50, 68)
-            } else {
-                bg
-            };
-            cell.bold = button || item.selected;
-            if item.selected {
-                cell.bg = accent;
-                cell.fg = if config.theme == "wezterm" {
-                    fg
-                } else {
-                    on(accent)
-                };
-                cell.underline = true;
+            header[item.row * grid.cols + col].c = c;
+            for offset in 1..w {
+                header[item.row * grid.cols + col + offset].wide_spacer = true;
             }
-            if matches!(item.action, Action::Hide) {
-                cell.bg = blend(bg, config.colors.cursor, 0.65);
-                cell.fg = on(cell.bg);
-            }
-            if matches!(item.action, Action::Close(_) | Action::CloseWindow) {
-                cell.bg = blend(bg, close, 0.15);
-                cell.fg = close;
-            }
-            if hovered == Some(item.action) {
-                cell.bg = if matches!(item.action, Action::Close(_) | Action::CloseWindow) {
-                    close
-                } else {
-                    config.colors.cursor
-                };
-                cell.fg = on(cell.bg);
-                cell.underline = true;
-            }
+            col += w;
         }
     }
+    for item in items
+        .iter()
+        .filter(|i| i.row == 0 && (matches!(i.action, Action::Tab(_)) || i.action == Action::Clock))
+    {
+        let end = if let Action::Tab(index) = item.action {
+            items
+                .iter()
+                .find(|i| i.action == Action::Close(index))
+                .map_or(item.end, |i| i.end)
+        } else {
+            item.end
+        };
+        grid.chrome_panels.push(tay_render::ChromePanel {
+            row: 0,
+            start: item.start,
+            end,
+            background: bg,
+            corners: if matches!(item.action, Action::Tab(_)) {
+                tay_render::PanelCorners::Opposite
+            } else {
+                tay_render::PanelCorners::All
+            },
+            accent: if item.selected {
+                Some(style.accent)
+            } else {
+                None
+            },
+        });
+    }
     // 帮助/编辑消息:整行弱化显示。
-    if !message.is_empty() {
-        for c in &mut header[2 * grid.cols..] {
+    if !message.is_empty() && rows >= 4 {
+        for c in &mut header[3 * grid.cols..] {
             *c = base.clone();
         }
         let mut col = 0;
@@ -297,17 +413,27 @@ pub fn decorate(
             if col + width > grid.cols {
                 break;
             }
-            header[2 * grid.cols + col].c = c;
-            header[2 * grid.cols + col].fg = dim;
+            header[3 * grid.cols + col].c = c;
+            header[3 * grid.cols + col].fg = dim;
             for offset in 1..width {
-                header[2 * grid.cols + col + offset].wide_spacer = true;
+                header[3 * grid.cols + col + offset].wide_spacer = true;
             }
             col += width;
+        }
+    }
+    if rows >= 2 {
+        for col in 0..grid.cols {
+            let mut cell = header[col].clone();
+            cell.c = ' ';
+            cell.zerowidth = None;
+            cell.wide_spacer = false;
+            header[grid.cols + col] = cell;
         }
     }
     for item in items.iter().filter(|i| i.row == 0) {
         use tay_render::WindowIconKind;
         let kind = match item.action {
+            Action::Settings => WindowIconKind::Settings,
             Action::Hide => WindowIconKind::Minimize,
             Action::Maximize => {
                 if maximized {
@@ -328,23 +454,23 @@ pub fn decorate(
     }
     header.append(&mut grid.cells);
     grid.cells = header;
-    grid.rows += ROWS;
-    grid.cursor.1 += ROWS;
+    grid.rows += rows;
+    grid.cursor.1 += rows;
     if let Some(s) = &mut grid.selection {
-        s.start.1 += ROWS;
-        s.end.1 += ROWS;
+        s.start.1 += rows;
+        s.end.1 += rows;
     }
     if let Some(p) = &mut grid.preedit {
-        p.row += ROWS;
+        p.row += rows;
     }
     for b in &mut grid.badges {
-        b.row += ROWS;
+        b.row += rows;
     }
     for o in &mut grid.overlays {
-        o.row += ROWS;
+        o.row += rows;
     }
     for i in &mut grid.images {
-        i.row += ROWS;
+        i.row += rows;
     }
 }
 
@@ -352,9 +478,61 @@ pub fn decorate(
 mod tests {
     use super::*;
     #[test]
+    fn clock_reserves_space_without_overlapping_tabs_or_settings() {
+        let titles = vec!["中文 shell long".into(); 24];
+        for cols in 2..200 {
+            for active in [0, 5, 23] {
+                let items = layout(cols, &titles, active, false, &Config::default(), "18:42");
+                for (index, a) in items.iter().enumerate() {
+                    assert!(a.end <= cols);
+                    for b in items.iter().skip(index + 1) {
+                        if a.row == b.row {
+                            assert!(
+                                a.end <= b.start || b.end <= a.start,
+                                "cols={cols} {:?} {:?}",
+                                a.action,
+                                b.action
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn compact_header_uses_one_row_and_unicode_columns() {
+        let config = Config::default();
+        for cols in [2, 12, 18, 24, 40, 80, 160] {
+            let items = layout(cols, &["中文 shell".into()], 0, false, &config, "");
+            assert!(items.iter().all(|i| i.row == 0 && i.end <= cols));
+            for item in &items {
+                for col in item.start..item.end {
+                    assert_eq!(hit(&items, 0, col), Some(item.action));
+                    assert_eq!(
+                        hit(&items, 1, col),
+                        Some(item.action),
+                        "加高区域下半部分可点击"
+                    );
+                }
+            }
+            if cols >= 24 {
+                assert!(items.iter().any(|i| i.action == Action::New));
+                assert!(items.iter().any(|i| i.action == Action::Settings));
+            }
+            for item in items {
+                assert_eq!(width(&item.text), item.end - item.start);
+            }
+        }
+        let items = layout(100, &["中文 shell".into()], 0, false, &config, "");
+        assert!(items.iter().any(|i| i.text.contains("中文")));
+        assert_eq!(rows(&config, false), 2);
+        assert_eq!(rows(&config, true), 4);
+    }
+
+    #[test]
     fn standard_window_controls_have_separate_hit_targets() {
         for cols in [24, 80, 200] {
-            let items = layout(cols, &["shell".into()], 0, false, &Config::default());
+            let items = layout(cols, &["shell".into()], 0, false, &Config::default(), "");
             let mut previous = 0;
             for action in [Action::Hide, Action::Maximize, Action::CloseWindow] {
                 let item = items
@@ -375,7 +553,7 @@ mod tests {
         let titles = vec!["a very long title".into(); 24];
         for cols in [24, 40, 80] {
             for active in 0..24 {
-                let items = layout(cols, &titles, active, true, &Config::default());
+                let items = layout(cols, &titles, active, true, &Config::default(), "");
                 for action in [
                     Action::Tab(active),
                     Action::Close(active),
@@ -396,7 +574,7 @@ mod tests {
     fn active_tab_remains_visible_with_many_tabs() {
         let titles = vec!["shell".to_string(); 24];
         for active in 0..24 {
-            let items = layout(80, &titles, active, false, &Config::default());
+            let items = layout(80, &titles, active, false, &Config::default(), "");
             assert!(items.iter().any(|i| i.action == Action::Tab(active)));
         }
     }
@@ -433,14 +611,25 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            scrollbar: None,
         };
-        decorate(&mut grid, &[], "help", &Config::default(), None, false);
-        assert_eq!(grid.rows, 4);
-        assert_eq!(grid.cells.len(), 8);
-        assert_eq!(grid.cells[6].c, 'z');
-        assert_eq!(grid.cursor, (1, 3));
-        assert_eq!(grid.preedit.unwrap().row, 3);
-        assert_eq!(grid.selection.unwrap().start, (0, 3));
+        decorate(
+            &mut grid,
+            &[],
+            "help",
+            &Config::default(),
+            None,
+            false,
+            true,
+        );
+        assert_eq!(grid.rows, 5);
+        assert_eq!(grid.cells.len(), 10);
+        assert_eq!(grid.cells[8].c, 'z');
+        assert_eq!(grid.cursor, (1, 4));
+        assert_eq!(grid.preedit.unwrap().row, 4);
+        assert_eq!(grid.selection.unwrap().start, (0, 4));
     }
 
     #[test]
@@ -452,6 +641,7 @@ mod tests {
                 1,
                 true,
                 &Config::default(),
+                "",
             );
             for i in &items {
                 assert!(i.end <= cols, "项不越界");
@@ -464,7 +654,7 @@ mod tests {
 
     #[test]
     fn tab_close_is_separate_from_switch() {
-        let items = layout(120, &["shell".into()], 0, false, &Config::default());
+        let items = layout(120, &["shell".into()], 0, false, &Config::default(), "");
         assert!(items.iter().any(|i| i.action == Action::Close(0)));
         assert!(items.iter().any(|i| i.action == Action::New));
     }
@@ -474,7 +664,7 @@ mod tests {
     /// [Hide ×] 除外 —— 它有意撑到屏幕右缘(命中区含边缘填充)。
     #[test]
     fn wide_char_columns_match_char_count() {
-        let items = layout(40, &["a".into()], 0, false, &Config::default());
+        let items = layout(40, &["a".into()], 0, false, &Config::default(), "");
         for i in &items {
             let chars = i.text.chars().count();
             if i.action == Action::Hide {
