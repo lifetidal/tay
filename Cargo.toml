@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0"
-repository = "https://github.com/tay-term/tay"
+repository = "https://github.com/lifetidal/tay"
 
 [workspace.dependencies]
 tay-config = { path = "crates/tay-config" }
@@ -37,4 +37,6 @@ opt-level = 1
 opt-level = 2
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
+strip = true

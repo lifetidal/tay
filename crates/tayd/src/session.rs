@@ -92,6 +92,9 @@ pub struct SnapshotCell {
     pub fg: Color,
     pub bg: Color,
     pub flags: Flags,
+    /// OSC 8 超链接:快照 `hyperlinks` 表的索引(共享 URI,
+    /// 每单元只存 u32)。
+    pub hyperlink: Option<u32>,
 }
 
 /// 会话快照(架构 §3):可见区域 + 锚点版本,由会话线程在每次
@@ -120,6 +123,9 @@ pub struct SessionSnapshot {
     pub blocks: Arc<crate::blocks::CommandBlockStore>,
     /// 图像放置实例(COW 共享引用;解码像素经 Arc 共享)。
     pub images: Arc<Vec<KittyImageEntry>>,
+    /// OSC 8 超链接 URI 表(单元格经 `SnapshotCell::hyperlink` 索引;
+    /// 去重共享,整表体积 = 去重后的 URI 总量)。
+    pub hyperlinks: Vec<Arc<str>>,
 }
 
 /// 图像放置实例(锚定在网格行;解码像素经 KittyImage.rgba 共享)。
@@ -353,10 +359,20 @@ impl<U: EventListener> SessionState<U> {
         let rows = Dimensions::screen_lines(grid);
         let content = self.term.renderable_content();
         let mut cells = Vec::with_capacity(rows * cols);
+        // OSC 8:URI 去重表(单元格只存 u32 索引,不逐格复制 URL)。
+        let mut link_ids: std::collections::HashMap<Arc<str>, u32> = Default::default();
+        let mut hyperlinks: Vec<Arc<str>> = Vec::new();
         for idx in content.display_iter {
             if idx.point.column.0 >= cols {
                 continue;
             }
+            let hyperlink = idx.cell.hyperlink().map(|h| {
+                let uri: Arc<str> = h.uri().into();
+                *link_ids.entry(uri.clone()).or_insert_with(|| {
+                    hyperlinks.push(uri);
+                    (hyperlinks.len() - 1) as u32
+                })
+            });
             cells.push(SnapshotCell {
                 c: idx.cell.c,
                 zerowidth: idx
@@ -367,6 +383,7 @@ impl<U: EventListener> SessionState<U> {
                 fg: idx.cell.fg,
                 bg: idx.cell.bg,
                 flags: idx.cell.flags,
+                hyperlink,
             });
         }
         cells.resize(
@@ -377,6 +394,7 @@ impl<U: EventListener> SessionState<U> {
                 fg: Color::Named(NamedColor::Foreground),
                 bg: Color::Named(NamedColor::Background),
                 flags: Flags::empty(),
+                hyperlink: None,
             },
         );
         SessionSnapshot {
@@ -399,6 +417,7 @@ impl<U: EventListener> SessionState<U> {
             cursor_shape: content.cursor.shape,
             blocks: self.blocks.clone(),
             images: self.images.clone(),
+            hyperlinks,
         }
     }
 
@@ -584,6 +603,74 @@ mod tests {
         assert_eq!(snap.cells[4].c, '\u{f120}');
         assert_eq!(snap.cells[6].c, '\u{f02a2}');
         assert_eq!(snap.cursor.col, 7);
+    }
+
+    /// OSC 8 超链接:快照按单元携带去重后的 URI 索引,链接范围
+    /// 内连续下划线语义由渲染层决定(此处只验证数据完整性)。
+    #[test]
+    fn snapshots_carry_osc8_hyperlinks() {
+        let mut state = SessionState::new(epoch_test_term());
+        let mut parser: alacritty_terminal::vte::ansi::Processor =
+            alacritty_terminal::vte::ansi::Processor::new();
+        parser.advance(
+            &mut state.term,
+            "\x1b]8;;https://example.com\x07ab\x1b]8;;\x07cd".as_bytes(),
+        );
+        let snap = state.snapshot();
+        // "ab" 带链接,"cd" 不带(行首 "ab" 在 0、1 列)。
+        let l0 = snap.cells[0].hyperlink.expect("a 应带链接");
+        let l1 = snap.cells[1].hyperlink.expect("b 应带链接");
+        assert_eq!(l0, l1, "同一 URL 共享表项");
+        assert_eq!(snap.hyperlinks[l0 as usize].as_ref(), "https://example.com");
+        assert!(snap.cells[2].hyperlink.is_none());
+        assert!(snap.cells[3].hyperlink.is_none());
+        // 空链接(OSC 8 关闭)不产生表项;填充分量。
+        assert!(snap.hyperlinks.len() == 1, "只应有一个去重 URI");
+        // 同一 URI 再次出现 → 复用表项。
+        parser.advance(
+            &mut state.term,
+            "\r\n\x1b]8;;https://example.com\x07x\x1b]8;;\x07".as_bytes(),
+        );
+        let snap = state.snapshot();
+        assert_eq!(snap.hyperlinks.len(), 1, "重复 URI 复用同一表项");
+        let first_row_len = state.term.grid().columns();
+        assert_eq!(
+            snap.cells[first_row_len].hyperlink,
+            Some(0),
+            "第二行 x 复用表项 0"
+        );
+    }
+
+    /// 属性测试:任意字节流(含任意切分点)喂给真实解析管线 ——
+    /// 不 panic、网格尺寸不变、快照单元数与可见区一致。
+    /// (确定性回归见 ptyloop 的 chunk_split_equivalence_full_term;
+    /// 这里是随机广覆盖。)
+    #[test]
+    fn arbitrary_bytes_never_panic_and_keep_grid_shape() {
+        use proptest::prelude::*;
+        proptest!(ProptestConfig::with_cases(512), |(bytes in proptest::collection::vec(any::<u8>(), 0..512), cut in 0usize..16usize)| {
+            let mut state = SessionState::new(epoch_test_term());
+            let cols = state.term.grid().columns();
+            let rows = state.term.grid().screen_lines();
+            let mut parser: alacritty_terminal::vte::ansi::Processor =
+                alacritty_terminal::vte::ansi::Processor::new();
+            // 在 cut 处(以及每个 16 字节边界)切分,覆盖跨 chunk 状态。
+            let mut fed = 0usize;
+            while fed < bytes.len() {
+                let take = if cut > 0 && fed < cut && fed + cut <= bytes.len() {
+                    (cut - fed).min(16)
+                } else {
+                    16
+                }
+                .min(bytes.len() - fed);
+                parser.advance(&mut state.term, &bytes[fed..fed + take]);
+                fed += take;
+            }
+            let snap = state.snapshot();
+            assert_eq!(state.term.grid().columns(), cols);
+            assert_eq!(state.term.grid().screen_lines(), rows);
+            assert_eq!(snap.cells.len(), rows * cols);
+        });
     }
 
     /// 测试用终端:40 列 × 5 行,历史上限 20。

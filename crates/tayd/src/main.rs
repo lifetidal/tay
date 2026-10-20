@@ -27,6 +27,7 @@ mod input;
 mod ipc;
 mod keys;
 mod kitty;
+mod persist;
 mod ptyloop;
 mod quickselect;
 mod session;

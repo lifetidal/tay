@@ -146,6 +146,7 @@ mod tests {
             fg: Color::Named(NamedColor::Foreground),
             bg: Color::Named(NamedColor::Background),
             flags: Flags::INVERSE,
+            hyperlink: None,
         };
         let r = render_cell(&c, &colors, &config);
         assert_eq!(r.bg, config.foreground);

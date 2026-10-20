@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::grid::Scroll;
-use alacritty_terminal::index::Point;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as PtyOptions, Shell};
 use alacritty_terminal::vi_mode::ViMotion;
@@ -47,6 +45,11 @@ fn clock_text() -> String {
     }
     String::from_utf8_lossy(&buf[..n]).into_owned()
 }
+
+/// 可视铃闪烁时长(BEL 到达后网格背景衰减混色的窗口)。
+const BELL_FLASH: Duration = Duration::from_millis(140);
+/// 可视铃最大混色强度(背景 → 闪光色的线性插值系数)。
+const BELL_FLASH_MAX: f32 = 0.30;
 
 /// alacritty_terminal 要求的网格尺寸(其 (usize,usize) 实现仅测试可见)。
 struct Dims {
@@ -142,6 +145,12 @@ struct TabSession {
     reply_tx: mpsc::Sender<SessionReply>,
     reply_rx: mpsc::Receiver<SessionReply>,
     title: String,
+    /// Shell 子进程 pid(退出时经 /proc/<pid>/cwd 取工作目录,
+    /// 写入会话文件供 resurrect 恢复)。
+    pid: Option<u32>,
+    /// 本标签的 shell 命令(会话文件按标签记录,resurrect 时
+    /// 覆盖当前配置的默认 shell)。
+    shell: String,
     /// 折叠状态按**稳定 BlockId** 键控,属该标签(切换标签保留,
     /// 与 alt-screen 切换同理 —— 折叠不得因离开标签而丢失)。
     folded: std::collections::BTreeSet<crate::blocks::BlockId>,
@@ -231,6 +240,13 @@ pub struct TayApp {
     config_mtime: Option<std::time::SystemTime>,
     config_reload: Option<mpsc::Receiver<Result<Config, String>>>,
     kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
+    /// Ctrl 键当前是否按住(键盘事件携带 mods;Ctrl+点击打开
+    /// OSC 8 超链接时用 —— 指针事件不带修饰键状态)。
+    ctrl_held: bool,
+    /// 激活标签的 shell pid 与命令(与 sender 同生命周期,切标签
+    /// 时随 TabSession 往返;退出时写会话文件)。
+    active_pid: Option<u32>,
+    active_shell: String,
     /// 最近一次热重载失败的配置 mtime(同一版本只告警一次,修复后自动恢复)。
     config_error_at: Option<std::time::SystemTime>,
     /// 持久剪贴板(Wayland 上数据归属存活连接:每用新建即弃可能丢数据,
@@ -238,6 +254,9 @@ pub struct TayApp {
     clipboard: Option<arboard::Clipboard>,
     /// 状态 toast(QuickSelect 反馈等):(消息, 置入时间)。
     status_msg: Option<(String, Instant)>,
+    /// 可视铃(终端 BEL):到此时刻为止闪烁网格背景;AboutToWait
+    /// 驱动衰减重绘,到期清除(与状态 toast 同一机制)。
+    bell_until: Option<Instant>,
     /// 会话:快照单槽(会话线程发布,UI 渲染只读它 —— 架构 §3)。
     snapshot_slot: Option<Arc<Mutex<Option<SessionUpdate>>>>,
     /// 最近一次快照(渲染/输入路由/光标定位的唯一来源)。
@@ -376,9 +395,13 @@ impl TayApp {
             config_mtime: None,
             config_reload: None,
             kitty_down: Default::default(),
+            ctrl_held: false,
+            active_pid: None,
+            active_shell: String::new(),
             config_error_at: None,
             clipboard: arboard::Clipboard::new().ok(),
             status_msg: None,
+            bell_until: None,
             snapshot_slot: None,
             snapshot: None,
             folded: Default::default(),
@@ -532,6 +555,17 @@ impl TayApp {
     }
 
     fn start_session(&self, cols: usize, rows: usize) -> Result<TabSession, String> {
+        self.start_session_with(cols, rows, self.config.shell_command(), None)
+    }
+
+    /// 创建标签会话;`shell`/`cwd` 覆盖当前配置(会话文件恢复用)。
+    fn start_session_with(
+        &self,
+        cols: usize,
+        rows: usize,
+        shell: String,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<TabSession, String> {
         // 终端 + PTY 事件循环线程。
         let (tx, rx) = mpsc::channel();
         let listener = Listener::new(tx.clone(), self.wake.clone());
@@ -563,10 +597,13 @@ impl TayApp {
         };
         state.palette = self.config.colors.clone();
         let opts = PtyOptions {
-            shell: Some(Shell::new(self.config.shell_command(), vec![])),
+            shell: Some(Shell::new(shell.clone(), vec![])),
+            working_directory: cwd,
             ..Default::default()
         };
         let pty = tty::new(&opts, ws, 0).map_err(|e| format!("创建 PTY 失败: {e}"))?;
+        // spawn 前捕获子进程 pid(会话文件写 /proc/<pid>/cwd 用)。
+        let pid = pty.child().id();
         // 快照单槽 + 应答通道(架构 §3):Term 所有权随 spawn 移入
         // 会话线程,UI 只留句柄。
         let slot: Arc<Mutex<Option<SessionUpdate>>> = Arc::new(Mutex::new(None));
@@ -589,6 +626,8 @@ impl TayApp {
             reply_tx,
             reply_rx,
             title: "shell".into(),
+            pid: Some(pid),
+            shell,
             folded: Default::default(),
         })
     }
@@ -609,6 +648,8 @@ impl TayApp {
         self.reply_tx = Some(tab.reply_tx);
         self.reply_rx = Some(tab.reply_rx);
         self.tab_title = tab.title;
+        self.active_pid = tab.pid;
+        self.active_shell = tab.shell;
         self.folded = tab.folded;
         self.sel = None;
         self.quick = None;
@@ -643,6 +684,8 @@ impl TayApp {
             reply_tx: self.reply_tx.take().expect("active reply sender"),
             reply_rx: self.reply_rx.take().expect("active reply receiver"),
             title: self.tab_title.clone(),
+            pid: self.active_pid,
+            shell: std::mem::take(&mut self.active_shell),
             folded: std::mem::take(&mut self.folded),
         };
         self.tabs[self.active_tab] = Some(old);
@@ -663,6 +706,34 @@ impl TayApp {
                 cell_width: cw.round() as u16,
                 cell_height: ch.round() as u16,
             }));
+        }
+    }
+
+    /// 优雅退出:把标签骨架写入会话文件(`tay resurrect` 恢复)。
+    /// 保存失败只记日志,不阻断退出(quit 语义优先)。
+    fn write_session_file(&self) {
+        let mut tabs: Vec<crate::persist::PersistTab> = Vec::new();
+        for (i, slot) in self.tabs.iter().enumerate() {
+            let pt = if i == self.active_tab {
+                crate::persist::PersistTab {
+                    shell: self.active_shell.clone(),
+                    cwd: self.active_pid.and_then(crate::persist::cwd_of),
+                    title: self.tab_title.clone(),
+                }
+            } else if let Some(t) = slot {
+                crate::persist::PersistTab {
+                    shell: t.shell.clone(),
+                    cwd: t.pid.and_then(crate::persist::cwd_of),
+                    title: t.title.clone(),
+                }
+            } else {
+                continue;
+            };
+            tabs.push(pt);
+        }
+        match crate::persist::save(&tabs, self.active_tab) {
+            Ok(()) => log::info!("会话文件已保存: {} 个标签", tabs.len()),
+            Err(e) => log::warn!("会话文件保存失败: {e}"),
         }
     }
 
@@ -780,7 +851,11 @@ impl TayApp {
                 self.maximized = !self.maximized;
                 self.request_layer_height(ctx);
             }
-            Action::CloseWindow => ctx.exit(),
+            Action::CloseWindow => {
+                // 窗口 × 按钮 = 优雅退出:与 tay quit 同路写会话文件。
+                self.write_session_file();
+                ctx.exit();
+            }
             Action::Clock => { /* 非交互:点击无操作 */ }
             Action::Hotkeys => {
                 self.settings_open = false;
@@ -881,8 +956,55 @@ impl TayApp {
             // 渲染器 + GPU surface(输出回退重建时复用此函数)。
             let (cols, rows) = self.create_renderer(ctx)?;
 
-            let tab = self.start_session(cols, rows)?;
-            self.install_session(tab);
+            // TAY_RESURRECT=1(tay resurrect 拉起):恢复上次退出保存的
+            // 标签骨架(壳/cwd/标题;不恢复网格内容 —— 见 persist.rs)。
+            if let Some((persist_tabs, active)) = std::env::var_os("TAY_RESURRECT")
+                .is_some()
+                .then(crate::persist::load)
+                .flatten()
+            {
+                let mut created = 0usize;
+                for (i, pt) in persist_tabs.iter().enumerate() {
+                    if i >= 24 {
+                        log::warn!("会话文件超过 24 个标签,其余忽略");
+                        break;
+                    }
+                    let cwd = pt.cwd.as_deref().map(std::path::PathBuf::from);
+                    match self.start_session_with(cols, rows, pt.shell.clone(), cwd) {
+                        Ok(mut tab) => {
+                            tab.title = pt.title.clone();
+                            if i == 0 {
+                                self.tabs[0] = Some(tab);
+                            } else {
+                                self.tabs.push(Some(tab));
+                            }
+                            created += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("恢复标签 {i} 失败: {e}");
+                            if i == 0 {
+                                break; // 首个失败 → 整体回退默认单标签
+                            }
+                        }
+                    }
+                }
+                if created == 0 {
+                    let tab = self.start_session(cols, rows)?;
+                    self.install_session(tab);
+                } else {
+                    // 先安装首个(switch_tab 的旧槽构造前提),再切到
+                    // 记录的目标;目标槽缺失(恢复失败)→ 留在首个。
+                    let first = self.tabs[0].take().expect("首个标签已创建");
+                    self.install_session(first);
+                    if active > 0 && active < self.tabs.len() && self.tabs[active].is_some() {
+                        self.switch_tab(active, ctx);
+                    }
+                    log::info!("resurrect:恢复 {created} 个标签,激活 {}", self.active_tab);
+                }
+            } else {
+                let tab = self.start_session(cols, rows)?;
+                self.install_session(tab);
+            }
 
             self.set_ime_area(ctx, (0, 0));
             // 初始 margin 对齐(WindowState 建面时用 -2000 占位防闪屏)。
@@ -1018,6 +1140,29 @@ impl TayApp {
         }
     }
 
+    /// 显示单元 → OSC 8 超链接 URI(显示行经视图映射回网格行,
+    /// 与选区/光标共用同一转换;无链接 → None)。
+    fn link_at_cell(&self, col: usize, row: usize) -> Option<Arc<str>> {
+        let snap = self.snapshot.as_ref()?;
+        let cols = snap.dims.0;
+        let gl = self.view.row_to_grid(row)?;
+        let first = -(snap.display_offset as i32);
+        let idx = (gl - first) as usize * cols + col;
+        let link = snap.cells.get(idx)?.hyperlink?;
+        snap.hyperlinks.get(link as usize).cloned()
+    }
+
+    /// xdg-open 打开 URL(与 QuickSelect 同一模式);失败给 toast。
+    fn open_link(&mut self, uri: Arc<str>, ctx: &mut Ctx<'_>) {
+        match std::process::Command::new("xdg-open").arg(&*uri).spawn() {
+            Ok(_) => log::info!("xdg-open: {uri}"),
+            Err(e) => {
+                log::warn!("xdg-open 失败: {e}");
+                self.status("打开链接失败", ctx);
+            }
+        }
+    }
+
     /// 从会话快照构建渲染网格(含命令块折叠重映射)。快照携带产生
     /// 它的 SessionMeta —— 网格与锚点必然同一版本(架构 §3);
     /// 尚未收到快照(会话刚启动)时渲染空白网格。
@@ -1045,21 +1190,14 @@ impl TayApp {
         // —— 折叠重映射:可见网格行 → 显示行 ——
         let first = -off;
         let last = first + rows as i32 - 1;
-        // 折叠区间(相邻提示符之间的输出行;P3c:存储逻辑在 blocks.rs)。
-        // 锚点为绝对行,映射回 grid 行。
+        // 折叠区间(相邻提示符之间的输出行;P3c:存储逻辑在 blocks.rs,
+        // 锚点 → 网格行映射在 view.rs —— 架构 §2.3 唯一转换点)。
         let ranges: Vec<(i32, i32)> = snap
             .as_ref()
-            .map(|s| s.blocks.fold_ranges(&self.folded))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|(a, b)| {
-                // 唯一转换点(SessionMeta::resolve):早于历史淘汰的
-                // 折叠区间直接丢弃(显示层不渲染失效锚点)。
-                let ga = meta.resolve(a, total_lines, rows)?;
-                let gb = meta.resolve(b, total_lines, rows)?;
-                Some((ga, gb))
+            .map(|s| {
+                crate::view::fold_ranges_to_grid(&s.blocks, &self.folded, meta, total_lines, rows)
             })
-            .collect();
+            .unwrap_or_default();
         // 显示映射(架构 §2.3:TerminalView,view.rs;正向/反向
         // 转换唯一实现,绘制/命中/选区/光标共用)。
         let view = crate::view::ViewMap::new(first, last, &ranges).with_meta(meta);
@@ -1103,8 +1241,30 @@ impl TayApp {
                 let base = gi as usize * cols;
                 for col in 0..cols {
                     let sc = &s.cells[base + col];
-                    cells[row * cols + col] =
-                        crate::terminal::render_cell(sc, &s.colors, &self.config.colors);
+                    let mut cell = crate::terminal::render_cell(sc, &s.colors, &self.config.colors);
+                    // OSC 8 超链接:整段下划线(alacritty 语义)。
+                    if sc.hyperlink.is_some() {
+                        cell.underline = true;
+                    }
+                    cells[row * cols + col] = cell;
+                }
+            }
+        }
+        // 可视铃:网格背景向闪光色衰减混色(剩余时长 → 强度)。
+        // 覆盖全部单元(含折叠占位行),整面统一闪烁。
+        if let Some(until) = self.bell_until {
+            let remain = until.saturating_duration_since(Instant::now());
+            let k =
+                BELL_FLASH_MAX * (remain.as_secs_f32() / BELL_FLASH.as_secs_f32()).clamp(0.0, 1.0);
+            if k > 0.0 {
+                let flash = Rgb::new(0x9a, 0xb8, 0xd8);
+                for cell in &mut cells {
+                    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * k).round() as u8;
+                    cell.bg = Rgb::new(
+                        m(cell.bg.0, flash.0),
+                        m(cell.bg.1, flash.1),
+                        m(cell.bg.2, flash.2),
+                    );
                 }
             }
         }
@@ -1123,74 +1283,24 @@ impl TayApp {
             Some(ACursorShape::Beam) => tay_render::CursorShape::Beam,
             _ => tay_render::CursorShape::Hidden,
         };
-        // 光标/选区经映射(折叠区间内的行落到占位行)。
-        let to_display = |p: Point| -> (usize, usize) {
-            let d = view.project(
-                GridPoint {
-                    line: p.line.0,
-                    col: p.column.0 as u32,
-                },
-                cols,
-            );
-            (d.col, d.row)
-        };
         // 选区渲染:鼠标拖选(UI 视图状态,选择时刻定格锚点)优先;
-        // 无鼠标选区时渲染 vi 选区(会话侧,快照携带)。此前只渲染
-        // 快照的 vi 选区 —— 重构回归:拖选看不见高亮但复制正常
-        // (2026-10-19 修复,TAY_SEL 截图验色确认)。
-        let selection = self
-            .sel
-            .and_then(|((sl, sc), (el, ec))| {
-                let (a0, a1) = if sl <= el {
-                    ((sl, sc), (el, ec))
-                } else {
-                    ((el, ec), (sl, sc))
-                };
-                let row0 = view.grid_to_row(a0.0.0 - meta.cum_scroll)?;
-                let row1 = view.grid_to_row(a1.0.0 - meta.cum_scroll)?;
-                let (r0, r1) = if row0 <= row1 {
-                    (row0, row1)
-                } else {
-                    (row1, row0)
-                };
-                // 同一行的列序归一(反向拖选)。
-                let (c0, c1) = if r0 == r1 && a0.1 > a1.1 {
-                    (a1.1, a0.1)
-                } else {
-                    (a0.1, a1.1)
-                };
-                Some(tay_render::SelectionRange {
-                    start: ((c0 as usize).min(cols - 1), r0),
-                    end: ((c1 as usize).min(cols - 1), r1),
-                })
-            })
-            .or_else(|| {
-                snap.as_ref()
-                    .and_then(|s| s.selection)
-                    .map(|s| tay_render::SelectionRange {
-                        start: to_display(s.start),
-                        end: to_display(s.end),
-                    })
-            });
+        // 无鼠标选区时渲染 vi 选区(会话侧,快照携带)。投影逻辑
+        // 在 view.rs(折叠感知 + 列序归一)。
+        let selection = crate::view::selection_to_display(
+            self.sel,
+            snap.as_ref().and_then(|s| s.selection),
+            meta,
+            &view,
+            cols,
+        );
         // OSC 133 徽章:非零退出码显示在对应提示符行尾(块状态
-        // 来自快照的 COW 共享引用,与网格同版本)。
+        // 来自快照的 COW 共享引用,与网格同版本;投影在 view.rs)。
         let badges = snap
             .as_ref()
-            .map(|s| &*s.blocks)
-            .into_iter()
-            .flat_map(|blocks| blocks.badges())
-            .filter_map(|(line, code)| {
-                let gl = meta.resolve(*line, total_lines, rows)?;
-                let row = view.grid_to_row(gl)?;
-                Some(tay_render::Badge {
-                    row,
-                    text: format!(" ✗ {code} "),
-                    color: Rgb::new(0xff, 0x5f, 0x5f),
-                })
-            })
-            .collect();
+            .map(|s| crate::view::badges_to_display(&s.blocks, meta, total_lines, rows, &view))
+            .unwrap_or_default();
 
-        // kitty 图像:网格行 → 显示行(折叠区间内隐藏)。
+        // kitty 图像:网格行 → 显示行(折叠区间内隐藏;投影在 view.rs)。
         let (cw, ch) = self
             .renderer
             .as_ref()
@@ -1198,44 +1308,18 @@ impl TayApp {
             .unwrap_or((10.0, 20.0));
         let images = snap
             .as_ref()
-            .map(|s| &*s.images)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| {
-                // 图像锚点同走唯一转换点;已被历史淘汰 → 不渲染。
-                let gl = meta.resolve(HistoryAnchor(e.grid_line), total_lines, rows)?;
-                let row = view.grid_to_row(gl)?;
-                let cols = e
-                    .img
-                    .cols
-                    .unwrap_or((e.img.w as f32 / cw).ceil() as u32)
-                    .max(1);
-                let rows = e
-                    .img
-                    .rows
-                    .unwrap_or((e.img.h as f32 / ch).ceil() as u32)
-                    .max(1);
-                // 跨折叠区间 → 隐藏(修复:此前误把绝对行与
-                // grid 相对区间比较,滚动后折叠隐藏失效)。
-                if ranges
-                    .iter()
-                    .any(|(a, b)| gl + rows as i32 > *a && gl <= *b)
-                {
-                    return None;
-                }
-                Some(tay_render::RenderImage {
-                    id: e.id,
-                    row,
-                    col: e.col as usize,
-                    cols,
+            .map(|s| {
+                crate::view::images_to_display(
+                    &s.images,
+                    meta,
+                    total_lines,
                     rows,
-                    w: e.img.w,
-                    h: e.img.h,
-                    z: e.img.z,
-                    rgba: e.img.rgba.clone(),
-                })
+                    &ranges,
+                    &view,
+                    (cw, ch),
+                )
             })
-            .collect();
+            .unwrap_or_default();
 
         // QuickSelect 覆盖层 + vi 搜索状态栏。
         let mut overlays: Vec<tay_render::Overlay> = self
@@ -2095,11 +2179,18 @@ impl Handler for TayApp {
             } else {
                 None
             };
+            // 悬停超链接也显示手形指针(发现性;Ctrl 按住时保留
+            // 常规指针,提示点击会直接打开)。
+            let over_link = !self.ctrl_held
+                && self
+                    .cell_at(*x, *y)
+                    .is_some_and(|(c, r)| self.link_at_cell(c, r).is_some());
             ctx.set_pointer_over_control(
                 hovered.is_some_and(|a| a != crate::chrome::Action::Clock)
                     || self
                         .scrollbar_geometry()
-                        .is_some_and(|g| g.contains(*x as f32, *y as f32)),
+                        .is_some_and(|g| g.contains(*x as f32, *y as f32))
+                    || over_link,
             );
             if hovered != self.chrome_hover {
                 self.chrome_hover = hovered;
@@ -2224,6 +2315,9 @@ impl Handler for TayApp {
                 }
 
             WEvent::Keyboard { key, pressed, mods } => {
+                // 按下/释放都携带当前 mods:同步 Ctrl 状态(指针事件
+                // 不携带修饰键,Ctrl+点击打开超链接依赖此字段)。
+                self.ctrl_held = mods.ctrl;
                 if !pressed {
                     if let Some(original) = self.kitty_down.remove(&key.raw_code) {
                         let mode = self.snapshot.as_ref().map(|s|s.mode).unwrap_or_default();
@@ -2462,6 +2556,14 @@ impl Handler for TayApp {
                 y,
             } => {
                 if pressed {
+                        // Ctrl+点击:OSC 8 超链接直接打开(不进选区)。
+                        if self.ctrl_held
+                            && let Some(cell) = self.cell_at(x, y)
+                            && let Some(uri) = self.link_at_cell(cell.0, cell.1)
+                        {
+                            self.open_link(uri, ctx);
+                            return;
+                        }
                         // 点击徽章 → 折叠/展开该块。
                         if let Some(cell) = self.cell_at(x, y)
                             && let Some(line) = self.badge_line_at(DisplayPoint {
@@ -2622,6 +2724,11 @@ impl Handler for TayApp {
                                 ctx.request_redraw();
                             }
                         Event::Title(t) => {self.tab_title=t;ctx.request_redraw();},
+                        Event::Bell => {
+                            // 可视铃:网格背景短暂闪烁(衰减见 build_grid)。
+                            self.bell_until = Some(Instant::now() + BELL_FLASH);
+                            ctx.request_redraw();
+                        }
                         Event::ClipboardStore(_, text) => {
                             self.set_clipboard(text);
                         }
@@ -2641,6 +2748,7 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::Hide => self.hide(ctx),
                         crate::ipc::IpcCommand::Quit => {
                             log::info!("收到 quit");
+                            self.write_session_file();
                             if let Some(sender) = &self.sender {
                                 let _ = sender.send(SessionCommand::Shutdown);
                             }
@@ -2802,6 +2910,17 @@ impl Handler for TayApp {
                 {
                     self.status_msg = None;
                     ctx.request_redraw();
+                }
+                // 可视铃:到期清除;未到期衰减重绘并唤醒到期时刻。
+                // 与动画并发时动画的 8ms 步进自带重绘,不覆盖其 deadline。
+                if let Some(until) = self.bell_until {
+                    if Instant::now() >= until {
+                        self.bell_until = None;
+                        ctx.request_redraw();
+                    } else if !self.vis.animating() {
+                        ctx.set_anim_deadline(Some(until));
+                        ctx.request_redraw();
+                    }
                 }
                 // 截图/基准模式:事件循环自身驱动连续帧。
                 let continuous = self.renderer.as_ref().is_some_and(|r| r.shot_pending())

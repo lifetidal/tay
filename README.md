@@ -20,8 +20,17 @@
 - **vi 复制模式**(Ctrl+Shift+Space):hjkl 移动、`/` 全滚动回退搜索、
   `y` 复制
 - **图像协议三件套**:kitty graphics / sixel / iTerm2 inline(PNG/RGBA/RGB)
+- **OSC 8 超链接**:链接段下划线,悬停手形指针,**Ctrl+点击** 直接
+  xdg-open(与 QuickSelect 的打开语义互补)
+- **可视铃**:终端 BEL 时网格背景短闪(140ms 衰减混色)
+- **会话恢复**:`tay quit` 优雅退出时保存标签骨架(shell/工作目录/
+  标题),`tay resurrect` 恢复全部标签(滚动历史/图像不恢复 ——
+  内核状态不可序列化)
 - **主题热重载**:改 `~/.config/tay/config.lua` 即时生效
 - CJK 与 IME(text-input-v3)、ANSI 真色、滚动性能 >1000fps
+- **质量基建**:186 项测试 + proptest 属性测试、cargo-fuzz 双
+  harness(协议解析 / sixel 解码)、RustSec 依赖审计、GitHub
+  Actions CI(严格 Clippy 门禁)
 
 ## 安装
 
@@ -47,6 +56,7 @@ systemctl --user enable --now tayd.service
 tayd &          # daemon 常驻(窗口隐藏)
 tay toggle      # 呼出/收起(tay show / tay hide / tay quit)
 tay pin         # 临时固定:暂停失焦自动隐藏(再发一次解除)
+tay resurrect   # daemon 停止后:恢复上次退出保存的标签骨架
 ```
 
 首次按 **F12** 会在 KDE 弹窗确认一次全局热键绑定。

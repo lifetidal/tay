@@ -17,6 +17,22 @@ fn socket_path() -> PathBuf {
     dir.join("tay.sock")
 }
 
+/// 会话文件路径 —— 与 daemon 的 persist::path() 保持一致
+/// ($XDG_STATE_HOME || ~/.local/state)/tay/session.toml。
+fn session_file() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/state"))
+        })
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("tay").join("session.toml")
+}
+
 fn send(cmd: &str) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket_path()).map_err(|_| "daemon 未运行".to_string())?;
     stream
@@ -31,7 +47,9 @@ fn send(cmd: &str) -> Result<String, String> {
 }
 
 /// 拉起 daemon(tayd 需在 PATH 或与 tay 同目录)。
-fn spawn_daemon() -> Result<Child, String> {
+/// `resurrect` = 携带 TAY_RESURRECT=1:daemon 启动时按会话文件
+/// 恢复上次退出时保存的标签骨架。
+fn spawn_daemon(resurrect: bool) -> Result<Child, String> {
     let sibling = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("tayd")))
@@ -44,8 +62,11 @@ fn spawn_daemon() -> Result<Child, String> {
         .open(&log_path)
         .map_err(|e| format!("无法创建日志 {}: {e}", log_path.display()))?;
     let stderr = log.try_clone().map_err(|e| e.to_string())?;
-    Command::new(&path)
-        .process_group(0)
+    let mut cmd = Command::new(&path);
+    if resurrect {
+        cmd.env("TAY_RESURRECT", "1");
+    }
+    cmd.process_group(0)
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(stderr)
@@ -205,10 +226,56 @@ fn main() {
             cmd_doctor();
             return;
         }
+        "resurrect" => {
+            // 恢复上次退出保存的标签骨架:要求 daemon 未运行
+            // (quit 时才写会话文件;运行中恢复会与现有会话冲突)。
+            if UnixStream::connect(socket_path()).is_ok() {
+                eprintln!(
+                    "tay: daemon 已在运行 —— 请先 tay quit(退出时写入会话文件),再 tay resurrect"
+                );
+                std::process::exit(1);
+            }
+            if !session_file().exists() {
+                eprintln!("tay: 没有可恢复的会话文件(上次退出时未保存);tay toggle 正常启动");
+                std::process::exit(1);
+            }
+            let mut child = spawn_daemon(true).unwrap_or_else(|e| {
+                eprintln!("tay: {e}");
+                std::process::exit(1);
+            });
+            // 与冷启动同一就绪协议:等 socket 应答 show。
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                if let Ok(resp) = send("show") {
+                    if resp != "ok" {
+                        eprintln!("tay: {resp}");
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+                if let Ok(Some(status)) = child.try_wait()
+                    && !status.success()
+                {
+                    eprintln!(
+                        "tay: daemon 启动失败({status}); 日志: {}",
+                        socket_path().with_file_name("tayd.log").display()
+                    );
+                    std::process::exit(1);
+                }
+                if Instant::now() > deadline {
+                    eprintln!(
+                        "tay: daemon 启动超时; 日志: {}",
+                        socket_path().with_file_name("tayd.log").display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
         "--daemon" => return, // 被 CLI 拉起时:正常初始化 daemon
         _ => {
             eprintln!(
-                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|settings|maximize|restore|config|keys|doctor](默认 toggle)"
+                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|settings|maximize|restore|resurrect|config|keys|doctor](默认 toggle)"
             );
             std::process::exit(2);
         }
@@ -226,7 +293,7 @@ fn main() {
             if matches!(cmd.as_str(), "hide" | "quit") {
                 return;
             }
-            let mut child = spawn_daemon().unwrap_or_else(|e| {
+            let mut child = spawn_daemon(false).unwrap_or_else(|e| {
                 eprintln!("tay: {e}");
                 std::process::exit(1);
             });

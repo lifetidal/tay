@@ -9,6 +9,13 @@ license.workspace = true
 name = "tayd"
 path = "src/main.rs"
 
+[lib]
+name = "tayd"
+path = "src/lib.rs"
+
+[dev-dependencies]
+proptest = "1"
+
 [dependencies]
 tay-config.workspace = true
 tay-window.workspace = true
@@ -26,6 +33,9 @@ regex = "1"
 notify = "8"
 base64 = "0.22"
 image = { workspace = true, features = ["png"] }
+serde = { workspace = true }
+toml.workspace = true
+dirs.workspace = true
 log.workspace = true
 env_logger.workspace = true
 icy_sixel = "0.7.0"

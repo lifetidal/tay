@@ -7,3 +7,4 @@ Cargo.lock.orig
 
 !packaging/icons/tay.png
 !packaging/icons/tay-terminal.png
+fuzz/target/

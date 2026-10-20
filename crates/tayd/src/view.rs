@@ -3,8 +3,15 @@
 //! 网格行 ⇄ 显示行的**正向/反向映射唯一实现** —— 绘制、鼠标命中、
 //! 选区、QuickSelect、光标与 IME 共用。折叠只影响显示,不修改
 //! 终端底层内容;折叠占位行代表整个折叠区间(含端点)。
+//!
+//! 下方四个纯函数族(折叠区间/选区/徽章/图像投影)原本内联在
+//! app.build_grid(架构 §6 阶段 3 的未完成项);现收拢于此:
+//! 全部坐标转换唯一实现点 = session.rs / view.rs。
 
-use crate::session::{DisplayPoint, GridPoint};
+use std::collections::BTreeSet;
+
+use crate::blocks::{BlockId, CommandBlockStore};
+use crate::session::{DisplayPoint, GridPoint, HistoryAnchor, KittyImageEntry, SessionMeta};
 
 /// 一个显示行的条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +114,159 @@ impl ViewMap {
     }
 }
 
+/// 折叠区间(绝对锚点)→ 网格行区间。早于历史淘汰的区间直接
+/// 丢弃(显示层不渲染失效锚点);解析走 SessionMeta::resolve
+/// 唯一转换点(架构 §4.2)。
+pub fn fold_ranges_to_grid(
+    blocks: &CommandBlockStore,
+    folded: &BTreeSet<BlockId>,
+    meta: SessionMeta,
+    total_lines: usize,
+    rows: usize,
+) -> Vec<(i32, i32)> {
+    blocks
+        .fold_ranges(folded)
+        .into_iter()
+        .filter_map(|(a, b)| {
+            let ga = meta.resolve(a, total_lines, rows)?;
+            let gb = meta.resolve(b, total_lines, rows)?;
+            Some((ga, gb))
+        })
+        .collect()
+}
+
+/// 网格点 → 显示坐标(vi 选区投影;折叠区间内落到占位行)。
+fn project_point(
+    p: alacritty_terminal::index::Point,
+    view: &ViewMap,
+    cols: usize,
+) -> (usize, usize) {
+    let d = view.project(
+        GridPoint {
+            line: p.line.0,
+            col: p.column.0 as u32,
+        },
+        cols,
+    );
+    (d.col, d.row)
+}
+
+/// 选区 → 显示空间(折叠感知)。鼠标拖选(UI 视图状态,选择时刻
+/// 定格锚点)优先;无鼠标选区时用快照的 vi 选区(会话侧)。
+/// 同一行的列序归一(反向拖选)。
+pub fn selection_to_display(
+    mouse: Option<((HistoryAnchor, u32), (HistoryAnchor, u32))>,
+    snap_selection: Option<alacritty_terminal::selection::SelectionRange>,
+    meta: SessionMeta,
+    view: &ViewMap,
+    cols: usize,
+) -> Option<tay_render::SelectionRange> {
+    mouse
+        .and_then(|((sl, sc), (el, ec))| {
+            let (a0, a1) = if sl <= el {
+                ((sl, sc), (el, ec))
+            } else {
+                ((el, ec), (sl, sc))
+            };
+            let row0 = view.grid_to_row(a0.0.0 - meta.cum_scroll)?;
+            let row1 = view.grid_to_row(a1.0.0 - meta.cum_scroll)?;
+            let (r0, r1) = if row0 <= row1 {
+                (row0, row1)
+            } else {
+                (row1, row0)
+            };
+            // 同一行的列序归一(反向拖选)。
+            let (c0, c1) = if r0 == r1 && a0.1 > a1.1 {
+                (a1.1, a0.1)
+            } else {
+                (a0.1, a1.1)
+            };
+            Some(tay_render::SelectionRange {
+                start: ((c0 as usize).min(cols - 1), r0),
+                end: ((c1 as usize).min(cols - 1), r1),
+            })
+        })
+        .or_else(|| {
+            snap_selection.map(|s| tay_render::SelectionRange {
+                start: project_point(s.start, view, cols),
+                end: project_point(s.end, view, cols),
+            })
+        })
+}
+
+/// OSC 133 徽章(绝对行)→ 显示行 + 文本(非零退出码显示在对应
+/// 提示符行尾;块状态来自快照的 COW 共享引用,与网格同版本)。
+pub fn badges_to_display(
+    blocks: &CommandBlockStore,
+    meta: SessionMeta,
+    total_lines: usize,
+    rows: usize,
+    view: &ViewMap,
+) -> Vec<tay_render::Badge> {
+    blocks
+        .badges()
+        .filter_map(|(line, code)| {
+            let gl = meta.resolve(*line, total_lines, rows)?;
+            let row = view.grid_to_row(gl)?;
+            Some(tay_render::Badge {
+                row,
+                text: format!(" ✗ {code} "),
+                color: tay_config::Rgb::new(0xff, 0x5f, 0x5f),
+            })
+        })
+        .collect()
+}
+
+/// kitty 图像放置(网格行锚点)→ 显示行;跨折叠区间 → 隐藏
+/// (修复:此前误把绝对行与 grid 相对区间比较,滚动后折叠隐藏
+/// 失效 —— 这里保持「绝对行 + 折叠区间」判定)。
+pub fn images_to_display(
+    images: &[KittyImageEntry],
+    meta: SessionMeta,
+    total_lines: usize,
+    rows: usize,
+    ranges: &[(i32, i32)],
+    view: &ViewMap,
+    cell_size: (f32, f32),
+) -> Vec<tay_render::RenderImage> {
+    let (cw, ch) = cell_size;
+    images
+        .iter()
+        .filter_map(|e| {
+            // 图像锚点同走唯一转换点;已被历史淘汰 → 不渲染。
+            let gl = meta.resolve(HistoryAnchor(e.grid_line), total_lines, rows)?;
+            let row = view.grid_to_row(gl)?;
+            let img_cols = e
+                .img
+                .cols
+                .unwrap_or((e.img.w as f32 / cw).ceil() as u32)
+                .max(1);
+            let img_rows = e
+                .img
+                .rows
+                .unwrap_or((e.img.h as f32 / ch).ceil() as u32)
+                .max(1);
+            if ranges
+                .iter()
+                .any(|(a, b)| gl + img_rows as i32 > *a && gl <= *b)
+            {
+                return None;
+            }
+            Some(tay_render::RenderImage {
+                id: e.id,
+                row,
+                col: e.col as usize,
+                cols: img_cols,
+                rows: img_rows,
+                w: e.img.w,
+                h: e.img.h,
+                z: e.img.z,
+                rgba: e.img.rgba.clone(),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +344,64 @@ mod tests {
         );
         // 视口外 → 钳到最后一行(索引 4 = 网格行 6)。
         assert_eq!(m.project(grid((9, 0)), 10), DisplayPoint { row: 4, col: 0 });
+    }
+
+    /// 鼠标选区投影:行序归一 + 反向拖选列序归一 + 折叠感知。
+    #[test]
+    fn mouse_selection_normalizes_order_and_respects_folds() {
+        let m = ViewMap::new(0, 6, &[(2, 4)]);
+        let meta = SessionMeta::default();
+        // 行 1 → 显示行 1;行 5 → 显示行 3(折叠占位行 2)。
+        let expected = Some(tay_render::SelectionRange {
+            start: (2, 1),
+            end: (3, 3),
+        });
+        assert_eq!(
+            selection_to_display(
+                Some(((HistoryAnchor(1), 2), (HistoryAnchor(5), 3))),
+                None,
+                meta,
+                &m,
+                10
+            ),
+            expected
+        );
+        // 反向拖选(起点在终点之后)→ 同一结果。
+        assert_eq!(
+            selection_to_display(
+                Some(((HistoryAnchor(5), 3), (HistoryAnchor(1), 2))),
+                None,
+                meta,
+                &m,
+                10
+            ),
+            expected
+        );
+    }
+
+    /// vi 选区投影:会话侧点 → 显示点,折叠区间内落到占位行。
+    #[test]
+    fn vi_selection_projects_through_folds() {
+        use alacritty_terminal::index::{Column, Line, Point};
+        use alacritty_terminal::selection::SelectionRange;
+        let m = ViewMap::new(0, 6, &[(2, 4)]);
+        let sel = selection_to_display(
+            None,
+            Some(SelectionRange {
+                start: Point::new(Line(3), Column(2)),
+                end: Point::new(Line(5), Column(4)),
+                is_block: false,
+            }),
+            SessionMeta::default(),
+            &m,
+            10,
+        );
+        assert_eq!(
+            sel,
+            Some(tay_render::SelectionRange {
+                start: (2, 2),
+                end: (4, 3),
+            })
+        );
     }
 }
