@@ -106,10 +106,25 @@ pub fn layout(
         0
     };
     let reserved = window_reserved + extra + clock_width;
-    let page = (cols.saturating_sub(reserved) / config.tab_bar.tab_width as usize).max(1);
+    let usable = cols.saturating_sub(reserved);
+    // 浏览器式收缩:标签多到一页放不下时,按总数均分宽度让
+    // **全部标签始终可见**(标题截断);均分后仍不足 4 列才
+    // 退回分页(活动标签所在页)。此前固定 tab_width 分页且
+    // 无翻页提示 —— 用户看到"7 个到顶了",第 8 个像被顶掉。
+    let count = titles.len().max(1);
+    let mut tab_w = config.tab_bar.tab_width as usize;
+    let page = (usable / tab_w).max(1);
+    if count > page {
+        // 每标签预算 =(可用宽 − 每标签 3 列关闭钮)/ 总数。
+        let per = usable.saturating_sub(3 * count) / count;
+        if per >= 4 {
+            tab_w = per + 3;
+        }
+    }
+    let page = (usable / tab_w).max(1);
     let first = (active / page) * page;
     for (i, title) in titles.iter().enumerate().skip(first).take(page) {
-        let name = truncate(title, config.tab_bar.tab_width.saturating_sub(8) as usize);
+        let name = truncate(title, tab_w.saturating_sub(8));
         let label = format!(
             "{}:{}",
             i + 1,
@@ -122,10 +137,7 @@ pub fn layout(
         if available == 0 {
             break;
         }
-        tab_text = truncate(
-            &tab_text,
-            available.min(config.tab_bar.tab_width as usize - close_w),
-        );
+        tab_text = truncate(&tab_text, available.min(tab_w - close_w));
         let tab_w = width(&tab_text);
         items.push(Item {
             row: 0,
@@ -577,6 +589,29 @@ mod tests {
             let items = layout(80, &titles, active, false, &Config::default(), "");
             assert!(items.iter().any(|i| i.action == Action::Tab(active)));
         }
+    }
+
+    /// 浏览器式收缩:一页放不下时按总数均分,全部标签可见
+    /// (用户实测"7 个到顶了"的修复 —— 此前固定 24 列分页,
+    /// 200 列宽恰好一页 7 个,第 8 个起看不到)。
+    #[test]
+    fn all_tabs_shrink_to_fit_when_more_than_one_page() {
+        // 200 列:固定 24 列只能放 7 个;收缩后 14 个全部可见。
+        let titles: Vec<String> = (0..14).map(|i| format!("tab{i}")).collect();
+        let items = layout(200, &titles, 13, false, &Config::default(), "");
+        for i in 0..14 {
+            assert!(
+                items.iter().any(|x| x.action == Action::Tab(i)),
+                "标签 {i} 必须可见(收缩而非分页)"
+            );
+        }
+        assert!(items.iter().all(|i| i.end <= 200));
+        // 窄到连 4 列都均分不出(80 列 × 24 标签)→ 退回分页,
+        // 活动标签仍在本页(既有测试),且不越界。
+        let many = vec!["s".to_string(); 24];
+        let items = layout(80, &many, 23, false, &Config::default(), "");
+        assert!(items.iter().any(|i| i.action == Action::Tab(23)));
+        assert!(items.iter().all(|i| i.end <= 80));
     }
 
     #[test]
