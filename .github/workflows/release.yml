@@ -1,0 +1,51 @@
+name: Release
+
+# 打 tag vX.Y.Z 或手动触发:构建 release 二进制并附加到
+# GitHub Release(附 sha256;AUR 仍从源码构建,见
+# docs/release-publishing.md —— 快照包需要真实源码 tar 校验和,
+# 与这里的裸二进制产物是两条独立链路)。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 系统依赖(Wayland / 字体 / 键盘)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build release
+        run: |
+          cargo build --release --locked --bin tay --bin tayd
+          mkdir -p dist
+          cp target/release/tay dist/tay-${{ matrix.target }}
+          cp target/release/tayd dist/tayd-${{ matrix.target }}
+          cd dist
+          sha256sum tay-${{ matrix.target }} tayd-${{ matrix.target }} > SHA256SUMS
+
+      - name: 附加到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/tay-${{ matrix.target }}
+            dist/tayd-${{ matrix.target }}
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

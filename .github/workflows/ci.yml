@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 质量门:fmt / clippy / 全量测试 / diff 卫生。
+  # 与仓库的验收基线一致(usability-review.md):
+  #   cargo fmt --check、clippy -D warnings、cargo test --workspace。
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 系统依赖(Wayland / 字体 / 键盘)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwayland-dev libxkbcommon-dev libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --locked
+
+      - name: diff 卫生
+        run: git diff --check
+
+  # 依赖安全审计(advisories 豁免见仓库根 audit.toml,
+  # 每条豁免记录依赖路径与升级条件)。
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

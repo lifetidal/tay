@@ -1,0 +1,21 @@
+# cargo audit 豁免清单(2026-10-20 审计,无 CVE 级漏洞)。
+# 每条记录依赖路径与升级条件;条件满足时应移除豁免并升级。
+[advisories]
+ignore = [
+    # ttf-parser 0.25.1 unmaintained(上游终止维护,字体生态常态)
+    # 路径: cosmic-text 0.19 → fontdb 0.23 → ttf-parser
+    # 升级条件: cosmic-text 换用新解析器或 fontdb 更换后端
+    "RUSTSEC-2026-0192",
+    # lru 0.16.4 unsound(pop() 缺 panic 安全)
+    # 路径: glyphon 0.12(最新版)钉住 lru 0.16,0.16.x 无修复版
+    # 升级条件: glyphon 发布依赖 lru ≥0.17 的版本
+    "RUSTSEC-2026-0253",
+    # zvariant 5.15.0 unmaintained
+    # 路径: zbus 5 → ashpd 0.13(portal 热键)
+    # 升级条件: ashpd 迁移到 zbus 6 后整体升级(ashpd 0.13 为最新)
+    "RUSTSEC-2026-0370",
+    # zbus_names 4.3.4 unmaintained(同上)
+    "RUSTSEC-2026-0371",
+    # zvariant_derive 5.15.0 unmaintained(同上)
+    "RUSTSEC-2026-0372",
+]
