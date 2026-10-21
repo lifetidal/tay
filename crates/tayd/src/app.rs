@@ -171,7 +171,33 @@ impl EventListener for Listener {
     }
 }
 
-struct TabSession {
+struct PaneTab {
+    root: Layout<PaneId>,
+    focused: PaneId,
+    zoomed: bool,
+}
+#[derive(Default)]
+struct PaneView {
+    preedit: Option<tay_render::Preedit>,
+    /// 鼠标选区(稳定锚点):(起点, 当前点) —— 行号为历史绝对行、
+    /// 列为网格列。锚点在**选择时刻**定格,后续滚屏/输出不改变它
+    /// 指向的文本(P1:异步复制不受请求前的滚屏影响)。
+    /// 选区来源快照的失效世代(选择时刻定格):复制请求携带它,
+    /// 会话执行前校验 —— 清屏/resize/屏幕切换后旧选择明确返回
+    /// 过期,绝不把新文本当旧选择复制(第八轮定点修复)。
+    sel: Option<((HistoryAnchor, u32), (HistoryAnchor, u32))>,
+    sel_epoch: AnchorEpoch,
+    dragging: bool,
+    scrollbar_drag: Option<(f32, AnchorEpoch)>,
+    scroll_px: f32,
+    quick: Option<QuickState>,
+    vi_search_query: Option<String>,
+    view: crate::view::ViewMap,
+    kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
+    status_msg: Option<(String, Instant)>,
+}
+struct PaneSession {
+    ui: PaneView,
     worker: Option<crate::ptyloop::SessionWorker>,
     sender: Option<TermSender>,
     slot: Option<Arc<Mutex<Option<SessionUpdate>>>>,
@@ -183,21 +209,23 @@ struct TabSession {
     /// Shell 子进程 pid(退出时经 /proc/<pid>/cwd 取工作目录,
     /// 写入会话文件供 resurrect 恢复)。
     pid: Option<u32>,
-    /// 本标签的 shell 命令(会话文件按标签记录,resurrect 时
+    /// 本窗格的 shell 命令(会话文件按窗格记录,resurrect 时
     /// 覆盖当前配置的默认 shell)。
     shell: String,
-    /// 折叠状态按**稳定 BlockId** 键控,属该标签(切换标签保留,
+    /// 折叠状态按**稳定 BlockId** 键控,属该窗格(切换焦点保留,
     /// 与 alt-screen 切换同理 —— 折叠不得因离开标签而丢失)。
     seen_epoch: AnchorEpoch,
     bell_until: Option<Instant>,
     folded: std::collections::BTreeSet<crate::blocks::BlockId>,
 }
 
-use crate::tabs::{TabId, Tabs};
+use crate::panes::{Axis, Divider, Layout, Rect};
+use crate::tabs::{TabId as PaneId, Tabs as Sessions};
 
-impl TabSession {
+impl PaneSession {
     fn empty() -> Self {
         Self {
+            ui: Default::default(),
             worker: None,
             sender: None,
             slot: None,
@@ -219,10 +247,15 @@ pub struct TayApp {
     termination: crate::shutdown::Termination,
     shutting_down: bool,
     retiring: Vec<crate::ptyloop::SessionWorker>,
-    tabs: Tabs<TabSession>,
-    active_tab: TabId,
+    sessions: Sessions<PaneSession>,
+    layouts: Vec<PaneTab>,
+    divider_drag: Option<Divider>,
+    pane_output_dirty: bool,
+    pane_smoke: Option<(std::path::PathBuf, u8)>,
+    active_pane: PaneId,
     settings_open: bool,
     hotkey_status: String,
+    tray_status_tx: Option<mpsc::SyncSender<String>>,
     chrome_hover: Option<crate::chrome::Action>,
     maximized: bool,
     editing: Option<(crate::chrome::Field, String)>,
@@ -234,27 +267,11 @@ pub struct TayApp {
     instance: Option<wgpu::Instance>,
     renderer: Option<tay_render::Renderer>,
     dims: Option<(usize, usize)>,
-    preedit: Option<tay_render::Preedit>,
-    /// 鼠标选区(稳定锚点):(起点, 当前点) —— 行号为历史绝对行、
-    /// 列为网格列。锚点在**选择时刻**定格,后续滚屏/输出不改变它
-    /// 指向的文本(P1:异步复制不受请求前的滚屏影响)。
-    sel: Option<((HistoryAnchor, u32), (HistoryAnchor, u32))>,
-    /// 选区来源快照的失效世代(选择时刻定格):复制请求携带它,
-    /// 会话执行前校验 —— 清屏/resize/屏幕切换后旧选择明确返回
-    /// 过期,绝不把新文本当旧选择复制(第八轮定点修复)。
-    sel_epoch: AnchorEpoch,
-    dragging: bool,
-    scrollbar_drag: Option<(f32, AnchorEpoch)>,
+    /// 隔离测试用的滚动条事件阶段。
     scrollbar_smoke: Option<u8>,
-    scroll_px: f32,
 
     // —— M1:呼出状态(P3c:状态机拆到 visibility.rs)——
     vis: crate::visibility::VisibilityController,
-    // —— M3:QuickSelect / vi 复制模式 ——
-    quick: Option<QuickState>,
-    vi_search_query: Option<String>,
-    /// 显示映射(架构 §2.3:TerminalView;折叠感知正向/反向转换)。
-    view: crate::view::ViewMap,
     /// GPU surface 生命周期阶段(架构 §5.1)。
     gpu_phase: GpuPhase,
     layer_h: i32,
@@ -293,7 +310,6 @@ pub struct TayApp {
     slowui_at_start: bool,
     config_mtime: Option<std::time::SystemTime>,
     config_reload: Option<mpsc::Receiver<Result<Config, String>>>,
-    kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
     /// Ctrl 键当前是否按住(键盘事件携带 mods;Ctrl+点击打开
     /// OSC 8 超链接时用 —— 指针事件不带修饰键状态)。
     ctrl_held: bool,
@@ -302,8 +318,6 @@ pub struct TayApp {
     /// 持久剪贴板(Wayland 上数据归属存活连接:每用新建即弃可能丢数据,
     /// 且每次 new 都有往返开销 —— 常驻一个实例,全部读写复用)。
     clipboard: Option<arboard::Clipboard>,
-    /// 状态 toast(QuickSelect 反馈等):(消息, 置入时间)。
-    status_msg: Option<(String, Instant)>,
 }
 
 /// GPU surface 生命周期(对应窗口层 surface 状态,架构 §5.1):
@@ -376,8 +390,8 @@ impl TayApp {
         hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
         wake: Arc<UnixStream>,
     ) -> Self {
-        let (tabs, active_tab) = Tabs::new(TabSession::empty());
-        let hotkey_status = format!("{}: requesting system binding", config.global_shortcut);
+        let (sessions, active_pane) = Sessions::new(PaneSession::empty());
+        let hotkey_status = format!("{}：正在请求全局快捷键", config.global_shortcut);
         Self {
             termination: crate::shutdown::Termination::install(&wake)
                 .expect("install termination handlers"),
@@ -388,25 +402,25 @@ impl TayApp {
             bench,
             instance: None,
             renderer: None,
-            tabs,
-            active_tab,
+            sessions,
+            layouts: vec![PaneTab {
+                root: Layout::leaf(active_pane),
+                focused: active_pane,
+                zoomed: false,
+            }],
+            divider_drag: None,
+            pane_output_dirty: false,
+            pane_smoke: std::env::var_os("TAY_PANES_SMOKE").map(|path| (path.into(), 0)),
+            active_pane,
             settings_open: false,
             hotkey_status,
+            tray_status_tx: None,
             chrome_hover: None,
             maximized: false,
             editing: None,
             dims: None,
-            preedit: None,
-            sel: None,
-            sel_epoch: AnchorEpoch::default(),
-            dragging: false,
-            scrollbar_drag: None,
             scrollbar_smoke: std::env::var_os("TAY_SCROLLBAR").map(|_| 0),
-            scroll_px: 0.0,
             vis: crate::visibility::VisibilityController::new(480),
-            quick: None,
-            vi_search_query: None,
-            view: crate::view::ViewMap::default(),
             gpu_phase: GpuPhase::Ready,
             layer_h: 480,
             shown_once: false,
@@ -434,18 +448,16 @@ impl TayApp {
             slowui_at_start,
             config_mtime: None,
             config_reload: None,
-            kitty_down: Default::default(),
             ctrl_held: false,
             config_error_at: None,
             clipboard: arboard::Clipboard::new().ok(),
-            status_msg: None,
         }
     }
 
     /// 呼出(margin 动画到 0;状态机见 visibility.rs,
     /// 此处提交 margin + 重绘;无会话时先启动新会话)。
     fn show(&mut self, ctx: &mut Ctx<'_>) {
-        if self.tabs[self.active_tab].sender.is_none()
+        if self.sessions[self.active_pane].sender.is_none()
             && let Some((cols, rows)) = self.dims
         {
             match self.start_session(cols, rows) {
@@ -470,8 +482,8 @@ impl TayApp {
 
     /// 收起。
     fn hide(&mut self, ctx: &mut Ctx<'_>) {
-        self.scrollbar_drag = None;
-        self.dragging = false;
+        self.sessions[self.active_pane].ui.scrollbar_drag = None;
+        self.sessions[self.active_pane].ui.dragging = false;
         ctx.request_keyboard(false, false);
         match self.vis.hide(self.config.animation_ms) {
             crate::visibility::VisOutcome::None => {}
@@ -482,7 +494,7 @@ impl TayApp {
 
     /// toggle:动画中则反向(从当前实际位置,而非动画起点)。
     fn toggle(&mut self, ctx: &mut Ctx<'_>) {
-        if self.tabs[self.active_tab].sender.is_none() {
+        if self.sessions[self.active_pane].sender.is_none() {
             self.show(ctx);
             return;
         }
@@ -509,7 +521,10 @@ impl TayApp {
                 }
             }
         }
-        if self.vis.is_hidden() {
+        // Release at the start of hiding, not when the animation finishes.
+        if !self.vis.wants_keyboard() {
+            self.sessions[self.active_pane].ui.scrollbar_drag = None;
+            self.sessions[self.active_pane].ui.dragging = false;
             ctx.request_keyboard(false, false);
         }
     }
@@ -527,8 +542,11 @@ impl TayApp {
         if let Some(margin) = self.vis.step(self.config.animation_ms) {
             ctx.set_top_margin(margin);
         }
-        if was_animating && self.vis.is_hidden() {
-            ctx.request_keyboard(false, false);
+        if self.vis.is_hidden() && self.sessions[self.active_pane].sender.is_some() {
+            if was_animating {
+                ctx.request_keyboard(false, false);
+            }
+            ctx.unmap();
         }
         if self.vis.animating() {
             // 下一动画步(~8ms 粒度,≈125 步/秒,150ms 动画 ≈ 19 步)。
@@ -585,7 +603,7 @@ impl TayApp {
         Ok((cols, rows))
     }
 
-    fn start_session(&self, cols: usize, rows: usize) -> Result<TabSession, String> {
+    fn start_session(&self, cols: usize, rows: usize) -> Result<PaneSession, String> {
         self.start_session_with(cols, rows, self.config.shell_command(), None)
     }
 
@@ -596,7 +614,7 @@ impl TayApp {
         rows: usize,
         shell: String,
         cwd: Option<std::path::PathBuf>,
-    ) -> Result<TabSession, String> {
+    ) -> Result<PaneSession, String> {
         // 终端 + PTY 事件循环线程。
         let tx = crate::events::Events::default();
         let rx = tx.clone();
@@ -650,7 +668,8 @@ impl TayApp {
         )
         .map_err(|e| format!("PTY 事件循环创建失败: {e}"))?;
         listener.attach(sender.clone());
-        Ok(TabSession {
+        Ok(PaneSession {
+            ui: Default::default(),
             worker: Some(worker),
             sender: Some(sender),
             slot: Some(slot),
@@ -667,82 +686,130 @@ impl TayApp {
         })
     }
 
-    fn install_session(&mut self, tab: TabSession) {
-        self.tabs[self.active_tab] = tab;
+    fn install_session(&mut self, tab: PaneSession) {
+        self.sessions[self.active_pane] = tab;
         self.activate_view();
     }
 
-    /// Transient gestures belong to the focused UI; session data stays in the collection.
+    /// Cancel focus-specific gestures while preserving each pane’s selection and scroll state.
     fn activate_view(&mut self) {
-        self.kitty_down.clear();
-        let tab = &mut self.tabs[self.active_tab];
-        if let Some(update) = tab
-            .slot
-            .as_ref()
-            .and_then(|slot| slot.lock().unwrap().take())
-        {
-            tab.snapshot = Some(update.snapshot);
-        }
-        tab.seen_epoch = tab
-            .snapshot
-            .as_ref()
-            .map(|s| s.meta.invalidate_epoch)
-            .unwrap_or_default();
-        self.sel = None;
-        self.quick = None;
-        self.preedit = None;
-        self.dragging = false;
-        self.scrollbar_drag = None;
-        self.vi_search_query = None;
-        self.scroll_px = 0.0;
-        self.status_msg = None;
-        self.view = Default::default();
+        self.take_snapshot(self.active_pane);
+        let pane = &mut self.sessions[self.active_pane];
+        pane.ui.dragging = false;
+        pane.ui.scrollbar_drag = None;
+        pane.ui.preedit = None;
+        pane.ui.quick = None;
+        pane.ui.kitty_down.clear();
+        self.divider_drag = None;
     }
-
     fn active_index(&self) -> usize {
-        self.tabs.position(self.active_tab)
+        self.layouts
+            .iter()
+            .position(|tab| tab.root.contains(self.active_pane))
+            .expect("pane belongs to a tab")
     }
-
-    fn switch_tab(&mut self, index: usize, ctx: &mut Ctx<'_>) {
-        let Some(id) = self.tabs.id_at(index) else {
-            return;
-        };
-        if id == self.active_tab {
+    fn focus_pane(&mut self, id: PaneId, ctx: &mut Ctx<'_>) {
+        if id == self.active_pane {
             return;
         }
-        self.active_tab = id;
+        self.sessions[self.active_pane].ui.kitty_down.clear();
+        self.sessions[self.active_pane].ui.dragging = false;
+        self.sessions[self.active_pane].ui.quick = None;
+        self.sessions[self.active_pane].ui.preedit = None;
+        self.active_pane = id;
+        let index = self.active_index();
+        self.layouts[index].focused = id;
         self.activate_view();
         self.resize_active();
+        let _ = self.build_grid();
+        self.set_ime_area(ctx, self.cursor_pos());
         ctx.request_redraw();
     }
-
-    fn resize_active(&self) {
-        if let (Some((cols, rows)), Some(r), Some(sender)) = (
-            self.dims,
-            &self.renderer,
-            &self.tabs[self.active_tab].sender,
-        ) {
-            let (cw, ch) = r.cell_size();
-            let _ = sender.send(SessionCommand::Resize(WindowSize {
-                num_cols: cols as u16,
-                num_lines: rows as u16,
-                cell_width: cw.round() as u16,
-                cell_height: ch.round() as u16,
-            }));
+    fn switch_tab(&mut self, index: usize, ctx: &mut Ctx<'_>) {
+        let Some(tab) = self.layouts.get(index) else {
+            return;
+        };
+        self.focus_pane(tab.focused, ctx);
+    }
+    fn pane_geometry(&self) -> (Vec<(PaneId, Rect)>, Vec<Divider>) {
+        let (cols, rows) = self.dims.unwrap_or((80, 24));
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        };
+        let tab = &self.layouts[self.active_index()];
+        let (w, h) = tab.root.minimum();
+        if tab.zoomed || cols < w || rows < h {
+            (vec![(self.active_pane, bounds)], vec![])
+        } else {
+            tab.root.geometry(bounds)
         }
     }
-
+    fn pane_rect(&self) -> Rect {
+        self.pane_geometry()
+            .0
+            .into_iter()
+            .find(|(id, _)| *id == self.active_pane)
+            .map(|(_, r)| r)
+            .unwrap_or_default()
+    }
+    fn pane_size(&self) -> (usize, usize) {
+        let rect = self.pane_rect();
+        (rect.w.max(1), rect.h.max(1))
+    }
+    fn resize_active(&self) {
+        let (cw, ch) = self
+            .renderer
+            .as_ref()
+            .map(|r| r.cell_size())
+            .unwrap_or((8.0, 16.0));
+        for (id, rect) in self.pane_geometry().0 {
+            if let Some(sender) = &self.sessions[id].sender {
+                let _ = sender.send(SessionCommand::Resize(WindowSize {
+                    num_cols: rect.w.max(1) as u16,
+                    num_lines: rect.h.max(1) as u16,
+                    cell_width: cw.round() as u16,
+                    cell_height: ch.round() as u16,
+                }));
+            }
+        }
+    }
     /// 优雅退出:把标签骨架写入会话文件(`tay resurrect` 恢复)。
     /// 保存失败只记日志,不阻断退出(quit 语义优先)。
     fn write_session_file(&self) {
         let tabs: Vec<_> = self
-            .tabs
+            .layouts
             .iter()
-            .filter(|(_, tab)| tab.sender.is_some())
-            .map(|(_, tab)| crate::persist::PersistTab {
-                shell: tab.shell.clone(),
-                cwd: tab.pid.and_then(crate::persist::cwd_of),
-                title: tab.title.clone(),
+            .filter_map(|tab| {
+                let ids = tab.root.ids();
+                if ids.iter().all(|id| self.sessions[*id].sender.is_none()) {
+                    return None;
+                }
+                let panes: Vec<_> = ids
+                    .iter()
+                    .map(|id| {
+                        let p = &self.sessions[*id];
+                        crate::persist::PersistPane {
+                            shell: p.shell.clone(),
+                            cwd: p.pid.and_then(crate::persist::cwd_of),
+                            title: p.title.clone(),
+                        }
+                    })
+                    .collect();
+                let first = &panes[0];
+                Some(crate::persist::PersistTab {
+                    shell: first.shell.clone(),
+                    cwd: first.cwd.clone(),
+                    title: first.title.clone(),
+                    layout: tab
+                        .root
+                        .filter_map(&mut |id| ids.iter().position(|old| *old == id)),
+                    focused: ids.iter().position(|id| *id == tab.focused).unwrap_or(0),
+                    zoomed: tab.zoomed,
+                    panes,
+                })
             })
             .collect();
         match crate::persist::save(&tabs, self.active_index()) {
@@ -773,13 +840,13 @@ impl TayApp {
         for worker in &self.retiring {
             worker.request_stop();
         }
-        for (_, tab) in self.tabs.iter() {
+        for (_, tab) in self.sessions.iter() {
             if let Some(worker) = &tab.worker {
                 worker.request_stop();
             }
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        for (_, tab) in self.tabs.iter_mut() {
+        for (_, tab) in self.sessions.iter_mut() {
             if let Some(worker) = &mut tab.worker
                 && !worker.finish_until(deadline)
             {
@@ -791,7 +858,7 @@ impl TayApp {
         }
         // Give killed children a shared short window to be reaped by Pty::drop.
         let reap_deadline = Instant::now() + Duration::from_millis(100);
-        for (_, tab) in self.tabs.iter_mut() {
+        for (_, tab) in self.sessions.iter_mut() {
             if let Some(worker) = &mut tab.worker {
                 let _ = worker.finish_until(reap_deadline);
             }
@@ -802,69 +869,221 @@ impl TayApp {
     }
 
     fn new_tab(&mut self, ctx: &mut Ctx<'_>) {
-        if self.tabs[self.active_tab].sender.is_none() {
+        if self.sessions[self.active_pane].sender.is_none() {
             self.show(ctx);
             return;
         }
-        if self.tabs.len() >= 24 {
-            self.status("最多 24 个标签页", ctx);
+        if self.sessions.len() >= 24 {
+            self.status("最多 24 个终端会话", ctx);
             return;
         }
         let (cols, rows) = self.dims.unwrap_or((80, 24));
         match self.start_session(cols, rows) {
-            Ok(tab) => {
-                self.tabs.insert(tab);
-                self.switch_tab(self.tabs.len() - 1, ctx);
+            Ok(pane) => {
+                let id = self.sessions.insert(pane);
+                self.layouts.push(PaneTab {
+                    root: Layout::leaf(id),
+                    focused: id,
+                    zoomed: false,
+                });
+                self.focus_pane(id, ctx);
             }
             Err(e) => self.status(format!("新建标签失败: {e}"), ctx),
         }
     }
-
+    fn split_pane(&mut self, axis: Axis, ctx: &mut Ctx<'_>) {
+        let index = self.active_index();
+        if self.sessions.len() >= 24 || self.layouts[index].root.ids().len() >= 8 {
+            self.status("每标签最多 8 个窗格,共 24 个会话", ctx);
+            return;
+        }
+        let rect = self.pane_rect();
+        if self.layouts[index].zoomed
+            || self.pane_geometry().0.len() < self.layouts[index].root.ids().len()
+            || match axis {
+                Axis::Columns => rect.w < 17,
+                Axis::Rows => rect.h < 7,
+            }
+        {
+            self.status("窗格太小或已最大化,请先恢复布局", ctx);
+            return;
+        }
+        let pane = &self.sessions[self.active_pane];
+        let cwd = pane
+            .pid
+            .and_then(crate::persist::cwd_of)
+            .map(std::path::PathBuf::from);
+        let shell = if pane.shell.is_empty() {
+            self.config.shell_command()
+        } else {
+            pane.shell.clone()
+        };
+        let (cols, rows) = match axis {
+            Axis::Columns => (rect.w / 2, rect.h),
+            Axis::Rows => (rect.w, rect.h / 2),
+        };
+        match self.start_session_with(cols, rows, shell, cwd) {
+            Ok(pane) => {
+                let id = self.sessions.insert(pane);
+                self.layouts[index].root.split(self.active_pane, id, axis);
+                self.focus_pane(id, ctx);
+                log::info!(
+                    "pane split: {:?}, {} panes",
+                    axis,
+                    self.layouts[index].root.ids().len()
+                );
+            }
+            Err(e) => self.status(format!("分屏失败: {e}"), ctx),
+        }
+    }
+    fn next_pane(&mut self, ctx: &mut Ctx<'_>) {
+        let ids = self.layouts[self.active_index()].root.ids();
+        let i = ids
+            .iter()
+            .position(|id| *id == self.active_pane)
+            .unwrap_or(0);
+        self.focus_pane(ids[(i + 1) % ids.len()], ctx);
+    }
+    fn zoom_pane(&mut self, ctx: &mut Ctx<'_>) {
+        self.divider_drag = None;
+        let index = self.active_index();
+        if self.layouts[index].root.ids().len() == 1 {
+            self.layouts[index].zoomed = false;
+            return;
+        }
+        self.layouts[index].zoomed = !self.layouts[index].zoomed;
+        self.sessions[self.active_pane].ui.sel = None;
+        self.sessions[self.active_pane].ui.quick = None;
+        self.resize_active();
+        ctx.request_redraw();
+    }
+    fn pane_pointer(&mut self, ctx: &mut Ctx<'_>, event: &WEvent) -> bool {
+        if let WEvent::PointerMoved { x, y } = event
+            && let Some(divider) = self.divider_drag.clone()
+        {
+            if let Some((col, row)) = self.window_cell(*x, *y) {
+                let (position, extent) = match divider.axis {
+                    Axis::Columns => (col.saturating_sub(divider.parent.x), divider.parent.w),
+                    Axis::Rows => (row.saturating_sub(divider.parent.y), divider.parent.h),
+                };
+                let ratio = (position.saturating_mul(1000) / extent.saturating_sub(1).max(1))
+                    .min(950) as u16;
+                let index = self.active_index();
+                self.layouts[index].root.set_ratio(&divider.path, ratio);
+                self.resize_active();
+                ctx.request_redraw();
+            }
+            return true;
+        }
+        if let WEvent::PointerButton {
+            button: MouseButtonIdx::Left,
+            pressed,
+            x,
+            y,
+        } = event
+        {
+            if !pressed && self.divider_drag.take().is_some() {
+                return true;
+            }
+            if *pressed && let Some((col, row)) = self.window_cell(*x, *y) {
+                let (leaves, dividers) = self.pane_geometry();
+                if let Some(divider) = dividers.into_iter().find(|d| d.rect.contains(col, row)) {
+                    self.divider_drag = Some(divider);
+                    self.sessions[self.active_pane].ui.dragging = false;
+                    return true;
+                }
+                if let Some((id, _)) = leaves.into_iter().find(|(_, r)| r.contains(col, row)) {
+                    self.focus_pane(id, ctx);
+                }
+            }
+        }
+        false
+    }
     fn close_tab(&mut self, index: usize, ctx: &mut Ctx<'_>) {
-        let Some(id) = self.tabs.id_at(index) else {
+        let Some(tab) = self.layouts.get(index) else {
             return;
         };
-        self.remove_session(id);
-        if self.tabs[self.active_tab].sender.is_none() {
+        let ids = tab.root.ids();
+        for id in ids {
+            self.remove_session(id);
+        }
+        self.resize_active();
+        if self.sessions[self.active_pane].sender.is_none() {
             self.hide(ctx);
         }
         ctx.request_redraw();
     }
-
-    fn remove_session(&mut self, id: TabId) {
-        let index = self.tabs.position(id);
-        if let Some(mut worker) = self.tabs[id].worker.take() {
+    fn close_pane(&mut self, ctx: &mut Ctx<'_>) {
+        self.remove_session(self.active_pane);
+        self.resize_active();
+        if self.sessions[self.active_pane].sender.is_none() {
+            self.hide(ctx);
+        }
+        ctx.request_redraw();
+    }
+    fn remove_session(&mut self, id: PaneId) {
+        self.divider_drag = None;
+        if let Some(mut worker) = self.sessions[id].worker.take() {
             worker.request_stop();
-            // UI must not wait on a child. Keep its handle until the next wake/shutdown.
             if worker.is_finished() {
                 let _ = worker.finish_until(Instant::now());
             } else {
                 self.retiring.push(worker);
             }
         }
-        if self.tabs.len() == 1 {
-            self.tabs[id] = TabSession::empty();
+        let index = self
+            .layouts
+            .iter()
+            .position(|tab| tab.root.contains(id))
+            .expect("pane tab");
+        if let Some(root) = self.layouts[index].root.remove(id) {
+            self.layouts[index].root = root;
+            if self.layouts[index].root.ids().len() == 1 {
+                self.layouts[index].zoomed = false;
+            }
+            if self.layouts[index].focused == id {
+                self.layouts[index].focused = self.layouts[index].root.ids()[0];
+            }
+        } else if self.layouts.len() > 1 {
+            self.layouts.remove(index);
+        } else {
+            self.sessions[id] = PaneSession::empty();
+            self.layouts[index].zoomed = false;
+            self.active_pane = id;
             self.activate_view();
             return;
         }
-        if id == self.active_tab {
-            let next = if index == 0 { 1 } else { index - 1 };
-            self.active_tab = self.tabs.id_at(next).expect("remaining tab");
+        if self.active_pane == id {
+            self.active_pane = self.layouts[index.min(self.layouts.len() - 1)].focused;
             self.activate_view();
-            self.resize_active();
         }
-        self.tabs.remove(id);
+        self.sessions.remove(id);
     }
-
-    fn background_exits(&mut self) -> Vec<TabId> {
+    fn background_exits(&mut self) -> Vec<PaneId> {
         let mut exited = Vec::new();
-        for (id, tab) in self.tabs.iter_mut() {
-            if id == self.active_tab {
+        let visible = self
+            .pane_geometry()
+            .0
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        for (id, tab) in self.sessions.iter_mut() {
+            if id == self.active_pane {
                 continue;
             }
             for event in tab.rx.drain() {
                 match event {
-                    Event::Title(title) => tab.title = title,
+                    Event::Title(title) => {
+                        tab.title = title;
+                        self.pane_output_dirty = true;
+                    }
+                    Event::Wakeup if visible.contains(&id) => self.pane_output_dirty = true,
+                    Event::Bell => {
+                        tab.bell_until = Some(Instant::now() + BELL_FLASH);
+                        if visible.contains(&id) {
+                            self.pane_output_dirty = true;
+                        }
+                    }
                     Event::Exit | Event::ChildExit(_) => {
                         exited.push(id);
                         break;
@@ -877,7 +1096,27 @@ impl TayApp {
     }
 
     fn chrome_items(&self, cols: usize) -> Vec<crate::chrome::Item> {
-        let titles: Vec<_> = self.tabs.iter().map(|(_, tab)| tab.title.clone()).collect();
+        let titles: Vec<_> = self
+            .layouts
+            .iter()
+            .map(|tab| {
+                let title = &self.sessions[tab.focused].title;
+                let n = tab.root.ids().len();
+                if n > 1 {
+                    format!(
+                        "{title} [{}/{n}]",
+                        tab.root
+                            .ids()
+                            .iter()
+                            .position(|id| *id == tab.focused)
+                            .unwrap_or(0)
+                            + 1
+                    )
+                } else {
+                    title.clone()
+                }
+            })
+            .collect();
         crate::chrome::layout(
             cols,
             &titles,
@@ -887,7 +1126,6 @@ impl TayApp {
             &clock_text(),
         )
     }
-
     fn save_appearance(&mut self, ctx: &mut Ctx<'_>, previous: &Config) {
         if let Err(e) = self.config.save_appearance_delta(previous) {
             self.status(format!("设置已应用但保存失败: {e}"), ctx);
@@ -895,7 +1133,7 @@ impl TayApp {
     }
 
     fn update_session_colors(&self) {
-        for (_, tab) in self.tabs.iter() {
+        for (_, tab) in self.sessions.iter() {
             if let Some(sender) = &tab.sender {
                 let _ = sender.send(SessionCommand::SetColors(self.config.colors.clone()));
             }
@@ -1017,26 +1255,66 @@ impl TayApp {
         active: usize,
     ) -> bool {
         let mut restored = Vec::new();
-        for (i, pt) in saved.iter().take(24).enumerate() {
-            let cwd = pt.cwd.as_deref().map(std::path::PathBuf::from);
-            match self.start_session_with(cols, rows, pt.shell.clone(), cwd) {
-                Ok(mut tab) => {
-                    tab.title = pt.title.clone();
-                    if restored.is_empty() {
-                        self.install_session(tab);
-                    } else {
-                        self.tabs.insert(tab);
-                    }
-                    restored.push(i);
+        let mut layouts = Vec::new();
+        let mut installed = false;
+        for (index, tab) in saved.iter().take(24).enumerate() {
+            let legacy = crate::persist::PersistPane {
+                shell: tab.shell.clone(),
+                cwd: tab.cwd.clone(),
+                title: tab.title.clone(),
+            };
+            let panes = if tab.panes.is_empty() {
+                std::slice::from_ref(&legacy)
+            } else {
+                tab.panes.as_slice()
+            };
+            let mut mapping = Vec::new();
+            for (i, pane) in panes.iter().take(8).enumerate() {
+                if self.sessions.len() >= 24 && installed {
+                    mapping.push(None);
+                    continue;
                 }
-                Err(error) => log::warn!("恢复标签 {i} 失败: {error}"),
+                let cwd = pane.cwd.as_deref().map(std::path::PathBuf::from);
+                match self.start_session_with(cols, rows, pane.shell.clone(), cwd) {
+                    Ok(mut session) => {
+                        session.title = pane.title.clone();
+                        let id = if !installed {
+                            self.install_session(session);
+                            installed = true;
+                            self.active_pane
+                        } else {
+                            self.sessions.insert(session)
+                        };
+                        mapping.push(Some(id));
+                    }
+                    Err(error) => {
+                        log::warn!("恢复标签 {index} 窗格 {i} 失败: {error}");
+                        mapping.push(None);
+                    }
+                }
+            }
+            let source = tab.layout.clone().unwrap_or_else(|| Layout::leaf(0));
+            if let Some(root) = source.filter_map(&mut |i| mapping.get(i).copied().flatten()) {
+                let focused = mapping
+                    .get(tab.focused)
+                    .copied()
+                    .flatten()
+                    .filter(|id| root.contains(*id))
+                    .unwrap_or_else(|| root.ids()[0]);
+                layouts.push(PaneTab {
+                    root,
+                    focused,
+                    zoomed: tab.zoomed,
+                });
+                restored.push(index);
             }
         }
-        if restored.is_empty() {
+        if layouts.is_empty() {
             return false;
         }
+        self.layouts = layouts;
         let index = restored_active_index(&restored, active);
-        self.active_tab = self.tabs.id_at(index).expect("restored active tab");
+        self.active_pane = self.layouts[index].focused;
         self.activate_view();
         self.resize_active();
         log::info!("resurrect: 恢复 {} 个标签,激活 {index}", restored.len());
@@ -1090,6 +1368,11 @@ impl TayApp {
                 crate::ipc::accept_loop(listener, self.ipc_tx.clone(), self.wake.clone());
             }
             if self.shot.is_none() && self.bench.is_none() {
+                self.tray_status_tx = Some(crate::tray::spawn(
+                    self.ipc_tx.clone(),
+                    self.wake.clone(),
+                    self.hotkey_status.clone(),
+                ));
                 crate::hotkey::spawn(
                     self.hotkey_tx.clone(),
                     self.wake.clone(),
@@ -1108,10 +1391,12 @@ impl TayApp {
 
     /// 当前光标位置(显示坐标;唯一来源 = 会话快照)。
     fn cursor_pos(&self) -> (usize, usize) {
-        let Some(snap) = &self.tabs[self.active_tab].snapshot else {
+        let Some(snap) = &self.sessions[self.active_pane].snapshot else {
             return (0, 0);
         };
-        self.view
+        self.sessions[self.active_pane]
+            .ui
+            .view
             .cursor_position(snap.cursor, snap.dims.0)
             .map(|p| (p.col, p.row))
             .unwrap_or((0, 0))
@@ -1122,8 +1407,11 @@ impl TayApp {
             let (cw, ch) = r.cell_size();
             let pad = r.padding();
             ctx.set_ime_cursor_area(
-                col as f32 * cw + pad,
-                (row + crate::chrome::rows(&self.config, self.settings_open)) as f32 * ch + pad,
+                (col + self.pane_rect().x) as f32 * cw + pad,
+                (row + self.pane_rect().y + crate::chrome::rows(&self.config, self.settings_open))
+                    as f32
+                    * ch
+                    + pad,
                 cw,
                 ch,
             );
@@ -1150,23 +1438,16 @@ impl TayApp {
             .saturating_sub(crate::chrome::rows(&self.config, self.settings_open))
             .max(1);
         if Some((cols, rows)) != self.dims {
-            self.scrollbar_drag = None;
+            self.sessions[self.active_pane].ui.scrollbar_drag = None;
             log::info!("网格调整 {cols}×{rows}");
             self.dims = Some((cols, rows));
             // 行号重排:显示坐标选区/QuickSelect 同属旧布局
             // (块/图像失效归会话线程,随 Resize 命令同批发布)。
-            self.sel = None;
-            self.quick = None;
-            // 终端内核 resize 归会话线程(架构 §3):PTY 与网格一并更新。
-            if let Some(sender) = &self.tabs[self.active_tab].sender {
-                let _ = sender.send(SessionCommand::Resize(WindowSize {
-                    num_lines: rows as u16,
-                    num_cols: cols as u16,
-                    cell_width: cw.round() as u16,
-                    cell_height: ch.round() as u16,
-                }));
-            }
+            self.sessions[self.active_pane].ui.sel = None;
+            self.sessions[self.active_pane].ui.quick = None;
         }
+        self.divider_drag = None;
+        self.resize_active();
         // IME 光标矩形按新单元格尺寸重设(热重载 pad 后必走这里)。
         let pos = self.cursor_pos();
         self.set_ime_area(ctx, pos);
@@ -1199,26 +1480,27 @@ impl TayApp {
         self.gpu_phase = self.gpu_phase.on_height_request();
     }
 
-    fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
-        let (cw, ch) = self.renderer.as_ref()?.cell_size();
-        let (cols, rows) = self.dims?;
-        let pad = self.renderer.as_ref()?.padding() as f64;
+    fn window_cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let r = self.renderer.as_ref()?;
+        let (cw, ch) = r.cell_size();
+        let pad = r.padding() as f64;
         let c = ((x - pad) / cw as f64).floor();
-        let r = ((y - pad) / ch as f64).floor()
+        let row = ((y - pad) / ch as f64).floor()
             - crate::chrome::rows(&self.config, self.settings_open) as f64;
-        if c < 0.0 || r < 0.0 || c as usize >= cols || r as usize >= rows {
-            None
-        } else {
-            Some((c as usize, r as usize))
-        }
+        (c >= 0.0 && row >= 0.0).then_some((c as usize, row as usize))
     }
-
+    fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let (c, r) = self.window_cell(x, y)?;
+        let pane = self.pane_rect();
+        pane.contains(c, r)
+            .then_some((c.saturating_sub(pane.x), r.saturating_sub(pane.y)))
+    }
     /// 显示单元 → OSC 8 超链接 URI(显示行经视图映射回网格行,
     /// 与选区/光标共用同一转换;无链接 → None)。
     fn link_at_cell(&self, col: usize, row: usize) -> Option<Arc<str>> {
-        let snap = self.tabs[self.active_tab].snapshot.as_ref()?;
+        let snap = self.sessions[self.active_pane].snapshot.as_ref()?;
         let cols = snap.dims.0;
-        let gl = self.view.row_to_grid(row)?;
+        let gl = self.sessions[self.active_pane].ui.view.row_to_grid(row)?;
         let first = -(snap.display_offset as i32);
         let idx = (gl - first) as usize * cols + col;
         let link = snap.cells.get(idx)?.hyperlink?;
@@ -1240,12 +1522,16 @@ impl TayApp {
     /// 它的 SessionMeta —— 网格与锚点必然同一版本(架构 §3);
     /// 尚未收到快照(会话刚启动)时渲染空白网格。
     fn build_grid(&mut self) -> tay_render::Grid {
-        let snap = self.tabs[self.active_tab].snapshot.clone();
+        self.build_pane_grid(self.active_pane, self.pane_rect())
+    }
+
+    fn build_pane_grid(&mut self, id: PaneId, rect: Rect) -> tay_render::Grid {
+        let snap = self.sessions[id].snapshot.clone();
         // 快照尺寸优先(会话版本),尚未有快照时回退到本地布局值。
         let (cols, rows) = snap
             .as_ref()
             .map(|s| s.dims)
-            .unwrap_or(self.dims.unwrap_or((80, 24)));
+            .unwrap_or((rect.w.max(1), rect.h.max(1)));
         let (off, total_lines, meta) = match &snap {
             Some(s) => (s.display_offset as i32, s.total_lines, s.meta),
             None => (0, rows, Default::default()),
@@ -1270,7 +1556,7 @@ impl TayApp {
             .map(|s| {
                 crate::view::fold_ranges_to_grid(
                     &s.blocks,
-                    &self.tabs[self.active_tab].folded,
+                    &self.sessions[id].folded,
                     meta,
                     total_lines,
                     rows,
@@ -1280,7 +1566,7 @@ impl TayApp {
         // 显示映射(架构 §2.3:TerminalView,view.rs;正向/反向
         // 转换唯一实现,绘制/命中/选区/光标共用)。
         let view = crate::view::ViewMap::new(first, last, &ranges).with_meta(meta);
-        self.view = view.clone();
+        self.sessions[id].ui.view = view.clone();
         let marker_fg = Rgb::new(0xc0, 0xa0, 0x40);
         let mut cells = vec![blank; rows * cols];
         for (row, e) in view.entries.iter().enumerate() {
@@ -1331,7 +1617,7 @@ impl TayApp {
         }
         // 可视铃:网格背景向闪光色衰减混色(剩余时长 → 强度)。
         // 覆盖全部单元(含折叠占位行),整面统一闪烁。
-        if let Some(until) = self.tabs[self.active_tab].bell_until {
+        if let Some(until) = self.sessions[id].bell_until {
             let remain = until.saturating_duration_since(Instant::now());
             let k =
                 BELL_FLASH_MAX * (remain.as_secs_f32() / BELL_FLASH.as_secs_f32()).clamp(0.0, 1.0);
@@ -1366,7 +1652,7 @@ impl TayApp {
         // 无鼠标选区时渲染 vi 选区(会话侧,快照携带)。投影逻辑
         // 在 view.rs(折叠感知 + 列序归一)。
         let selection = crate::view::selection_to_display(
-            self.sel,
+            self.sessions[id].ui.sel,
             snap.as_ref().and_then(|s| s.selection),
             meta,
             &view,
@@ -1401,7 +1687,8 @@ impl TayApp {
             .unwrap_or_default();
 
         // QuickSelect 覆盖层 + vi 搜索状态栏。
-        let mut overlays: Vec<tay_render::Overlay> = self
+        let mut overlays: Vec<tay_render::Overlay> = self.sessions[id]
+            .ui
             .quick
             .as_ref()
             .map(|q| {
@@ -1415,7 +1702,7 @@ impl TayApp {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(query) = &self.vi_search_query
+        if let Some(query) = &self.sessions[id].ui.vi_search_query
             && rows > 0
         {
             overlays.push(tay_render::Overlay {
@@ -1425,7 +1712,7 @@ impl TayApp {
             });
         }
         // 状态 toast(QuickSelect 反馈等):底部一行,约 1.2s 后消失。
-        if let Some((msg, at)) = &self.status_msg
+        if let Some((msg, at)) = &self.sessions[id].ui.status_msg
             && at.elapsed() < Duration::from_millis(1200)
             && rows > 0
         {
@@ -1443,21 +1730,79 @@ impl TayApp {
             cursor: cursor_position.map(|p| (p.col, p.row)).unwrap_or((0, 0)),
             cursor_shape,
             selection,
-            preedit: self.preedit.clone(),
+            preedit: self.sessions[id].ui.preedit.clone(),
             badges,
             overlays,
             images,
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
-            scrollbar: self.build_scrollbar(rows),
+            scrollbar: self.pane_scrollbar(id, rect, rows),
         }
+    }
+
+    fn take_snapshot(&mut self, id: PaneId) {
+        let pane = &mut self.sessions[id];
+        if let Some(update) = pane
+            .slot
+            .as_ref()
+            .and_then(|slot| slot.lock().unwrap().take())
+        {
+            if pane.seen_epoch != update.snapshot.meta.invalidate_epoch {
+                pane.seen_epoch = update.snapshot.meta.invalidate_epoch;
+                pane.ui.sel = None;
+                pane.ui.quick = None;
+            }
+            let live: std::collections::BTreeSet<_> = update
+                .snapshot
+                .blocks
+                .blocks()
+                .iter()
+                .map(|b| b.id)
+                .collect();
+            pane.folded.retain(|id| live.contains(id));
+            pane.snapshot = Some(update.snapshot);
+        }
+    }
+    fn build_window_grid(&mut self) -> tay_render::Grid {
+        let focused = self.active_pane;
+        let (leaves, dividers) = self.pane_geometry();
+        if leaves.len() == 1 {
+            self.take_snapshot(focused);
+            let grid = self.build_pane_grid(focused, leaves[0].1);
+            if Some((grid.cols, grid.rows)) == self.dims {
+                return grid;
+            }
+            let (cols, rows) = self.dims.unwrap_or((80, 24));
+            return crate::composite::compose(
+                cols,
+                rows,
+                vec![(leaves[0].1, grid, true)],
+                &[],
+                &self.config.colors,
+            );
+        }
+        let mut panes = Vec::new();
+        for (id, rect) in leaves {
+            self.take_snapshot(id);
+            panes.push((rect, self.build_pane_grid(id, rect), id == focused));
+        }
+        let (cols, rows) = self.dims.unwrap_or((80, 24));
+        crate::composite::compose(cols, rows, panes, &dividers, &self.config.colors)
     }
 
     /// 滚动条指示器(终端区,不含操作栏):视口位置与占比。
     /// 无滚动历史(total ≤ rows)时返回 None。
     fn build_scrollbar(&self, term_rows: usize) -> Option<tay_render::Scrollbar> {
-        let snap = self.tabs[self.active_tab].snapshot.as_ref()?;
+        self.pane_scrollbar(self.active_pane, self.pane_rect(), term_rows)
+    }
+    fn pane_scrollbar(
+        &self,
+        id: PaneId,
+        rect: Rect,
+        term_rows: usize,
+    ) -> Option<tay_render::Scrollbar> {
+        let snap = self.sessions[id].snapshot.as_ref()?;
         if snap.mode.contains(TermMode::ALT_SCREEN) {
             return None;
         }
@@ -1468,6 +1813,9 @@ impl TayApp {
         }
         let span = (total - term_rows) as f32;
         Some(tay_render::Scrollbar {
+            right: self.renderer.as_ref().map(|renderer| {
+                renderer.padding() + (rect.x + rect.w) as f32 * renderer.cell_size().0
+            }),
             top: chrome_rows,
             extent: term_rows as f32,
             position: (snap.display_offset as f32 / span).min(1.0),
@@ -1477,8 +1825,10 @@ impl TayApp {
 
     fn scrollbar_geometry(&self) -> Option<tay_render::ScrollbarGeometry> {
         let renderer = self.renderer.as_ref()?;
-        let (_, rows) = self.dims?;
-        self.build_scrollbar(rows)?.geometry(
+        let (_, rows) = self.pane_size();
+        let mut bar = self.build_scrollbar(rows)?;
+        bar.top += self.pane_rect().y as f32;
+        bar.geometry(
             renderer.surface_size().0 as f32,
             renderer.cell_size().1,
             renderer.padding(),
@@ -1487,9 +1837,9 @@ impl TayApp {
     fn drag_scrollbar(&self, y: f32, grab: f32, epoch: AnchorEpoch) {
         if let (Some(geometry), Some(snapshot), Some(sender), Some((_, rows))) = (
             self.scrollbar_geometry(),
-            &self.tabs[self.active_tab].snapshot,
-            &self.tabs[self.active_tab].sender,
-            self.dims,
+            &self.sessions[self.active_pane].snapshot,
+            &self.sessions[self.active_pane].sender,
+            Some(self.pane_size()),
         ) {
             let offset = geometry.offset(y, grab, snapshot.total_lines.saturating_sub(rows));
             let _ = sender.send(SessionCommand::ScrollToOffset { offset, epoch });
@@ -1498,7 +1848,7 @@ impl TayApp {
 
     /// 折叠/展开光标所在命令块(Ctrl+Shift+H)。
     fn toggle_fold_at_cursor(&mut self, ctx: &mut Ctx<'_>) {
-        let Some(snap) = self.tabs[self.active_tab].snapshot.clone() else {
+        let Some(snap) = self.sessions[self.active_pane].snapshot.clone() else {
             return;
         };
         let line = snap.cursor.line;
@@ -1508,7 +1858,7 @@ impl TayApp {
     /// 折叠/展开包含网格行 `line` 的命令块(折叠按稳定 BlockId,
     /// 不依赖可能变化的行号 —— 架构 §3)。
     fn toggle_fold_line(&mut self, line: i32, ctx: &mut Ctx<'_>) {
-        let Some(snap) = self.tabs[self.active_tab].snapshot.clone() else {
+        let Some(snap) = self.sessions[self.active_pane].snapshot.clone() else {
             return;
         };
         let anchor = HistoryAnchor(line + snap.meta.cum_scroll);
@@ -1518,10 +1868,10 @@ impl TayApp {
         let Some(block) = snap.blocks.blocks().iter().find(|b| b.prompt == prompt) else {
             return;
         };
-        let folded = if self.tabs[self.active_tab].folded.remove(&block.id) {
+        let folded = if self.sessions[self.active_pane].folded.remove(&block.id) {
             false
         } else {
-            self.tabs[self.active_tab].folded.insert(block.id);
+            self.sessions[self.active_pane].folded.insert(block.id);
             true
         };
         log::info!(
@@ -1531,20 +1881,23 @@ impl TayApp {
             block.id.0
         );
         // 折叠改变布局:关闭 QuickSelect 与选区。
-        self.quick = None;
-        self.sel = None;
+        self.sessions[self.active_pane].ui.quick = None;
+        self.sessions[self.active_pane].ui.sel = None;
         ctx.request_redraw();
     }
 
     /// 显示单元 → 稳定选择点(网格行 + 与映射同源的 meta →
     /// 绝对锚点)。
     fn anchor_at(&self, cell: (usize, usize)) -> Option<(HistoryAnchor, u32)> {
-        let line = self.view.row_to_grid(cell.1)?;
+        let line = self.sessions[self.active_pane]
+            .ui
+            .view
+            .row_to_grid(cell.1)?;
         if line < 0 {
             return None;
         }
         Some((
-            HistoryAnchor(line + self.view.meta.cum_scroll),
+            HistoryAnchor(line + self.sessions[self.active_pane].ui.view.meta.cum_scroll),
             cell.0 as u32,
         ))
     }
@@ -1552,16 +1905,16 @@ impl TayApp {
     /// 点击是否落在退出码徽章上(显示点 → 网格点,坐标映射的
     /// 反向转换;命中返回该块的提示符所在网格点)。
     fn badge_line_at(&self, p: DisplayPoint) -> Option<GridPoint> {
-        let grid_line = self.view.row_to_grid(p.row)?;
+        let grid_line = self.sessions[self.active_pane].ui.view.row_to_grid(p.row)?;
         if grid_line < 0 {
             return None;
         }
-        let snap = self.tabs[self.active_tab].snapshot.as_ref()?;
+        let snap = self.sessions[self.active_pane].snapshot.as_ref()?;
         let cum = snap.meta.cum_scroll;
         snap.blocks
             .nonzero_exit_at(HistoryAnchor(grid_line + cum))
             .and_then(|_| {
-                let cols = self.dims.map(|(c, _)| c).unwrap_or(80);
+                let cols = self.pane_size().0;
                 let badge_start = cols.saturating_sub(8);
                 (p.col >= badge_start).then_some(GridPoint {
                     line: grid_line,
@@ -1574,33 +1927,33 @@ impl TayApp {
     /// TAY_IME 验收钩子复用)。
     fn ime_commit(&mut self, text: String, ctx: &mut Ctx<'_>) {
         log::info!("IME 提交 {} 字节", text.len());
-        if let Some(sender) = &self.tabs[self.active_tab].sender
+        if let Some(sender) = &self.sessions[self.active_pane].sender
             && !sender.send(SessionCommand::Input(text.into_bytes()))
         {
             // 拒绝有可见反馈(统一预算满:终端积压)。
             self.status("输入被拒绝:终端积压,请稍后再试", ctx);
         }
-        self.preedit = None;
+        self.sessions[self.active_pane].ui.preedit = None;
         ctx.request_redraw();
     }
 
     /// vi 复制模式切换(Ctrl+Shift+Space;命令 → 会话)。
     fn toggle_vi(&mut self, ctx: &mut Ctx<'_>) {
-        if let Some(sender) = &self.tabs[self.active_tab].sender {
+        if let Some(sender) = &self.sessions[self.active_pane].sender {
             let _ = sender.send(SessionCommand::ToggleVi);
-            self.vi_search_query = None;
+            self.sessions[self.active_pane].ui.vi_search_query = None;
             ctx.request_redraw();
         }
     }
 
     fn paste_clipboard(&mut self, ctx: &mut Ctx<'_>) {
         if let Some(text) = self.get_clipboard() {
-            let bracketed = self.tabs[self.active_tab]
+            let bracketed = self.sessions[self.active_pane]
                 .snapshot
                 .as_ref()
                 .is_some_and(|s| s.mode.contains(TermMode::BRACKETED_PASTE));
             let bytes = crate::input::paste_bytes(&text, bracketed);
-            if let Some(sender) = &self.tabs[self.active_tab].sender
+            if let Some(sender) = &self.sessions[self.active_pane].sender
                 && !sender.send(SessionCommand::Input(bytes))
             {
                 self.status("粘贴被拒绝:终端积压,请稍后再试", ctx);
@@ -1636,11 +1989,14 @@ impl TayApp {
         };
         if (pressed || kitty_flags.report_events)
             && let Some(bytes) = crate::keys::translate_kitty(key, mods, &kitty_flags, event)
-            && let Some(sender) = &self.tabs[self.active_tab].sender
+            && let Some(sender) = &self.sessions[self.active_pane].sender
         {
             if sender.send(SessionCommand::Input(bytes)) {
                 if pressed && kitty_flags.report_events {
-                    self.kitty_down.insert(key.raw_code, key.clone());
+                    self.sessions[self.active_pane]
+                        .ui
+                        .kitty_down
+                        .insert(key.raw_code, key.clone());
                 }
             } else {
                 self.status("输入被拒绝:终端积压,请稍后再试", ctx);
@@ -1655,23 +2011,25 @@ impl TayApp {
         use tay_window::NamedKey as N;
 
         // 搜索输入中:字符入查询,Enter 执行,Esc 取消。
-        if self.vi_search_query.is_some() {
+        if self.sessions[self.active_pane].ui.vi_search_query.is_some() {
             match key.key {
                 K::Named(N::Escape) => {
-                    self.vi_search_query = None;
+                    self.sessions[self.active_pane].ui.vi_search_query = None;
                     ctx.request_redraw();
                 }
-                K::Named(N::Enter) if self.vi_search_query.is_some() => {
+                K::Named(N::Enter)
+                    if self.sessions[self.active_pane].ui.vi_search_query.is_some() =>
+                {
                     self.vi_search_next(1, ctx);
                 }
                 K::Named(N::Backspace) => {
-                    if let Some(q) = self.vi_search_query.as_mut() {
+                    if let Some(q) = self.sessions[self.active_pane].ui.vi_search_query.as_mut() {
                         q.pop();
                     }
                     ctx.request_redraw();
                 }
                 K::Char(c) => {
-                    if let Some(q) = self.vi_search_query.as_mut() {
+                    if let Some(q) = self.sessions[self.active_pane].ui.vi_search_query.as_mut() {
                         q.push(c);
                     }
                     ctx.request_redraw();
@@ -1697,7 +2055,7 @@ impl TayApp {
             _ => None,
         };
         if let Some(m) = motion {
-            if let Some(sender) = &self.tabs[self.active_tab].sender {
+            if let Some(sender) = &self.sessions[self.active_pane].sender {
                 let _ = sender.send(SessionCommand::ViMotion(m));
             }
             ctx.request_redraw();
@@ -1707,8 +2065,8 @@ impl TayApp {
             // yank:复制选区并退出 vi(应答在 ProxyWake 排空 → 剪贴板)。
             K::Char('y') => {
                 if let (Some(sender), Some(reply)) = (
-                    &self.tabs[self.active_tab].sender,
-                    self.tabs[self.active_tab].reply_tx.clone(),
+                    &self.sessions[self.active_pane].sender,
+                    self.sessions[self.active_pane].reply_tx.clone(),
                 ) {
                     let _ = sender.send(SessionCommand::SelectionToString { reply });
                     let _ = sender.send(SessionCommand::ToggleVi);
@@ -1717,14 +2075,14 @@ impl TayApp {
             }
             // 搜索。
             K::Char('/') => {
-                self.vi_search_query = Some(String::new());
+                self.sessions[self.active_pane].ui.vi_search_query = Some(String::new());
                 ctx.request_redraw();
             }
             K::Char('n') => self.vi_search_next(1, ctx),
             K::Char('N') => self.vi_search_next(-1, ctx),
             // 退出。
             K::Named(N::Escape) | K::Char('q') => {
-                if let Some(sender) = &self.tabs[self.active_tab].sender {
+                if let Some(sender) = &self.sessions[self.active_pane].sender {
                     let _ = sender.send(SessionCommand::ToggleVi);
                 }
                 ctx.request_redraw();
@@ -1735,12 +2093,12 @@ impl TayApp {
 
     /// 下一个/上一个搜索命中(dir = 1/-1;搜索在会话侧执行)。
     fn vi_search_next(&mut self, dir: i32, ctx: &mut Ctx<'_>) {
-        let Some(query) = self.vi_search_query.clone() else {
+        let Some(query) = self.sessions[self.active_pane].ui.vi_search_query.clone() else {
             return;
         };
         if let (Some(sender), Some(reply)) = (
-            &self.tabs[self.active_tab].sender,
-            self.tabs[self.active_tab].reply_tx.clone(),
+            &self.sessions[self.active_pane].sender,
+            self.sessions[self.active_pane].reply_tx.clone(),
         ) {
             let _ = sender.send(SessionCommand::Search { query, dir, reply });
         }
@@ -1751,11 +2109,11 @@ impl TayApp {
     /// 视口顶来自快照;滚动定位在会话侧解析 + 世代校验(淘汰/过期
     /// 目标 no-op)。
     fn jump_prompt(&mut self, dir: i32) {
-        let Some(snap) = self.tabs[self.active_tab].snapshot.clone() else {
+        let Some(snap) = self.sessions[self.active_pane].snapshot.clone() else {
             return;
         };
         let top = HistoryAnchor(-(snap.display_offset as i32) + snap.meta.cum_scroll);
-        let Some(blocks) = self.tabs[self.active_tab]
+        let Some(blocks) = self.sessions[self.active_pane]
             .snapshot
             .as_ref()
             .map(|s| s.blocks.clone())
@@ -1768,7 +2126,7 @@ impl TayApp {
             blocks.prompt_after(top)
         };
         if let Some(line) = target
-            && let Some(sender) = &self.tabs[self.active_tab].sender
+            && let Some(sender) = &self.sessions[self.active_pane].sender
         {
             // 携带来源世代:执行前清屏/resize/屏幕切换 → 会话拒绝。
             let epoch = snap.meta.invalidate_epoch;
@@ -1783,15 +2141,15 @@ impl TayApp {
     /// 并裁剪到存活历史;请求携带来源世代,执行前校验(应答携带
     /// 版本与过期标记,ProxyWake 排空 → 剪贴板/轻量反馈)。
     fn copy_command_output(&mut self) {
-        let Some(snap) = self.tabs[self.active_tab].snapshot.as_ref() else {
+        let Some(snap) = self.sessions[self.active_pane].snapshot.as_ref() else {
             return;
         };
         let Some((from_line, end_line, end_col)) = snap.blocks.last_output_range() else {
             return;
         };
         if let (Some(sender), Some(reply)) = (
-            &self.tabs[self.active_tab].sender,
-            self.tabs[self.active_tab].reply_tx.clone(),
+            &self.sessions[self.active_pane].sender,
+            self.sessions[self.active_pane].reply_tx.clone(),
         ) {
             let _ = sender.send(SessionCommand::CopyAnchors {
                 from_line,
@@ -1824,7 +2182,7 @@ impl TayApp {
     /// 滚轮滚动(ScrollDisplay 命令;TAY_SCROLL 钩子共用)。
     fn scroll_delta(&mut self, delta: i32) {
         if delta != 0
-            && let Some(sender) = &self.tabs[self.active_tab].sender
+            && let Some(sender) = &self.sessions[self.active_pane].sender
         {
             let _ = sender.send(SessionCommand::ScrollDisplay(Scroll::Delta(delta)));
         }
@@ -1834,7 +2192,7 @@ impl TayApp {
     fn status(&mut self, msg: impl Into<String>, ctx: &mut Ctx<'_>) {
         let msg = msg.into();
         log::info!("{msg}");
-        self.status_msg = Some((msg, Instant::now()));
+        self.sessions[self.active_pane].ui.status_msg = Some((msg, Instant::now()));
         // 到期后醒来重绘一帧清除 toast。
         ctx.request_wake_at(Instant::now() + Duration::from_millis(1200));
         ctx.request_redraw();
@@ -1843,12 +2201,12 @@ impl TayApp {
     /// 选区复制:优先自己的鼠标选区,其次 vi 选区(会话侧应答)。
     fn copy_selection(&mut self) {
         let (Some(sender), Some(reply)) = (
-            &self.tabs[self.active_tab].sender,
-            self.tabs[self.active_tab].reply_tx.clone(),
+            &self.sessions[self.active_pane].sender,
+            self.sessions[self.active_pane].reply_tx.clone(),
         ) else {
             return;
         };
-        if let Some((start, end)) = self.sel {
+        if let Some((start, end)) = self.sessions[self.active_pane].ui.sel {
             // 稳定锚点直发(P1):选择时刻已定格,滚屏不改变指向的
             // 文本;请求携带来源世代 —— 会话执行前校验,过期
             // (清屏/resize/屏幕切换)明确返回,不猜坐标(第八轮)。
@@ -1862,11 +2220,140 @@ impl TayApp {
                 from_col: s.1,
                 to_line: e.0,
                 to_col: Some(e.1),
-                epoch: self.sel_epoch,
+                epoch: self.sessions[self.active_pane].ui.sel_epoch,
                 reply,
             });
         } else {
             let _ = sender.send(SessionCommand::SelectionToString { reply });
+        }
+    }
+
+    /// Isolated smoke hook, like the scrollbar hook: synthetic events enter the
+    /// normal handler, without injecting input into the user's desktop.
+    fn exercise_panes(&mut self, ctx: &mut Ctx<'_>) {
+        let Some((path, stage)) = self.pane_smoke.clone() else {
+            return;
+        };
+        let (leaves, dividers) = self.pane_geometry();
+        if leaves.len() != 3
+            || leaves.iter().any(|(id, rect)| {
+                self.sessions[*id]
+                    .snapshot
+                    .as_ref()
+                    .is_none_or(|s| s.dims != (rect.w, rect.h))
+            })
+        {
+            return;
+        }
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        let (cw, ch) = renderer.cell_size();
+        let pad = renderer.padding();
+        let chrome = crate::chrome::rows(&self.config, self.settings_open);
+        let pixel = |x: usize, y: usize| {
+            (
+                (pad + (x as f32 + 0.5) * cw) as f64,
+                (pad + (y as f32 + chrome as f32 + 0.5) * ch) as f64,
+            )
+        };
+        if stage == 0 {
+            let (id, rect) = leaves[0];
+            let (x, y) = pixel(rect.x + 1, rect.y + 1);
+            for pressed in [true, false] {
+                self.on_event(
+                    ctx,
+                    WEvent::PointerButton {
+                        button: MouseButtonIdx::Left,
+                        pressed,
+                        x,
+                        y,
+                    },
+                );
+            }
+            assert_eq!(self.active_pane, id);
+            assert_eq!(self.cell_at(x, y), Some((1, 1)));
+            let divider = &dividers[0];
+            let (x, y) = pixel(divider.rect.x, divider.rect.y + divider.rect.h / 2);
+            self.on_event(
+                ctx,
+                WEvent::PointerButton {
+                    button: MouseButtonIdx::Left,
+                    pressed: true,
+                    x,
+                    y,
+                },
+            );
+            let (x, y) = match divider.axis {
+                Axis::Columns => pixel(
+                    divider.parent.x + divider.parent.w * 3 / 5,
+                    divider.rect.y + divider.rect.h / 2,
+                ),
+                Axis::Rows => pixel(
+                    divider.rect.x + divider.rect.w / 2,
+                    divider.parent.y + divider.parent.h * 3 / 5,
+                ),
+            };
+            self.on_event(ctx, WEvent::PointerMoved { x, y });
+            self.on_event(
+                ctx,
+                WEvent::PointerButton {
+                    button: MouseButtonIdx::Left,
+                    pressed: false,
+                    x,
+                    y,
+                },
+            );
+            let after = self.pane_geometry().1;
+            assert_ne!(
+                after.iter().find(|d| d.path == divider.path).unwrap().rect,
+                divider.rect,
+                "divider drag must change pane bounds"
+            );
+            self.pane_smoke = Some((path, 1));
+        } else if stage == 1 {
+            self.on_event(
+                ctx,
+                WEvent::Ime(ImeEvent::Commit(
+                    "printf '\\120\\101\\116\\105\\137\\122\\117\\125\\124\\105\\104\\n'\n".into(),
+                )),
+            );
+            self.pane_smoke = Some((path, 2));
+        } else {
+            let focused = self.active_pane;
+            let text = |id| {
+                self.sessions[id]
+                    .snapshot
+                    .as_ref()
+                    .map(|s| s.cells.iter().map(|c| c.c).collect::<String>())
+                    .unwrap_or_default()
+            };
+            if !text(focused).contains("PANE_ROUTED") {
+                return;
+            }
+            assert!(
+                leaves
+                    .iter()
+                    .filter(|(id, _)| *id != focused)
+                    .all(|(id, _)| !text(*id).contains("PANE_ROUTED"))
+            );
+            self.on_event(
+                ctx,
+                WEvent::Ime(ImeEvent::Preedit {
+                    text: "分屏测试".into(),
+                    cursor: Some((0, 0)),
+                }),
+            );
+            if let (Some(a), Some(b)) = (self.anchor_at((1, 1)), self.anchor_at((3, 2))) {
+                self.sessions[focused].ui.sel = Some((a, b));
+            }
+            std::fs::write(
+                path,
+                "ok = true\npanes = 3\ndragged = true\ninput_isolated = true\n",
+            )
+            .expect("pane smoke report");
+            log::info!("pane smoke: click, drag, IME and input isolation passed");
+            self.pane_smoke = None;
         }
     }
 
@@ -1913,7 +2400,7 @@ impl TayApp {
         if let (Some(stage), Some(g), Some(snapshot), Some((_, rows))) = (
             self.scrollbar_smoke,
             self.scrollbar_geometry(),
-            self.tabs[self.active_tab].snapshot.clone(),
+            self.sessions[self.active_pane].snapshot.clone(),
             self.dims,
         ) {
             let history = snapshot.total_lines.saturating_sub(rows);
@@ -1939,8 +2426,8 @@ impl TayApp {
                         y: 0.0,
                     },
                 );
-                assert!(self.scrollbar_drag.is_none());
-                assert!(!self.dragging);
+                assert!(self.sessions[self.active_pane].ui.scrollbar_drag.is_none());
+                assert!(!self.sessions[self.active_pane].ui.dragging);
                 self.scrollbar_smoke = Some(1);
             } else if stage == 1 && snapshot.display_offset >= history.saturating_sub(3) {
                 log::info!("TAY_SCROLLBAR: drag to oldest and release over header passed");
@@ -1985,8 +2472,12 @@ impl TayApp {
             self.sel_at_start = false;
             log::info!("TAY_SEL:合成拖选并复制(验收)");
             if let (Some(a0), Some(a1)) = (self.anchor_at((0, 0)), self.anchor_at((20, 0))) {
-                self.sel = Some((a0, a1));
-                self.sel_epoch = self.view.meta.invalidate_epoch;
+                self.sessions[self.active_pane].ui.sel = Some((a0, a1));
+                self.sessions[self.active_pane].ui.sel_epoch = self.sessions[self.active_pane]
+                    .ui
+                    .view
+                    .meta
+                    .invalidate_epoch;
                 self.copy_selection();
             }
         }
@@ -2003,7 +2494,7 @@ impl TayApp {
                 self.paste_at_start = false;
             }
             let paste = vec![if second { b'b' } else { b'a' }; 300 * 1024];
-            if let Some(sender) = &self.tabs[self.active_tab].sender
+            if let Some(sender) = &self.sessions[self.active_pane].sender
                 && !sender.send(SessionCommand::Input(paste))
             {
                 log::error!(
@@ -2021,13 +2512,13 @@ impl TayApp {
         // TAY_FOLD:第 14 帧自动折叠第一条命令输出(验证用)。
         if self.fold_at_start && self.frames == 14 {
             self.fold_at_start = false;
-            if let Some(block) = self.tabs[self.active_tab]
+            if let Some(block) = self.sessions[self.active_pane]
                 .snapshot
                 .clone()
                 .as_ref()
                 .and_then(|s| s.blocks.blocks().first())
             {
-                self.tabs[self.active_tab].folded.insert(block.id);
+                self.sessions[self.active_pane].folded.insert(block.id);
                 log::info!("折叠验证:块 #{} @ {}", block.id.0, block.prompt.0);
             }
         }
@@ -2035,7 +2526,7 @@ impl TayApp {
         // TAY_VI:第 13 帧自动进入 vi 模式(验证用)。
         if self.vi_at_start && self.frames == 13 {
             self.vi_at_start = false;
-            if let Some(sender) = &self.tabs[self.active_tab].sender {
+            if let Some(sender) = &self.sessions[self.active_pane].sender {
                 let _ = sender.send(SessionCommand::ToggleVi);
                 log::info!("已进入 vi 复制模式(验证)");
             }
@@ -2047,7 +2538,7 @@ impl TayApp {
             let grid = self.build_grid();
             let matches = crate::quickselect::build(&grid);
             log::info!("QuickSelect: {} 个匹配项", matches.len());
-            self.quick = Some(QuickState {
+            self.sessions[self.active_pane].ui.quick = Some(QuickState {
                 matches,
                 typed: String::new(),
             });
@@ -2056,7 +2547,8 @@ impl TayApp {
         // TAY_EXEC:第 10 帧执行命令(等 shell 就绪)。
         if !self.exec_sent && self.frames >= 10 {
             self.exec_sent = true;
-            if let (Some(sender), Some(cmd)) = (&self.tabs[self.active_tab].sender, &self.exec) {
+            if let (Some(sender), Some(cmd)) = (&self.sessions[self.active_pane].sender, &self.exec)
+            {
                 log::info!("执行: {cmd}");
                 let _ = sender.send(SessionCommand::Input(format!("{cmd}\n").into_bytes()));
             }
@@ -2069,7 +2561,7 @@ impl TayApp {
         {
             self.bench_started = true;
             log::info!("基准:灌入 3000 行输出");
-            if let Some(sender) = &self.tabs[self.active_tab].sender {
+            if let Some(sender) = &self.sessions[self.active_pane].sender {
                 let cmd = "i=0; while [ $i -lt 3000 ]; do echo $i; i=$((i+1)); done\n";
                 let _ = sender.send(SessionCommand::Input(cmd.as_bytes().to_vec()));
             }
@@ -2086,9 +2578,16 @@ impl TayApp {
         if hidden_idle {
             return;
         }
-        let mut grid = self.build_grid();
+        let mut grid = self.build_window_grid();
+        self.exercise_panes(ctx);
+        if self.pane_smoke.is_some() {
+            grid = self.build_window_grid();
+        }
+        if self.pane_smoke.is_some() {
+            ctx.request_redraw();
+        }
         if grid.cursor_shape != tay_render::CursorShape::Hidden {
-            self.set_ime_area(ctx, grid.cursor);
+            self.set_ime_area(ctx, self.cursor_pos());
         }
         let items = self.chrome_items(grid.cols);
         let message = if let Some((field, value)) = &self.editing {
@@ -2113,11 +2612,11 @@ impl TayApp {
             String::new()
         } else {
             format!(
-                "{} | {}: new | {}: switch | {}: settings",
+                "{} | {}: split right | {}: split down | {}: next pane",
                 self.hotkey_status,
-                self.config.binding_hint("new-tab"),
-                self.config.binding_hint("next-tab"),
-                self.config.binding_hint("settings")
+                self.config.binding_hint("split-right"),
+                self.config.binding_hint("split-down"),
+                self.config.binding_hint("next-pane")
             )
         };
         // 极简模式(tab_bar.visible = false)跳过操作栏:终端占满
@@ -2225,9 +2724,14 @@ impl Handler for TayApp {
         if self.shutting_down {
             return;
         }
+        if self.pane_pointer(ctx, &event) {
+            return;
+        }
         match &event {
-            WEvent::PointerMoved { y, .. } if self.scrollbar_drag.is_some() => {
-                let (grab, epoch) = self.scrollbar_drag.unwrap();
+            WEvent::PointerMoved { y, .. }
+                if self.sessions[self.active_pane].ui.scrollbar_drag.is_some() =>
+            {
+                let (grab, epoch) = self.sessions[self.active_pane].ui.scrollbar_drag.unwrap();
                 self.drag_scrollbar(*y as f32, grab, epoch);
                 return;
             }
@@ -2235,9 +2739,9 @@ impl Handler for TayApp {
                 button: MouseButtonIdx::Left,
                 pressed: false,
                 ..
-            } if self.scrollbar_drag.is_some() => {
-                self.scrollbar_drag = None;
-                self.dragging = false;
+            } if self.sessions[self.active_pane].ui.scrollbar_drag.is_some() => {
+                self.sessions[self.active_pane].ui.scrollbar_drag = None;
+                self.sessions[self.active_pane].ui.dragging = false;
                 ctx.set_pointer_over_control(false);
                 return;
             }
@@ -2250,7 +2754,7 @@ impl Handler for TayApp {
                 if let Some(geometry) = self
                     .scrollbar_geometry()
                     .filter(|g| g.contains(*x as f32, *y as f32))
-                    && let Some(snapshot) = &self.tabs[self.active_tab].snapshot
+                    && let Some(snapshot) = &self.sessions[self.active_pane].snapshot
                 {
                     let grab = if (*y as f32) >= geometry.thumb_top
                         && (*y as f32) < geometry.thumb_top + geometry.thumb_height
@@ -2260,8 +2764,8 @@ impl Handler for TayApp {
                         geometry.thumb_height / 2.0
                     };
                     let epoch = snapshot.meta.invalidate_epoch;
-                    self.scrollbar_drag = Some((grab, epoch));
-                    self.dragging = false;
+                    self.sessions[self.active_pane].ui.scrollbar_drag = Some((grab, epoch));
+                    self.sessions[self.active_pane].ui.dragging = false;
                     self.drag_scrollbar(*y as f32, grab, epoch);
                     return;
                 }
@@ -2298,7 +2802,10 @@ impl Handler for TayApp {
                     || self
                         .scrollbar_geometry()
                         .is_some_and(|g| g.contains(*x as f32, *y as f32))
-                    || over_link,
+                    || over_link
+                    || self.window_cell(*x, *y).is_some_and(|(c, r)| {
+                        self.pane_geometry().1.iter().any(|d| d.rect.contains(c, r))
+                    }),
             );
             if hovered != self.chrome_hover {
                 self.chrome_hover = hovered;
@@ -2335,7 +2842,7 @@ impl Handler for TayApp {
                 // 第一 configure 后:按输出高度重设 layer 尺寸,
                 // 等待 Resized 确认后一次性初始化渲染器(只 configure 一次,
                 // 规避 Mesa WSI 二次 swapchain 重建的段错误)。
-                if self.tabs[self.active_tab].sender.is_none() => {
+                if self.sessions[self.active_pane].sender.is_none() => {
                     let (_, out_h) = ctx.output_logical_size().unwrap_or((1920, 1080));
                     let h = (out_h * if self.maximized {100}else{self.config.height_percent} / 100).max(200);
                     self.layer_h = h as i32;
@@ -2351,7 +2858,7 @@ impl Handler for TayApp {
                 {
                     let rebuild = self.gpu_phase.on_resized_handshake();
                     self.gpu_phase = GpuPhase::Ready;
-                    if self.tabs[self.active_tab].sender.is_none() {
+                    if self.sessions[self.active_pane].sender.is_none() {
                         // 首次初始化:建终端/PTY/渲染器。
                         self.init(ctx);
                         // M1 常驻模型:默认收起;TAY_START_VISIBLE / 配置可让启动即呼出。
@@ -2367,24 +2874,7 @@ impl Handler for TayApp {
                             ctx.exit();
                             return;
                         }
-                        // 网格尺寸可能变化:PTY 同步(内核 resize 归会话)。
-                        if let Some((cols, rows)) = self.dims
-                            && let Some(sender) = &self.tabs[self.active_tab].sender
-                        {
-                            {
-                                let (cw, ch) = self
-                                    .renderer
-                                    .as_ref()
-                                    .map(|r| r.cell_size())
-                                    .unwrap_or((8.0, 16.0));
-                                let _ = sender.send(SessionCommand::Resize(WindowSize {
-                                    num_lines: rows as u16,
-                                    num_cols: cols as u16,
-                                    cell_width: cw.round() as u16,
-                                    cell_height: ch.round() as u16,
-                                }));
-                            }
-                        }
+                        self.resize_active();
                         // 新 surface 上 margin 为全离屏,重新对齐。
                         let m = self.vis.margin();
                         ctx.set_top_margin(m);
@@ -2413,22 +2903,25 @@ impl Handler for TayApp {
                 }
             }
 
-            WEvent::Focused(true) => {ctx.request_keyboard(true,false);}
+            WEvent::Focused(true) => {
+                // A queued enter may arrive after hide; never restore OnDemand then.
+                ctx.request_keyboard(self.vis.wants_keyboard(), false);
+            }
             WEvent::Focused(focused)
                 // 失焦自动隐藏(DESIGN §6.3:Wayland 上即 keyboard leave);
                 // `tay pin` 临时暂停。
                 if !focused
                     && self.config.hide_on_focus_out
                     && !self.vis.pinned()
-                    && !self.vis.is_hidden()
+                    && self.vis.wants_keyboard()
                 => {
                     self.hide(ctx);
                 }
 
             WEvent::Keyboard { key, pressed, mods } => {
                 if !pressed {
-                    if let Some(original) = self.kitty_down.remove(&key.raw_code) {
-                        let mode = self.tabs[self.active_tab].snapshot.as_ref().map(|s|s.mode).unwrap_or_default();
+                    if let Some(original) = self.sessions[self.active_pane].ui.kitty_down.remove(&key.raw_code) {
+                        let mode = self.sessions[self.active_pane].snapshot.as_ref().map(|s|s.mode).unwrap_or_default();
                         let flags = crate::keys::KittyFlags {
                             disambiguate: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
                             report_events: mode.contains(TermMode::REPORT_EVENT_TYPES),
@@ -2467,9 +2960,11 @@ impl Handler for TayApp {
                     log::debug!("configured shortcut: {action}");
                     use crate::chrome::Action;
                     match action.as_str() {
+                        "split-right"=>self.split_pane(Axis::Columns,ctx), "split-down"=>self.split_pane(Axis::Rows,ctx),
+                        "next-pane"=>self.next_pane(ctx), "close-pane"=>self.close_pane(ctx), "zoom-pane"=>self.zoom_pane(ctx),
                         "new-tab"=>self.new_tab(ctx), "close-tab"=>self.close_tab(self.active_index(),ctx),
-                        "next-tab"=>self.switch_tab((self.active_index()+1)%self.tabs.len(),ctx),
-                        "previous-tab"=>self.switch_tab((self.active_index()+self.tabs.len()-1)%self.tabs.len(),ctx),
+                        "next-tab"=>self.switch_tab((self.active_index()+1)%self.layouts.len(),ctx),
+                        "previous-tab"=>self.switch_tab((self.active_index()+self.layouts.len()-1)%self.layouts.len(),ctx),
                         "copy"=>self.copy_selection(), "paste"=>self.paste_clipboard(ctx),
                         "hide"=>self.hide(ctx), "maximize"=>self.chrome_action(Action::Maximize,ctx),
                         "settings"=>self.chrome_action(Action::Settings,ctx),
@@ -2483,10 +2978,10 @@ impl Handler for TayApp {
                 }
 
                 // QuickSelect 激活:消费按键(标签 / Esc 取消)。
-                if self.quick.is_some() {
+                if self.sessions[self.active_pane].ui.quick.is_some() {
                     match key.key {
                         KeyKind::Named(tay_window::NamedKey::Escape) => {
-                            self.quick = None;
+                            self.sessions[self.active_pane].ui.quick = None;
                             ctx.request_redraw();
                             return;
                         }
@@ -2495,24 +2990,24 @@ impl Handler for TayApp {
                             // Shift 本身作为"同时打开"修饰(P2e 分离打开动作)。
                             let label_char = c.to_ascii_lowercase();
                             if !label_char.is_ascii_lowercase() {
-                                self.quick = None;
+                                self.sessions[self.active_pane].ui.quick = None;
                                 ctx.request_redraw();
                                 return;
                             }
                             let fire = {
-                                let q = self.quick.as_mut().unwrap();
+                                let q = self.sessions[self.active_pane].ui.quick.as_mut().unwrap();
                                 q.typed.push(label_char);
                                 // 前缀无匹配 → 取消。
                                 let any_prefix =
                                     q.matches.iter().any(|m| m.label.starts_with(&q.typed));
                                 if !any_prefix {
-                                    self.quick = None;
+                                    self.sessions[self.active_pane].ui.quick = None;
                                     return;
                                 }
                                 q.resolve().is_some()
                             };
                             if fire {
-                                let q = self.quick.take().unwrap();
+                                let q = self.sessions[self.active_pane].ui.quick.take().unwrap();
                                 if let Some(m) = q.resolve() {
                                     let open = mods.shift && m.is_url;
                                     crate::quickselect::activate(m, open, &mut self.clipboard);
@@ -2530,7 +3025,7 @@ impl Handler for TayApp {
                         }
                         _ => {
                             // 其他按键取消。
-                            self.quick = None;
+                            self.sessions[self.active_pane].ui.quick = None;
                             ctx.request_redraw();
                             return;
                         }
@@ -2541,7 +3036,7 @@ impl Handler for TayApp {
                 // 单一来源 input::is_local;见 crates/tayd/src/input.rs。
                 // 模式来自会话快照(快照与内容同版本;按键翻译用
                 // 的快照滞后一个输出批次,与 PTY 往返同级,可接受)。
-                let mode = self.tabs[self.active_tab].snapshot
+                let mode = self.sessions[self.active_pane].snapshot
                     .as_ref()
                     .map(|s| s.mode)
                     .unwrap_or_default();
@@ -2587,7 +3082,7 @@ impl Handler for TayApp {
                         log::info!("QuickSelect: 无匹配项");
                     } else {
                         log::info!("QuickSelect: {} 个匹配项,按键选择", matches.len());
-                        self.quick = Some(QuickState {
+                        self.sessions[self.active_pane].ui.quick = Some(QuickState {
                             matches,
                             typed: String::new(),
                         });
@@ -2621,11 +3116,11 @@ impl Handler for TayApp {
                         return;
                     }
                 }
-                let app_cursor = self.tabs[self.active_tab].snapshot
+                let app_cursor = self.sessions[self.active_pane].snapshot
                     .as_ref()
                     .is_some_and(|s| s.mode.contains(TermMode::APP_CURSOR));
                 if let Some(bytes) = crate::keys::translate(&key, mods, app_cursor)
-                    && let Some(sender) = &self.tabs[self.active_tab].sender
+                    && let Some(sender) = &self.sessions[self.active_pane].sender
                     && !sender.send(SessionCommand::Input(bytes))
                 {
                     self.status("输入被拒绝:终端积压,请稍后再试", ctx);
@@ -2639,14 +3134,15 @@ impl Handler for TayApp {
                 ImeEvent::Commit(text) => {if let Some((_,value))=&mut self.editing{value.push_str(&text);ctx.request_redraw();}else{self.ime_commit(text,ctx);}},
                 ImeEvent::Preedit { text, cursor } => {
                     if text.is_empty() {
-                        self.preedit = None;
+                        self.sessions[self.active_pane].ui.preedit = None;
                     } else {
                         let (col, row) = self.cursor_pos();
-                        self.preedit = Some(tay_render::Preedit {
+                        self.sessions[self.active_pane].ui.preedit = Some(tay_render::Preedit {
                             text,
                             col,
                             row,
                             cursor_bytes: cursor,
+                            clip_right:None,
                         });
                         self.set_ime_area(ctx, (col, row));
                     }
@@ -2679,32 +3175,32 @@ impl Handler for TayApp {
                                 self.toggle_fold_line(line.line, ctx);
                                 return;
                             }
-                        self.dragging = true;
+                        self.sessions[self.active_pane].ui.dragging = true;
                         if let Some(cell) = self.cell_at(x, y)
                             && let Some(a) = self.anchor_at(cell)
                         {
-                            self.sel = Some((a, a));
+                            self.sessions[self.active_pane].ui.sel = Some((a, a));
                             // 选择来源世代 = 当前显示映射的世代(复制
                             // 请求携带,会话执行前校验)。
-                            self.sel_epoch = self.view.meta.invalidate_epoch;
+                            self.sessions[self.active_pane].ui.sel_epoch = self.sessions[self.active_pane].ui.view.meta.invalidate_epoch;
                         }
                     } else {
-                        self.dragging = false;
-                        if let Some((s, e)) = self.sel
+                        self.sessions[self.active_pane].ui.dragging = false;
+                        if let Some((s, e)) = self.sessions[self.active_pane].ui.sel
                             && s == e {
-                                self.sel = None;
+                                self.sessions[self.active_pane].ui.sel = None;
                             }
                     }
                     ctx.request_redraw();
                 }
 
             WEvent::PointerMoved { x, y }
-                if self.dragging => {
+                if self.sessions[self.active_pane].ui.dragging => {
                     if let Some(cell) = self.cell_at(x, y)
                         && let Some(a) = self.anchor_at(cell)
-                        && let Some((start, _)) = self.sel
+                        && let Some((start, _)) = self.sessions[self.active_pane].ui.sel
                     {
-                        self.sel = Some((start, a));
+                        self.sessions[self.active_pane].ui.sel = Some((start, a));
                     }
                     ctx.request_redraw();
                 }
@@ -2714,14 +3210,14 @@ impl Handler for TayApp {
             } => {
                 let mut delta = lines_y as i32 * 3;
                 if lines_y == 0.0 && pixel_y != 0.0 {
-                    self.scroll_px += pixel_y;
+                    self.sessions[self.active_pane].ui.scroll_px += pixel_y;
                     let ch = self
                         .renderer
                         .as_ref()
                         .map(|r| r.cell_size().1)
                         .unwrap_or(20.0);
-                    delta = (self.scroll_px / ch) as i32;
-                    self.scroll_px -= delta as f32 * ch;
+                    delta = (self.sessions[self.active_pane].ui.scroll_px / ch) as i32;
+                    self.sessions[self.active_pane].ui.scroll_px -= delta as f32 * ch;
                 }
                 self.scroll_delta(delta);
             }
@@ -2732,17 +3228,19 @@ impl Handler for TayApp {
 
             WEvent::ProxyWake => {
                 for id in self.background_exits() {
-                    let index = self.tabs.position(id);
-                    self.close_tab(index, ctx);
+                    self.remove_session(id);
+                    self.resize_active();
+                    ctx.request_redraw();
                 }
 
+                if std::mem::take(&mut self.pane_output_dirty){ctx.request_redraw();}
                 // Clear/coalesce notification bits before observing shared state.
                 // A publication racing with snapshot/reply reads must enqueue a new wake.
-                let events = self.tabs[self.active_tab].rx.drain();
+                let events = self.sessions[self.active_pane].rx.drain();
                 // 原子批次(架构 §7):快照与语义事件一起取出 ——
                 // 网格、命令块、图像、清屏事件必然同源,不存在
                 // 「旧网格配新事件」的版本竞争。
-                let update = self.tabs[self.active_tab].slot
+                let update = self.sessions[self.active_pane].slot
                     .as_ref()
                     .and_then(|slot| slot.lock().unwrap().take());
                 if let Some(update) = update {
@@ -2755,10 +3253,10 @@ impl Handler for TayApp {
                     // 推进世代但主屏块锚点保持有效(网格冻结),
                     // 清空会把进 vim 前用户的折叠全部弄丢(第十七轮
                     // 回归,已修复)。
-                    if update.snapshot.meta.invalidate_epoch != self.tabs[self.active_tab].seen_epoch {
-                        self.tabs[self.active_tab].seen_epoch = update.snapshot.meta.invalidate_epoch;
-                        self.sel = None;
-                        self.quick = None;
+                    if update.snapshot.meta.invalidate_epoch != self.sessions[self.active_pane].seen_epoch {
+                        self.sessions[self.active_pane].seen_epoch = update.snapshot.meta.invalidate_epoch;
+                        self.sessions[self.active_pane].ui.sel = None;
+                        self.sessions[self.active_pane].ui.quick = None;
                     }
                     // 折叠块裁剪:历史淘汰掉的块 ID 从折叠集合移除。
                     let live: std::collections::BTreeSet<_> = update
@@ -2768,8 +3266,8 @@ impl Handler for TayApp {
                         .iter()
                         .map(|b| b.id)
                         .collect();
-                    self.tabs[self.active_tab].folded.retain(|id| live.contains(id));
-                    self.tabs[self.active_tab].snapshot = Some(update.snapshot);
+                    self.sessions[self.active_pane].folded.retain(|id| live.contains(id));
+                    self.sessions[self.active_pane].snapshot = Some(update.snapshot);
                 }
                 // 会话应答:复制/搜索回执(携带版本)。乱序/过期语义:
                 // 复制文本在会话侧解析时即定格(不可变),按到达序
@@ -2778,7 +3276,7 @@ impl Handler for TayApp {
                 // 校验把关;过期(Stale)给轻量反馈且不覆盖已有剪贴板,
                 // 淘汰(Evicted)同样只反馈不复制;revision 保留作审计。
                 // 搜索应答只记日志,不对旧命中做任何 UI 动作。
-                if let Some(rx) = self.tabs[self.active_tab].reply_rx.take() {
+                if let Some(rx) = self.sessions[self.active_pane].reply_rx.take() {
                     while let Ok(reply) = rx.try_recv() {
                         match reply {
                             SessionReply::Rejected => self.status("复制内容超过 4 MiB,未写入剪贴板", ctx),
@@ -2822,7 +3320,7 @@ impl Handler for TayApp {
                             }
                         }
                     }
-                    self.tabs[self.active_tab].reply_rx = Some(rx);
+                    self.sessions[self.active_pane].reply_rx = Some(rx);
                 }
                 // 终端事件。
                 for ev in events {
@@ -2833,10 +3331,10 @@ impl Handler for TayApp {
                             if !self.vis.is_hidden() => {
                                 ctx.request_redraw();
                             }
-                        Event::Title(t) => {self.tabs[self.active_tab].title=t;ctx.request_redraw();},
+                        Event::Title(t) => {self.sessions[self.active_pane].title=t;ctx.request_redraw();},
                         Event::Bell => {
                             // 可视铃:网格背景短暂闪烁(衰减见 build_grid)。
-                            self.tabs[self.active_tab].bell_until = Some(Instant::now() + BELL_FLASH);
+                            self.sessions[self.active_pane].bell_until = Some(Instant::now() + BELL_FLASH);
                             ctx.request_redraw();
                         }
                         Event::ClipboardStore(_, text) => {
@@ -2844,7 +3342,7 @@ impl Handler for TayApp {
                         }
                         Event::Exit | Event::ChildExit(_) => {
                             log::info!("标签 shell 已退出");
-                            self.close_tab(self.active_index(),ctx);
+                            self.close_pane(ctx);
                             break;
                         }
                         _ => {}
@@ -2861,8 +3359,13 @@ impl Handler for TayApp {
                             self.shutdown(ctx);
                             return;
                         }
+                        crate::ipc::IpcCommand::SplitRight => self.split_pane(Axis::Columns,ctx),
+                        crate::ipc::IpcCommand::SplitDown => self.split_pane(Axis::Rows,ctx),
+                        crate::ipc::IpcCommand::NextPane => self.next_pane(ctx),
+                        crate::ipc::IpcCommand::ClosePane => self.close_pane(ctx),
+                        crate::ipc::IpcCommand::ZoomPane => self.zoom_pane(ctx),
                         crate::ipc::IpcCommand::NewTab => {self.new_tab(ctx);self.show(ctx);},
-                        crate::ipc::IpcCommand::NextTab => self.switch_tab((self.active_index()+1)%self.tabs.len(),ctx),
+                        crate::ipc::IpcCommand::NextTab => self.switch_tab((self.active_index()+1)%self.layouts.len(),ctx),
                         crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_index(),ctx),
                         crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
@@ -2881,7 +3384,8 @@ impl Handler for TayApp {
                     }
                 }
                 // portal 热键。
-                while let Ok(event)=self.hotkey_rx.try_recv(){match event{crate::hotkey::HotkeyTriggered::Toggle=>self.toggle(ctx),crate::hotkey::HotkeyTriggered::Status(s)=>{self.hotkey_status=s;ctx.request_redraw();}}}
+                while let Ok(event)=self.hotkey_rx.try_recv(){match event{crate::hotkey::HotkeyTriggered::Toggle=>self.toggle(ctx),crate::hotkey::HotkeyTriggered::Status(s)=>{if let Some(tx) = &self.tray_status_tx { let _ = tx.try_send(s.clone()); }
+                    self.hotkey_status=s;ctx.request_redraw();}}}
                 // 配置热重载(§M3:文件 mtime 变化 → 重载颜色等运行时字段)。
                 let path = tay_config::Config::config_path();
                 let mtime = std::fs::metadata(path).ok().and_then(|m|m.modified().ok());
@@ -2989,7 +3493,7 @@ impl Handler for TayApp {
             // 输出回退:窗口层已把 layer 角色重建到**新 wl_surface**。
             // 丢弃旧渲染器(旧 wl_surface 由窗口层保活),等新 surface
             // 的 configure 握手(Resized)后重建渲染器再呈现。
-            WEvent::SurfaceReplaced if self.tabs[self.active_tab].sender.is_some() => {
+            WEvent::SurfaceReplaced if self.sessions[self.active_pane].sender.is_some() => {
                 log::info!("输出回退:重建 GPU surface,等待 configure");
                 self.renderer = None;
                 self.instance = None;
@@ -2997,7 +3501,7 @@ impl Handler for TayApp {
             }
             WEvent::SurfaceReplaced => {}
 
-            WEvent::OutputChanged if self.tabs[self.active_tab].sender.is_some() => {
+            WEvent::OutputChanged if self.sessions[self.active_pane].sender.is_some() => {
                 self.request_layer_height(ctx);
                 // 窗口层重建 layer 角色后 margin 为全离屏,重提当前值。
                 let m = self.vis.margin();
@@ -3010,22 +3514,29 @@ impl Handler for TayApp {
                 // 呼出/收起动画步进。
                 self.step_animation(ctx);
                 // toast 到期:清除并重绘一帧(否则残留到旧画面里)。
-                if self
-                    .status_msg
+                if self.sessions[self.active_pane].ui.status_msg
                     .as_ref()
                     .is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(1200))
                 {
-                    self.status_msg = None;
+                    self.sessions[self.active_pane].ui.status_msg = None;
                     ctx.request_redraw();
                 }
                 // 可视铃:到期清除;未到期衰减重绘并唤醒到期时刻。
                 // 与动画并发时动画的 8ms 步进自带重绘,不覆盖其 deadline。
-                if let Some(until) = self.tabs[self.active_tab].bell_until {
+                if let Some(until) = self.sessions[self.active_pane].bell_until {
                     if Instant::now() >= until {
-                        self.tabs[self.active_tab].bell_until = None;
+                        self.sessions[self.active_pane].bell_until = None;
                         ctx.request_redraw();
                     } else if !self.vis.animating() {
                         ctx.set_anim_deadline(Some(until));
+                        ctx.request_redraw();
+                    }
+                }
+                for (id,_) in self.pane_geometry().0 {
+                    if id==self.active_pane{continue;}
+                    if let Some(until)=self.sessions[id].bell_until {
+                        if Instant::now()>=until{self.sessions[id].bell_until=None;}
+                        else{ctx.request_wake_at(until);}
                         ctx.request_redraw();
                     }
                 }
@@ -3079,7 +3590,7 @@ mod tests {
         )
     }
 
-    fn wait_for_exit(tab: &super::TabSession, timeout: std::time::Duration) {
+    fn wait_for_exit(tab: &super::PaneSession, timeout: std::time::Duration) {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if matches!(
@@ -3135,6 +3646,10 @@ mod tests {
         let saved = |shell: &str, title: &str| crate::persist::PersistTab {
             shell: shell.into(),
             title: title.into(),
+            panes: vec![],
+            layout: None,
+            focused: 0,
+            zoomed: false,
             cwd: Some("/tmp".into()),
         };
         assert!(app.restore_sessions(
@@ -3148,12 +3663,12 @@ mod tests {
             ],
             3
         ));
-        assert_eq!(app.tabs.len(), 2);
-        let active = app.active_tab;
-        assert_eq!(app.tabs[active].title, "B");
-        let background = app.tabs.id_at(0).unwrap();
+        assert_eq!(app.sessions.len(), 2);
+        let active = app.active_pane;
+        assert_eq!(app.sessions[active].title, "B");
+        let background = app.sessions.id_at(0).unwrap();
         assert!(
-            app.tabs[background]
+            app.sessions[background]
                 .sender
                 .as_ref()
                 .unwrap()
@@ -3165,7 +3680,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         app.remove_session(background);
-        assert_eq!(app.active_tab, active);
+        assert_eq!(app.active_pane, active);
         assert_eq!(app.active_index(), 0);
 
         // Real duplex blockage: output is consumed until the response high-water
@@ -3173,18 +3688,23 @@ mod tests {
         let flood = app
             .start_session_with(40, 6, "/bin/sh".into(), None)
             .unwrap();
-        let flood_id = app.tabs.insert(flood);
-        assert!(app.tabs[flood_id].sender.as_ref().unwrap().send(SessionCommand::Input(
+        let flood_id = app.sessions.insert(flood);
+        app.layouts.push(super::PaneTab {
+            root: crate::panes::Layout::leaf(flood_id),
+            focused: flood_id,
+            zoomed: false,
+        });
+        assert!(app.sessions[flood_id].sender.as_ref().unwrap().send(SessionCommand::Input(
             b"stty -echo -icanon; i=0; while [ $i -lt 200000 ]; do printf '\\033[6n'; i=$((i+1)); done; while :; do :; done\n".to_vec())));
-        wait_for_exit(&app.tabs[flood_id], Duration::from_secs(12));
+        wait_for_exit(&app.sessions[flood_id], Duration::from_secs(12));
         app.remove_session(flood_id);
 
         // Signals use exactly the same save/stop coordinator as IPC/window exit.
-        let sender = app.tabs[active].sender.as_ref().unwrap().clone();
+        let sender = app.sessions[active].sender.as_ref().unwrap().clone();
         assert!(sender.send(SessionCommand::Input(
             b"trap '' HUP; printf '\\122\\105\\101\\104\\131'; while :; do :; done\n".to_vec()
         )));
-        let slot = app.tabs[active].slot.clone().unwrap();
+        let slot = app.sessions[active].slot.clone().unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let ready = slot.lock().unwrap().as_ref().is_some_and(|update| {
@@ -3210,7 +3730,7 @@ mod tests {
         app.finish_shutdown();
         assert!(start.elapsed() < Duration::from_secs(3));
         assert!(!sender.send(SessionCommand::Input(b"late".to_vec())));
-        assert!(app.tabs[active].worker.as_ref().unwrap().is_finished());
+        assert!(app.sessions[active].worker.as_ref().unwrap().is_finished());
         let (saved, index) = crate::persist::load().unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(index, 0);
@@ -3232,13 +3752,49 @@ mod tests {
         app.finish_shutdown(); // an unwritable state path cannot prevent cleanup
         assert!(app.shutting_down);
         assert!(
-            app.tabs[app.active_tab]
+            app.sessions[app.active_pane]
                 .worker
                 .as_ref()
                 .unwrap()
                 .is_finished()
         );
         assert!(!crate::persist::path().exists());
+        drop(app);
+        let mut app = headless_app();
+        let mut root = crate::panes::Layout::leaf(0);
+        root.split(0, 1, crate::panes::Axis::Columns);
+        root.split(1, 2, crate::panes::Axis::Rows);
+        let tab = crate::persist::PersistTab {
+            shell: "/bin/sh".into(),
+            cwd: None,
+            title: "split".into(),
+            panes: vec![
+                crate::persist::PersistPane {
+                    shell: "/bin/sh".into(),
+                    cwd: None,
+                    title: "first".into(),
+                },
+                crate::persist::PersistPane {
+                    shell: "/nonexistent/tay-pane-shell".into(),
+                    cwd: None,
+                    title: "failed".into(),
+                },
+                crate::persist::PersistPane {
+                    shell: "/bin/sh".into(),
+                    cwd: None,
+                    title: "last".into(),
+                },
+            ],
+            layout: Some(root),
+            focused: 1,
+            zoomed: false,
+        };
+        assert!(app.restore_sessions(80, 24, &[tab], 0));
+        assert_eq!(app.layouts.len(), 1);
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.layouts[0].root.ids().len(), 2);
+        assert_eq!(app.sessions[app.active_pane].title, "first");
+        app.finish_shutdown();
     }
 
     #[test]
