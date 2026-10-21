@@ -245,31 +245,12 @@ impl Ctx<'_> {
         if self.state.phase != SurfacePhase::Unmapped {
             return;
         }
-        // Remap after a null-buffer unmap. Do NOT wait for a fresh configure:
-        // KWin sends one configure when the surface unmaps (dropped below while
-        // Unmapped) and no second one for a remap whose requested state is
-        // unchanged —— waiting here deadlocks every show after the first hide
-        // (实测: 隐藏正常、再也呼不出; present 被 AwaitingConfigure 挡住,
-        // 日志只有「layer remap: waiting for configure」之后 50ms 兜底)。
-        // The surface keeps its last configured size, so present can resume
-        // immediately; KWin sends a new configure only if it wants a different
-        // size, and configure() accepts it (phase is no longer Unmapped).
-        if self.state.surface_configured_once {
-            self.state.phase = SurfacePhase::Ready;
-        } else {
-            // Never configured (hide raced the initial handshake): the first
-            // configure is still required before present.
-            self.state.phase = SurfacePhase::AwaitingConfigure;
-        }
-        if let Some(layer) = &self.state.layer {
-            layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-            layer.set_exclusive_zone(0);
-            layer.set_size(self.state.requested_size.0, self.state.requested_size.1);
-            layer.set_margin(self.state.top_margin, 0, 0, 0);
-            layer.set_keyboard_interactivity(self.state.keyboard_mode);
-            layer.commit();
-            log::info!("layer remap: presenting at the last configured size");
-        }
+        // A cached WSI swapchain may retain buffers from the unmapped surface.
+        // Rebuild the Wayland surface and renderer through the existing output
+        // recovery path, waiting for a fresh configure before attaching buffers.
+        let output = self.state.bound_output.clone();
+        self.state.rebind_layer(output.as_ref());
+        log::info!("layer remap: rebuilding surface and GPU presentation");
     }
 
     /// Moving a mapped surface offscreen does not deactivate it on KWin.
