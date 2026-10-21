@@ -25,9 +25,11 @@ impl<T> Tabs<T> {
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
+    #[cfg(test)]
     pub(crate) fn id_at(&self, index: usize) -> Option<TabId> {
         self.entries.keys().nth(index).copied()
     }
+    #[cfg(test)]
     pub(crate) fn position(&self, id: TabId) -> usize {
         self.entries
             .keys()

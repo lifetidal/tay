@@ -3,7 +3,7 @@
 set -euo pipefail
 usage() {
     cat <<'HELP'
-Usage: tools/package-arch.sh [--offline] [--syncdeps] [--skip-tests]
+Usage: tools/package-arch.sh [--offline] [--syncdeps] [--skip-tests] [--force]
   --offline     Use cached Cargo dependencies only.
   --syncdeps    Allow makepkg to install missing build dependencies (sudo).
   --skip-tests  Skip the workspace test suite.
@@ -23,7 +23,6 @@ for arg in "$@"; do
         --syncdeps) makepkg_args+=(--syncdeps) ;;
         --skip-tests) makepkg_args+=(--nocheck) ;;
         -h|--help) usage; exit 0 ;;
-        --force) : ;;
         *) printf 'Unknown option: %s\n' "$arg" >&2; usage >&2; exit 2 ;;
     esac
 done

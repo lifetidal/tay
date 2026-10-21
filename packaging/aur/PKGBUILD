@@ -1,15 +1,15 @@
-# Maintainer: tay-term <tay@example.com>
-# 注意:仓库公开后把 source 换成实际 git 地址。
+# Git development recipe; local snapshots use tools/package-arch.sh.
 
 pkgname=tay-git
 pkgver=r9.a6feccc
 pkgrel=1
 pkgdesc="Tay — Linux 一键呼出下拉终端(Rust 原生,Wayland layer-shell)"
 arch=('x86_64' 'aarch64')
-url="https://github.com/tay-term/tay"
-license=('GPL3')
-depends=('wayland' 'libxkbcommon' 'vulkan-icd-loader' 'fontconfig')
-makedepends=('cargo' 'git')
+url="https://github.com/lifetidal/tay"
+license=('GPL-3.0-only')
+depends=('glibc' 'gcc-libs' 'wayland' 'libxkbcommon' 'fontconfig')
+optdepends=('vulkan-icd-loader: Vulkan backend' 'mesa: OpenGL backend' 'xdg-desktop-portal: global shortcuts')
+makedepends=('cargo' 'git' 'pkgconf')
 provides=('tay')
 conflicts=('tay')
 source=("git+$url")
@@ -22,16 +22,21 @@ pkgver() {
 
 build() {
     cd "$srcdir/tay"
-    cargo build --release --locked
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked --bin tay --bin tayd
 }
 
 package() {
     cd "$srcdir/tay"
-    install -Dm755 target/release/tayd "$pkgdir/usr/bin/tayd"
-    install -Dm755 target/release/tay "$pkgdir/usr/bin/tay"
+    install -Dm755 "$srcdir/target/release/tayd" "$pkgdir/usr/bin/tayd"
+    install -Dm755 "$srcdir/target/release/tay" "$pkgdir/usr/bin/tay"
+    install -Dm644 packaging/tay.desktop "$pkgdir/usr/share/applications/org.tay.Tay.desktop"
     install -Dm644 packaging/tay.desktop "$pkgdir/usr/share/applications/tay.desktop"
+    printf '\nNoDisplay=true\n' >> "$pkgdir/usr/share/applications/tay.desktop"
     install -Dm644 packaging/icons/tay.png "$pkgdir/usr/share/pixmaps/tay.png"
+    install -Dm644 packaging/icons/tay.png "$pkgdir/usr/share/pixmaps/tay-owl-rounded-v1.png"
     install -Dm644 packaging/tayd.service "$pkgdir/usr/lib/systemd/user/tayd.service"
-    install -Dm644 DESIGN.md "$pkgdir/usr/share/doc/tay/DESIGN.md"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/tay/README.md"
+    install -Dm644 config/desktop.lua "$pkgdir/usr/share/doc/tay/examples/config.lua"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/tay/LICENSE"
 }

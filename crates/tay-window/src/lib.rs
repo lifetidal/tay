@@ -242,6 +242,64 @@ impl Ctx<'_> {
     /// 不复发)。
     pub fn wake_present(&mut self) {
         self.state.stalled = false;
+        if self.state.phase != SurfacePhase::Unmapped {
+            return;
+        }
+        // Remap after a null-buffer unmap. Do NOT wait for a fresh configure:
+        // KWin sends one configure when the surface unmaps (dropped below while
+        // Unmapped) and no second one for a remap whose requested state is
+        // unchanged —— waiting here deadlocks every show after the first hide
+        // (实测: 隐藏正常、再也呼不出; present 被 AwaitingConfigure 挡住,
+        // 日志只有「layer remap: waiting for configure」之后 50ms 兜底)。
+        // The surface keeps its last configured size, so present can resume
+        // immediately; KWin sends a new configure only if it wants a different
+        // size, and configure() accepts it (phase is no longer Unmapped).
+        if self.state.surface_configured_once {
+            self.state.phase = SurfacePhase::Ready;
+        } else {
+            // Never configured (hide raced the initial handshake): the first
+            // configure is still required before present.
+            self.state.phase = SurfacePhase::AwaitingConfigure;
+        }
+        if let Some(layer) = &self.state.layer {
+            layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+            layer.set_exclusive_zone(0);
+            layer.set_size(self.state.requested_size.0, self.state.requested_size.1);
+            layer.set_margin(self.state.top_margin, 0, 0, 0);
+            layer.set_keyboard_interactivity(self.state.keyboard_mode);
+            layer.commit();
+            log::info!("layer remap: presenting at the last configured size");
+        }
+    }
+
+    /// Moving a mapped surface offscreen does not deactivate it on KWin.
+    /// A null buffer removes it from the compositor's window/focus lifecycle.
+    /// Keep the wl_surface and renderer alive; PTYs continue running.
+    pub fn unmap(&mut self) {
+        if matches!(
+            self.state.phase,
+            SurfacePhase::Unmapped | SurfacePhase::Closing
+        ) {
+            return;
+        }
+        self.state.phase = SurfacePhase::Unmapped;
+        self.state.keyboard_mode = KeyboardInteractivity::None;
+        self.state.frame_pending = false;
+        self.state.frame_armed_at = None;
+        self.state.redraw_requested = false;
+        self.state.mods = Mods::default();
+        if let Some(ti) = &self.state.text_input {
+            ti.disable();
+            ti.commit();
+        }
+        self.state.ime_active = false;
+        self.state.ime_dirty = false;
+        if let Some(layer) = &self.state.layer {
+            layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        }
+        self.state.surface.attach(None, 0, 0);
+        self.state.surface.commit();
+        log::info!("layer unmapped: keyboard and window focus released");
     }
 
     /// 顶层 margin(px):负数 = 移出屏幕上沿(收起),0 = 呼出。
@@ -257,21 +315,26 @@ impl Ctx<'_> {
 
     /// 显式呼出时请求键盘焦点；获得焦点后恢复 OnDemand。
     pub fn request_keyboard(&mut self, shown: bool, acquire: bool) {
-        if let Some(layer) = &self.state.layer {
-            layer.set_keyboard_interactivity(if !shown {
-                KeyboardInteractivity::None
-            } else if acquire {
-                KeyboardInteractivity::Exclusive
-            } else {
-                KeyboardInteractivity::OnDemand
-            });
+        self.state.keyboard_mode = if !shown {
+            KeyboardInteractivity::None
+        } else if acquire {
+            KeyboardInteractivity::Exclusive
+        } else {
+            KeyboardInteractivity::OnDemand
+        };
+        if self.state.phase != SurfacePhase::Unmapped
+            && let Some(layer) = &self.state.layer
+        {
+            layer.set_keyboard_interactivity(self.state.keyboard_mode);
             layer.commit();
         }
     }
 
     pub fn set_top_margin(&mut self, margin: i32) {
         self.state.top_margin = margin;
-        if let Some(layer) = &self.state.layer {
+        if self.state.phase != SurfacePhase::Unmapped
+            && let Some(layer) = &self.state.layer
+        {
             layer.set_margin(margin, 0, 0, 0);
             layer.commit();
         }
@@ -279,7 +342,10 @@ impl Ctx<'_> {
 
     /// 设置 layer 表面尺寸(width 0 = 由合成器定,锚定左右时即全宽)。
     pub fn set_size(&mut self, width: u32, height: u32) {
-        if let Some(layer) = &self.state.layer {
+        self.state.requested_size = (width, height);
+        if self.state.phase != SurfacePhase::Unmapped
+            && let Some(layer) = &self.state.layer
+        {
             layer.set_size(width, height);
             layer.commit();
         }
@@ -388,6 +454,8 @@ pub enum SurfacePhase {
     AwaitingConfigure,
     /// 已 configure,可以呈现。
     Ready,
+    /// Hidden with a null buffer; no redraw or commit until explicit remap.
+    Unmapped,
     /// 事件循环退出中。
     Closing,
 }
@@ -466,6 +534,8 @@ struct WindowState {
     /// SurfaceReplaced 并销毁渲染器。
     retired: Vec<(LayerSurface, wl_surface::WlSurface)>,
     layer: Option<LayerSurface>,
+    keyboard_mode: KeyboardInteractivity,
+    requested_size: (u32, u32),
     /// layer-shell 全局保活(输出回退重建 layer surface 时还要用)。
     layer_shell: LayerShell,
     /// layer surface 绑定的输出(输出销毁 → 回退合成器默认)。
@@ -547,6 +617,8 @@ impl WindowState {
             surface,
             retired: Vec::new(),
             layer: None,
+            keyboard_mode: KeyboardInteractivity::None,
+            requested_size: (0, 480),
             layer_shell,
             bound_output: None,
             keyboard: None,
@@ -602,7 +674,7 @@ impl WindowState {
             chosen_output.as_ref(),
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.set_keyboard_interactivity(state.keyboard_mode);
         layer.set_exclusive_zone(0);
         layer.set_size(0, 480);
         layer.set_margin(-2000, 0, 0, 0);
@@ -633,6 +705,9 @@ impl WindowState {
 
     /// 强制重新请求帧回调(兜底/恢复用,不检查在途状态)。
     fn rearm_frame(&mut self) {
+        if self.phase != SurfacePhase::Ready {
+            return;
+        }
         self.frame_pending = true;
         self.frame_armed_at = Some(Instant::now());
         self.surface.frame(
@@ -957,7 +1032,7 @@ impl WindowState {
             output,
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.set_keyboard_interactivity(self.keyboard_mode);
         layer.set_exclusive_zone(0);
         self.surface
             .set_buffer_scale(self.scale.round().max(1.0) as i32);
@@ -989,6 +1064,16 @@ impl LayerShellHandler for WindowState {
         _serial: u32,
     ) {
         // 旧世代 surface 的 configure 不得修改新实例(架构 §5.4)。
+        if self.phase == SurfacePhase::Unmapped {
+            // null-buffer unmap 后 KWin 可能回一次 configure(常为 0×0):
+            // 此刻丢弃,remap 由 wake_present 按上次尺寸直接呈现。
+            log::debug!(
+                "忽略 unmapped 状态的 configure: {}×{}",
+                configure.new_size.0,
+                configure.new_size.1
+            );
+            return;
+        }
         if layer.wl_surface() != &self.surface {
             log::debug!("忽略旧 surface(世代 {})的 configure", self.generation.0 - 1);
             return;

@@ -483,6 +483,9 @@ pub fn decorate(
     }
     for i in &mut grid.images {
         i.row += rows;
+        if let Some((_, y, _, _)) = &mut i.clip {
+            *y += rows;
+        }
     }
 }
 
@@ -641,6 +644,7 @@ mod tests {
                 col: 0,
                 row: 0,
                 cursor_bytes: None,
+                clip_right: None,
             }),
             badges: vec![],
             overlays: vec![],

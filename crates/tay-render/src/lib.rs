@@ -65,6 +65,8 @@ pub struct SelectionRange {
 /// IME 预编辑文本(显示在光标处,下划线)。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preedit {
+    /// Exclusive grid column used to clip IME ink to its owning pane.
+    pub clip_right: Option<usize>,
     pub text: String,
     pub col: usize,
     pub row: usize,
@@ -90,6 +92,8 @@ pub struct Overlay {
 /// kitty graphics 图像(显示坐标)。
 #[derive(Clone, Debug)]
 pub struct RenderImage {
+    /// Optional pane clipping rectangle in grid cells (x,y,width,height).
+    pub clip: Option<(usize, usize, usize, usize)>,
     pub id: u32,
     pub row: usize,
     pub col: usize,
@@ -125,6 +129,8 @@ pub struct ChromePanel {
 /// position = 历史偏移比例：0 最新，1 最旧。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scrollbar {
+    /// Optional physical right edge for a pane-local scrollbar.
+    pub right: Option<f32>,
     pub top: f32,
     pub extent: f32,
     pub position: f32,
@@ -144,6 +150,7 @@ impl Scrollbar {
         if self.size >= 1.0 || self.extent <= 0.0 {
             return None;
         }
+        let right = self.right.unwrap_or(right);
         let height = self.extent * cell_height;
         let thumb_height = (self.size * height)
             .max(24.0)
@@ -204,6 +211,13 @@ struct Quad {
     color: [f32; 4],
 }
 
+struct ImageDraw {
+    key: (u32, usize),
+    rect: [f32; 4],
+    z: i32,
+    clip: [u32; 4],
+}
+
 /// bg 四边形的管线常量。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -231,6 +245,7 @@ pub struct Renderer {
     font_metrics: Metrics,
     preedit_buffer: Buffer,
     preedit_pos: Option<(usize, usize)>,
+    preedit_right: Option<usize>,
 
     family: String,
     font_weight: u16,
@@ -261,7 +276,7 @@ pub struct Renderer {
     /// 键 = 数据身份(共享句柄指针),同一数据零哈希零上传。
     img_cache: ImageCache,
     /// 当前帧图像实例((id, ptr), rect, z)。
-    current_images: Vec<((u32, usize), [f32; 4], i32)>,
+    current_images: Vec<ImageDraw>,
     unit_quad: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     locals_buf: wgpu::Buffer,
@@ -809,6 +824,7 @@ impl Renderer {
             font_metrics: Metrics::new(font_size_px, cell_h),
             preedit_buffer,
             preedit_pos: None,
+            preedit_right: None,
             family: config.font.family.clone(),
             font_weight: config.font.weight,
             cell: (cell_w, cell_h),
@@ -992,12 +1008,36 @@ impl Renderer {
                     img.cols as f32 * self.cell.0,
                     img.rows as f32 * self.cell.1,
                 ];
-                (key, rect, img.z)
+                let clip = img
+                    .clip
+                    .map(|(x, y, w, h)| {
+                        let left = (self.padding + x as f32 * self.cell.0).floor().max(0.0) as u32;
+                        let top = (self.padding + y as f32 * self.cell.1).floor().max(0.0) as u32;
+                        let right = (self.padding + (x + w) as f32 * self.cell.0)
+                            .ceil()
+                            .max(0.0) as u32;
+                        let bottom = (self.padding + (y + h) as f32 * self.cell.1)
+                            .ceil()
+                            .max(0.0) as u32;
+                        [
+                            left.min(self.size.0),
+                            top.min(self.size.1),
+                            right.min(self.size.0).saturating_sub(left),
+                            bottom.min(self.size.1).saturating_sub(top),
+                        ]
+                    })
+                    .unwrap_or([0, 0, self.size.0, self.size.1]);
+                ImageDraw {
+                    key,
+                    rect,
+                    z: img.z,
+                    clip,
+                }
             })
             .collect();
         // 只保留本帧可见图像的缓存项(删除/替换 → 旧纹理随帧释放)。
         let visible: std::collections::HashSet<(u32, usize)> =
-            self.current_images.iter().map(|(k, _, _)| *k).collect();
+            self.current_images.iter().map(|image| image.key).collect();
         self.img_cache.retain(|k, _| visible.contains(k));
         for img in &grid.images {
             let key = (
@@ -1146,6 +1186,7 @@ impl Renderer {
             }
             self.glyph_buffers.insert(key, CachedGlyph { buffer, ink });
         }
+        self.preedit_right = grid.preedit.as_ref().and_then(|p| p.clip_right);
         self.preedit_pos = grid
             .preedit
             .as_ref()
@@ -1505,7 +1546,11 @@ impl Renderer {
                 bounds: TextBounds {
                     left: left.floor() as i32,
                     top: top.floor() as i32,
-                    right: self.size.0 as i32,
+                    right: self
+                        .preedit_right
+                        .map(|col| (self.padding + col as f32 * self.cell.0).ceil() as i32)
+                        .unwrap_or(self.size.0 as i32)
+                        .min(self.size.0 as i32),
                     bottom: (top + self.cell.1).ceil() as i32,
                 },
                 default_color: self.fg_default,
@@ -1580,13 +1625,18 @@ impl Renderer {
 
     /// 画 kitty 图像(`above` = 文本之上)。
     fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, above: bool) {
-        let rects: Vec<((u32, usize), [f32; 4])> = self
+        for image in self
             .current_images
             .iter()
-            .filter(|(_, _, z)| (*z > 0) == above)
-            .map(|(key, rect, _)| (*key, *rect))
-            .collect();
-        for (key, rect) in rects {
+            .filter(|image| (image.z > 0) == above)
+        {
+            let key = image.key;
+            let rect = image.rect;
+            let [x, y, w, h] = image.clip;
+            if w == 0 || h == 0 {
+                continue;
+            }
+            pass.set_scissor_rect(x, y, w, h);
             let Some((_, bind, _, _, inst)) = self.img_cache.get(&key) else {
                 continue;
             };
@@ -1598,6 +1648,7 @@ impl Renderer {
             pass.set_vertex_buffer(1, inst.slice(..));
             pass.draw(0..6, 0..1);
         }
+        pass.set_scissor_rect(0, 0, self.size.0, self.size.1);
     }
 
     /// 把当前帧纹理读回并保存为 PNG(阻塞)。
@@ -1702,6 +1753,7 @@ mod tests {
         for ch in [12.0, 24.0, 48.0] {
             for position in [0.0, 0.5, 1.0] {
                 let g = Scrollbar {
+                    right: None,
                     top: 3.0,
                     extent: 20.0,
                     position,
@@ -1725,6 +1777,7 @@ mod tests {
             }
         }
         let tiny = Scrollbar {
+            right: None,
             top: 1.0,
             extent: 1.0,
             position: 0.0,
@@ -1737,6 +1790,7 @@ mod tests {
         assert_eq!(tiny.offset(1000.0, 0.0, 1000), 0);
         assert!(
             Scrollbar {
+                right: None,
                 top: 0.0,
                 extent: 20.0,
                 position: 0.0,
@@ -1877,6 +1931,7 @@ mod tests {
             col: 2,
             row: 0,
             cursor_bytes: None,
+            clip_right: None,
         });
         let draws = text_cells(&grid, Rgb(0, 160, 128));
         assert_eq!(

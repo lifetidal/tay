@@ -242,6 +242,11 @@ impl KeyBinding {
 }
 fn default_keys() -> Vec<KeyBinding> {
     let mut keys: Vec<_> = [
+        ("d", "CTRL|SHIFT", "split-right"),
+        ("e", "CTRL|SHIFT", "split-down"),
+        ("o", "CTRL|ALT", "next-pane"),
+        ("w", "CTRL|ALT", "close-pane"),
+        ("z", "CTRL|SHIFT", "zoom-pane"),
         ("t", "CTRL", "new-tab"),
         ("w", "CTRL", "close-tab"),
         ("t", "ALT", "new-tab"),
@@ -757,6 +762,11 @@ impl Config {
             check(seen.insert((key, mask.unwrap_or(255))), "存在重复快捷键");
             check(
                 [
+                    "split-right",
+                    "split-down",
+                    "next-pane",
+                    "close-pane",
+                    "zoom-pane",
                     "new-tab",
                     "close-tab",
                     "next-tab",

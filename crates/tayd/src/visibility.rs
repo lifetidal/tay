@@ -59,6 +59,12 @@ impl VisibilityController {
         self.vis == Vis::Hidden
     }
 
+    /// Keyboard eligibility follows the requested visibility, not the animated
+    /// margin: hiding must release focus before the first animation frame.
+    pub fn wants_keyboard(&self) -> bool {
+        matches!(self.vis, Vis::Shown | Vis::Animating { target: true, .. })
+    }
+
     /// 当前实际 margin(输出回退重建 layer 后由应用重新提交)。
     pub fn margin(&self) -> i32 {
         self.margin
@@ -205,6 +211,48 @@ impl VisibilityController {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn keyboard_released_at_hide_start_and_restored_on_reversal() {
+        let mut v = VisibilityController::new(400);
+        assert!(!v.wants_keyboard());
+        v.show(0);
+        assert!(v.wants_keyboard());
+        v.toggle(150);
+        assert!(v.animating());
+        assert!(!v.is_hidden());
+        assert_eq!(v.margin(), 0);
+        assert!(
+            !v.wants_keyboard(),
+            "release before any hide frame or late focus event"
+        );
+        v.toggle(150);
+        assert!(
+            v.wants_keyboard(),
+            "a reversed hide must acquire focus again"
+        );
+        v.hide(150);
+        v.step_at(Instant::now() + Duration::from_millis(200), 150);
+        assert!(v.is_hidden());
+        assert!(
+            !v.wants_keyboard(),
+            "late focus events must not reactivate hidden Tay"
+        );
+    }
+
+    #[test]
+    fn keyboard_policy_handles_instant_hide_and_cancelled_show() {
+        for animation_ms in [0, 150] {
+            let mut v = VisibilityController::new(400);
+            v.show(animation_ms);
+            assert!(v.wants_keyboard());
+            // Hide before the opening animation advances (margin is still offscreen).
+            v.hide(animation_ms);
+            assert!(!v.wants_keyboard());
+            v.show(animation_ms);
+            assert!(v.wants_keyboard());
+        }
+    }
 
     #[test]
     fn show_hide_instant_with_zero_animation() {

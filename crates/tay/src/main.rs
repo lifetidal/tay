@@ -208,7 +208,8 @@ fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "toggle".into());
     let cmd = match cmd.as_str() {
         "toggle" | "show" | "hide" | "quit" | "pin" | "new-tab" | "next-tab" | "close-tab"
-        | "settings" | "maximize" | "restore" => cmd,
+        | "settings" | "maximize" | "restore" | "split-right" | "split-down" | "next-pane"
+        | "close-pane" | "zoom-pane" => cmd,
         "config" => {
             cmd_config();
             return;
@@ -275,7 +276,7 @@ fn main() {
         "--daemon" => return, // 被 CLI 拉起时:正常初始化 daemon
         _ => {
             eprintln!(
-                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|settings|maximize|restore|resurrect|config|keys|doctor](默认 toggle)"
+                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|split-right|split-down|next-pane|close-pane|zoom-pane|settings|maximize|restore|resurrect|config|keys|doctor](默认 toggle)"
             );
             std::process::exit(2);
         }

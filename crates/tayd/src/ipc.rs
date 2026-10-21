@@ -131,6 +131,11 @@ pub fn accept_loop(listener: UnixListener, tx: SyncSender<IpcCommand>, wake: Arc
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IpcCommand {
+    SplitRight,
+    SplitDown,
+    NextPane,
+    ClosePane,
+    ZoomPane,
     Toggle,
     Show,
     Hide,
@@ -168,6 +173,11 @@ fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixS
             "hide" => Some(IpcCommand::Hide),
             "quit" => Some(IpcCommand::Quit),
             "pin" => Some(IpcCommand::Pin),
+            "split-right" => Some(IpcCommand::SplitRight),
+            "split-down" => Some(IpcCommand::SplitDown),
+            "next-pane" => Some(IpcCommand::NextPane),
+            "close-pane" => Some(IpcCommand::ClosePane),
+            "zoom-pane" => Some(IpcCommand::ZoomPane),
             "new-tab" => Some(IpcCommand::NewTab),
             "next-tab" => Some(IpcCommand::NextTab),
             "close-tab" => Some(IpcCommand::CloseTab),

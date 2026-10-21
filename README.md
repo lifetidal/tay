@@ -1,5 +1,7 @@
 # Tay
 
+<img src="packaging/icons/tay.png" alt="Tay 项目 Logo" width="160">
+
 **按一下按键,终端就从屏幕顶部滑下来;再按一下,它就藏回去。**
 
 一个 Linux 下拉终端(像老游戏里的 Quake 控制台)。Rust 写的,跑在
@@ -14,7 +16,7 @@ Wayland 上,没装任何配置也能直接干活。呼出只要 1~16 毫秒—�
 
 ```bash
 ./tools/package-arch.sh --offline
-sudo pacman -U ./dist/arch/tay-*.pkg.tar.zst
+sudo pacman -U ./dist/arch/tay-0.1.0-23-$(uname -m).pkg.tar.zst
 ```
 
 或者直接从源码装:
@@ -61,6 +63,28 @@ tay toggle      # 呼出 / 收起
 还原,`×` 关掉整个 Tay。标签上的小 `x` 只关那一个标签。
 命令行也有:`tay new-tab`、`tay next-tab`、`tay close-tab`、
 `tay maximize`、`tay restore`、`tay settings`。
+
+## 原生分屏
+
+一个标签里也可以并排显示多个独立终端，支持嵌套分割：
+
+| 操作 | 默认快捷键 | 命令 |
+|---|---|---|
+| 向右分割 | `Ctrl+Shift+D` | `tay split-right` |
+| 向下分割 | `Ctrl+Shift+E` | `tay split-down` |
+| 切换到下一个窗格 | `Ctrl+Alt+O` | `tay next-pane` |
+| 关闭当前窗格 | `Ctrl+Alt+W` | `tay close-pane` |
+| 当前窗格最大化 / 还原 | `Ctrl+Shift+Z` | `tay zoom-pane` |
+
+点击窗格切换焦点，拖动分隔线调整大小。新窗格沿用当前 shell 和工作目录；
+输入、滚动、选区、搜索和折叠状态各自独立。标签标题中的 `[2/3]` 表示
+当前是第 2 个窗格，共 3 个。关闭标签会结束其中全部窗格。
+
+每个标签最多 8 个窗格，全部标签合计最多 24 个会话。窗口过小时暂时只显示
+焦点窗格，放大后恢复布局。`tay quit` 保存分割方向、比例和焦点，
+`tay resurrect` 恢复布局；不恢复运行中的命令与滚动历史。
+
+快捷键可在 Lua `keys` 中覆盖，action 名称与上表命令相同。
 
 ## 让它好看
 

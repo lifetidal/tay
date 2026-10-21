@@ -7,7 +7,7 @@
 ```bash
 sudo pacman -S --needed base-devel rust
 ./tools/package-arch.sh
-sudo pacman -U ./dist/arch/tay-*.pkg.tar.zst
+sudo pacman -U ./dist/arch/tay-0.1.0-23-$(uname -m).pkg.tar.zst
 ```
 
 使用 rustup 管理 Rust 时，可保留现有工具链。打包需要支持 Rust 2024 edition 的工具链。
@@ -16,7 +16,7 @@ sudo pacman -U ./dist/arch/tay-*.pkg.tar.zst
 
 可选参数：`--offline` 仅使用 Cargo 缓存；`--syncdeps` 允许 makepkg
 通过 pacman 补齐依赖；`--skip-tests` 跳过测试。产物在 `dist/arch/`，
-独立构建缓存保存在 `target/arch-package/`。重复构建会覆盖相同版本的包。
+独立构建缓存保存在 `target/arch-package/`。默认拒绝覆盖同版本包；重新发布请递增 pkgrel，明确需要覆盖时使用 `--force`。
 底层配方为 `packaging/arch/PKGBUILD`，由脚本提供源码归档、版本和 SHA256。
 
 安装后，从应用菜单打开 Tay，或运行：
@@ -53,7 +53,7 @@ systemctl --user enable --now tayd.service
 `tay quit` 再启动服务，避免重复实例。默认是否显示窗口由用户配置的
 `start_hidden` 决定。卸载：`sudo pacman -R tay`。
 
-`packaging/aur/PKGBUILD` 是早期远程 AUR 草案，含占位仓库地址，
+`packaging/aur/PKGBUILD` 是从项目 Git 仓库构建的开发版配方，
 不用于上述本地打包流程。
 
 ## 其他发行版
@@ -66,3 +66,9 @@ systemctl --user enable --now tayd.service
   不同,宿主机的 `tay` CLI 无法直接连沙箱 daemon 的 IPC socket ——
   沙箱场景请用沙箱内的 `tay`(或 portal 热键)。全链路验证见
   DESIGN §9 M4 验收。
+
+0.1.0-22 起使用固定 Portal 应用身份 `org.tay.Tay`（菜单入口
+`org.tay.Tay.desktop`），不再依赖启动它的终端身份。首次运行可能需要
+重新确认全局快捷键授权。实际快捷键由桌面最终决定，托盘提示及菜单显示
+授权结果；未分配时可用托盘呼出，或在桌面绑定 `tay toggle`。
+托盘左键切换窗口，右键提供显示、隐藏、设置与退出；隐藏保留托盘和会话。

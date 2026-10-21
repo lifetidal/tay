@@ -70,6 +70,10 @@ pub fn configured_key_action<'a>(
     let action = configured_action(config, key.key, mods)?;
     if key.repeat
         && [
+            "split-right",
+            "split-down",
+            "close-pane",
+            "zoom-pane",
             "new-tab",
             "close-tab",
             "hide",
@@ -157,6 +161,40 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_shortcuts_consume_releases_and_repeats_without_spawning_again() {
+        let config = tay_config::Config::default();
+        for (c, action, alt) in [
+            ('D', "split-right", false),
+            ('E', "split-down", false),
+            ('W', "close-pane", true),
+            ('Z', "zoom-pane", false),
+        ] {
+            let mods = Mods {
+                ctrl: true,
+                shift: !alt,
+                alt,
+                meta: false,
+            };
+            let mut key = KeyPress {
+                key: KeyKind::Char(c),
+                text: None,
+                raw_code: 0,
+                repeat: false,
+            };
+            assert_eq!(
+                configured_key_action(&config, &key, true, mods),
+                Some(action)
+            );
+            assert_eq!(configured_key_action(&config, &key, false, mods), None);
+            key.repeat = true;
+            assert_eq!(
+                configured_key_action(&config, &key, true, mods),
+                Some("none")
+            );
+        }
+    }
 
     fn ctrl_shift() -> Mods {
         Mods {

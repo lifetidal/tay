@@ -43,3 +43,4 @@ dirs.workspace = true
 log.workspace = true
 env_logger.workspace = true
 icy_sixel = "0.7.0"
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }

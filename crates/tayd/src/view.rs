@@ -253,6 +253,7 @@ pub fn images_to_display(
                 return None;
             }
             Some(tay_render::RenderImage {
+                clip: None,
                 id: e.id,
                 row,
                 col: e.col as usize,

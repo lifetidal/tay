@@ -28,7 +28,7 @@
                 "install -Dm755 target/release/tayd /app/bin/tayd",
                 "install -Dm755 target/release/tay /app/bin/tay",
                 "install -Dm644 packaging/tay.desktop /app/share/applications/org.tay.Tay.desktop",
-                "sed -i s/Icon=tay/Icon=utilities-terminal/ /app/share/applications/org.tay.Tay.desktop"
+                "sed -i s/Icon=tay-owl-rounded-v1/Icon=utilities-terminal/ /app/share/applications/org.tay.Tay.desktop"
             ],
             "sources": [
                 {

@@ -18,6 +18,20 @@ pub struct PersistTab {
     /// 退出时刻的工作目录(/proc/<pid>/cwd;子进程已退出 → None)。
     pub cwd: Option<String>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panes: Vec<PersistPane>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<crate::panes::Layout<usize>>,
+    #[serde(default)]
+    pub focused: usize,
+    #[serde(default)]
+    pub zoomed: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PersistPane {
+    pub shell: String,
+    pub cwd: Option<String>,
+    pub title: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,7 +67,11 @@ fn save_at(path: &Path, tabs: &[PersistTab], active: usize) -> std::io::Result<(
         std::fs::create_dir_all(dir)?;
     }
     let text = toml::to_string_pretty(&File {
-        version: 1,
+        version: if tabs.iter().any(|tab| !tab.panes.is_empty()) {
+            2
+        } else {
+            1
+        },
         active,
         tabs: tabs.to_vec(),
     })
@@ -72,8 +90,31 @@ pub fn load() -> Option<(Vec<PersistTab>, usize)> {
 fn load_at(path: &Path) -> Option<(Vec<PersistTab>, usize)> {
     let text = std::fs::read_to_string(path).ok()?;
     let file: File = toml::from_str(&text).ok()?;
-    if file.version != 1 || file.tabs.is_empty() {
+    if !matches!(file.version, 1 | 2) || file.tabs.is_empty() {
         return None;
+    }
+    if file.tabs.len() > 24 {
+        return None;
+    }
+    let mut count = 0;
+    for tab in &file.tabs {
+        count += tab.panes.len().max(1);
+        if tab.panes.len() > 8 || count > 24 {
+            return None;
+        }
+        if let Some(layout) = &tab.layout {
+            let ids = layout.ids();
+            let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+            if tab.panes.is_empty()
+                || ids.len() != tab.panes.len()
+                || unique.len() != ids.len()
+                || ids.iter().any(|&id| id >= tab.panes.len())
+            {
+                return None;
+            }
+        } else if tab.panes.len() > 1 {
+            return None;
+        }
     }
     let active = file.active.min(file.tabs.len() - 1);
     Some((file.tabs, active))
@@ -87,6 +128,45 @@ mod tests {
         std::env::temp_dir().join(format!("tay-persist-test-{name}-{}", std::process::id()))
     }
 
+    #[test]
+    fn split_layout_roundtrips_and_rejects_duplicate_or_missing_panes() {
+        use crate::panes::{Axis, Layout};
+        let path = tmp_path("panes");
+        let mut root = Layout::leaf(0);
+        root.split(0, 1, Axis::Columns);
+        root.split(1, 2, Axis::Rows);
+        root.set_ratio(&[], 650);
+        let mut tab = PersistTab {
+            shell: "/bin/sh".into(),
+            cwd: None,
+            title: "tab".into(),
+            panes: (0..3)
+                .map(|i| PersistPane {
+                    shell: "/bin/sh".into(),
+                    cwd: Some("/tmp".into()),
+                    title: format!("pane-{i}"),
+                })
+                .collect(),
+            layout: Some(root),
+            focused: 2,
+            zoomed: true,
+        };
+        save_at(&path, &[tab.clone()], 0).unwrap();
+        assert_eq!(load_at(&path).unwrap(), (vec![tab.clone()], 0));
+        tab.layout = Some(Layout::leaf(0));
+        save_at(&path, &[tab.clone()], 0).unwrap();
+        assert!(load_at(&path).is_none());
+        tab.layout = Some(Layout::Split {
+            axis: Axis::Columns,
+            ratio: 500,
+            first: Box::new(Layout::leaf(0)),
+            second: Box::new(Layout::leaf(0)),
+        });
+        save_at(&path, &[tab], 0).unwrap();
+        assert!(load_at(&path).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// 保存 → 读回:字段逐项一致,active 钳制到合法范围。
     #[test]
     fn roundtrip_preserves_tabs_and_clamps_active() {
@@ -97,11 +177,19 @@ mod tests {
                 shell: "/bin/bash".into(),
                 cwd: Some("/home/weiyi/proj".into()),
                 title: "bash".into(),
+                panes: vec![],
+                layout: None,
+                focused: 0,
+                zoomed: false,
             },
             PersistTab {
                 shell: "fish".into(),
                 cwd: None,
                 title: "fish".into(),
+                panes: vec![],
+                layout: None,
+                focused: 0,
+                zoomed: false,
             },
         ];
         save_at(&path, &tabs, 99).expect("save");

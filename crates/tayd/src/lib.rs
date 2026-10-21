@@ -39,3 +39,9 @@ pub mod fuzz_support {
         crate::ptyloop::exercise_sixel(&data[..data.len().min(64 * 1024)]);
     }
 }
+
+mod panes;
+
+mod composite;
+
+mod tray;
