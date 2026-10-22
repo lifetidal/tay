@@ -155,6 +155,10 @@ class Watcher(dbus.service.Object):
                 print('PASS: actual tray properties, rounded icon and menu exported', flush=True)
                 return False
             except Exception as error:
+                # A short-lived recovery-test daemon can exit before this delayed
+                # callback. A retired item is not an export failure.
+                if not bus.name_has_owner(name):
+                    return False
                 verification_errors.append(repr(error))
                 return False
         GLib.timeout_add(150, verify)

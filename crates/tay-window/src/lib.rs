@@ -13,6 +13,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use wayland_protocols_plasma::blur::client::{
+    org_kde_kwin_blur::OrgKdeKwinBlur, org_kde_kwin_blur_manager::OrgKdeKwinBlurManager,
+};
 
 use sctk::compositor::{CompositorHandler, CompositorState};
 use sctk::delegate_registry;
@@ -169,6 +172,48 @@ fn physical_size(logical: (u32, u32), scale: f64) -> (u32, u32) {
 }
 
 impl Ctx<'_> {
+    pub fn diagnostic_state(&self) -> String {
+        format!(
+            "surface={:?}, blur_requested={}, blur_applied={}",
+            self.state.phase,
+            self.state.blur_requested,
+            self.state.blur.is_some()
+        )
+    }
+    pub fn set_background_blur(&mut self, enabled: bool) {
+        if self.state.blur_requested == enabled && (!enabled || self.state.blur.is_some()) {
+            return;
+        }
+        self.state.blur_requested = enabled;
+        if self.state.blur_manager.is_none() {
+            self.state.blur_manager = self
+                .state
+                .registry_state
+                .bind_one::<OrgKdeKwinBlurManager, _, _>(&self.state.qh, 1..=1, ())
+                .ok();
+        }
+        let Some(manager) = self.state.blur_manager.as_ref() else {
+            if enabled {
+                log::warn!("合成器不支持 KDE 背景模糊，保留透明背景");
+            }
+            return;
+        };
+        if let Some(old) = self.state.blur.take() {
+            old.release();
+        }
+        if enabled {
+            let blur = manager.create(&self.state.surface, &self.state.qh, ());
+            blur.set_region(None);
+            blur.commit();
+            self.state.blur = Some(blur);
+        } else {
+            manager.unset(&self.state.surface);
+        }
+        if self.state.phase != SurfacePhase::Unmapped {
+            self.state.surface.commit();
+        }
+    }
+
     /// 请求下一帧(帧回调到达后投递 `RedrawRequested`)。
     pub fn request_redraw(&mut self) {
         self.state.redraw_requested = true;
@@ -515,6 +560,9 @@ struct WindowState {
     /// SurfaceReplaced 并销毁渲染器。
     retired: Vec<(LayerSurface, wl_surface::WlSurface)>,
     layer: Option<LayerSurface>,
+    blur_requested: bool,
+    blur_manager: Option<OrgKdeKwinBlurManager>,
+    blur: Option<OrgKdeKwinBlur>,
     keyboard_mode: KeyboardInteractivity,
     requested_size: (u32, u32),
     /// layer-shell 全局保活(输出回退重建 layer surface 时还要用)。
@@ -598,6 +646,9 @@ impl WindowState {
             surface,
             retired: Vec::new(),
             layer: None,
+            blur_requested: false,
+            blur_manager: None,
+            blur: None,
             keyboard_mode: KeyboardInteractivity::None,
             requested_size: (0, 480),
             layer_shell,
@@ -869,7 +920,7 @@ impl ProvidesRegistryState for WindowState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState, SeatState];
+    registry_handlers![OutputState, SeatState, BlurGlobals];
 }
 
 impl CompositorHandler for WindowState {
@@ -984,6 +1035,10 @@ impl WindowState {
         // 上一代退役资源此刻才销毁:app 在上一次重建的
         // SurfaceReplaced 里已销毁渲染器,旧 surface 上不再有
         // wgpu 引用(sctk 保证先销毁角色再销毁 surface 的顺序)。
+        if let Some(blur) = self.blur.take() {
+            blur.release();
+        }
+        self.blur_requested = false;
         self.retired.clear();
         // 当前这一代退役**保活**:app 要等 SurfaceReplaced 事件
         // 才 drop 渲染器,surface 必须先活过 wgpu 的销毁。
@@ -1463,6 +1518,60 @@ fn map_button(button: u32) -> MouseButtonIdx {
         0x111 => MouseButtonIdx::Right,
         0x112 => MouseButtonIdx::Middle,
         n => MouseButtonIdx::Other(n as u16),
+    }
+}
+
+impl sctk::dispatch2::Dispatch2<OrgKdeKwinBlurManager, WindowState> for () {
+    fn event(
+        &self,
+        _: &mut WindowState,
+        _: &OrgKdeKwinBlurManager,
+        _: <OrgKdeKwinBlurManager as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<WindowState>,
+    ) {
+    }
+}
+impl sctk::dispatch2::Dispatch2<OrgKdeKwinBlur, WindowState> for () {
+    fn event(
+        &self,
+        _: &mut WindowState,
+        _: &OrgKdeKwinBlur,
+        _: <OrgKdeKwinBlur as Proxy>::Event,
+        _: &Connection,
+        _: &QueueHandle<WindowState>,
+    ) {
+    }
+}
+
+struct BlurGlobals;
+impl sctk::registry::RegistryHandler<WindowState> for BlurGlobals {
+    fn new_global(
+        data: &mut WindowState,
+        _: &Connection,
+        _: &QueueHandle<WindowState>,
+        _: u32,
+        interface: &str,
+        _: u32,
+    ) {
+        if interface == "org_kde_kwin_blur_manager" {
+            let enabled = data.blur_requested;
+            Ctx { state: data }.set_background_blur(enabled);
+        }
+    }
+    fn remove_global(
+        data: &mut WindowState,
+        _: &Connection,
+        _: &QueueHandle<WindowState>,
+        _: u32,
+        interface: &str,
+    ) {
+        if interface == "org_kde_kwin_blur_manager" {
+            if let Some(blur) = data.blur.take() {
+                blur.release();
+            }
+            data.blur_manager = None;
+        }
     }
 }
 

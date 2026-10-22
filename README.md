@@ -5,8 +5,7 @@
 **按一下按键,终端就从屏幕顶部滑下来;再按一下,它就藏回去。**
 
 一个 Linux 下拉终端(像老游戏里的 Quake 控制台)。Rust 写的,跑在
-Wayland 上,没装任何配置也能直接干活。呼出只要 1~16 毫秒——因为
-它平时就待在后台等着你。
+Wayland 上,没装任何配置也能直接干活。常驻后台，实际呼出速度取决于桌面合成器、显卡和机器配置。
 
 设计蓝图见 [DESIGN.md](DESIGN.md);开发过程记录见 [docs/](docs/)。
 
@@ -16,7 +15,7 @@ Wayland 上,没装任何配置也能直接干活。呼出只要 1~16 毫秒—�
 
 ```bash
 ./tools/package-arch.sh --offline
-sudo pacman -U ./dist/arch/tay-0.1.0-23-$(uname -m).pkg.tar.zst
+sudo pacman -U ./dist/arch/tay-0.1.0-34-$(uname -m).pkg.tar.zst
 ```
 
 或者直接从源码装:
@@ -81,15 +80,16 @@ tay toggle      # 呼出 / 收起
 当前是第 2 个窗格，共 3 个。关闭标签会结束其中全部窗格。
 
 每个标签最多 8 个窗格，全部标签合计最多 24 个会话。窗口过小时暂时只显示
-焦点窗格，放大后恢复布局。`tay quit` 保存分割方向、比例和焦点，
-`tay resurrect` 恢复布局；不恢复运行中的命令与滚动历史。
+焦点窗格，放大后恢复布局。布局和工作目录每秒采样，由后台线程合并保存；正常退出会保存最终状态。
+异常退出后下次启动自动恢复，正常退出后可用 `tay resurrect` 恢复。
+只恢复 Shell、目录和布局，不恢复运行中的命令与滚动历史。
 
 快捷键可在 Lua `keys` 中覆盖，action 名称与上表命令相同。
 
 ## 让它好看
 
 所有外观都在一个文件里:`~/.config/tay/config.lua`。
-改完保存,**立即生效**,不用重启。写坏了也没关系——它会
+外观改完保存后立即生效；Shell 对新会话生效，全局快捷键需要重启并授权。写坏了也没关系——它会
 自动沿用上一次能用的配置。
 
 ```lua
@@ -106,18 +106,18 @@ return {
   tab_bar = {
     visible = true,       -- 改成 false = 极简模式:整条栏藏起来,
                           --   终端占满全高(快捷键照常工作)
-    compact = true,       -- true = 只有一行标签;false = 三行完整栏
+    compact = true,       -- true = 紧凑标签栏;false = 更宽松的栏高
     -- 颜色全都可以不写:不写就从主题自动搭配,换主题自动协调
   },
 }
 ```
 
 不知道颜色怎么配?打开设置面板(`Ctrl+,`,或点标签栏的齿轮),
-**Font / Background / Text color** 可以直接点着改,改完自动
+设置以独立浮层显示，不改变终端行数。外观、背景、快捷键分为三个页面；主题可直接预览，透明度、图片强度和亮度可点击或拖动调整，图片可用桌面文件选择器选择，也可编辑路径。「撤销上次修改」撤销上一次外观操作，「恢复默认外观」回到出厂外观。点击字段后输入，Enter 应用、Esc 取消、Ctrl+A 替换、Ctrl+V 粘贴，改完自动
 保存到配置文件(你手写的注释和逻辑都会保留)。
 
 改字号还有更快的:`Ctrl+=` 放大、`Ctrl+-` 缩小、`Ctrl+0` 复原,
-或点标签栏的 `A+` / `A-`。
+或在设置面板点击字号字段。
 
 想换全局呼出键(默认 F12):
 
@@ -171,3 +171,49 @@ cargo clippy --workspace --all-targets -- -D warnings
 跑一遍端到端冒烟(用独立配置和 socket,不碰你正在用的实例)。
 
 许可证:**GPL-3.0**。
+
+### 背景图片与模糊
+
+在现有 `~/.config/tay/config.lua` 的返回表中加入以下字段，保存后自动重载：
+
+```lua
+background_image = "/home/用户名/Pictures/wallpaper.jpg", -- PNG/JPEG；空字符串禁用
+background_image_opacity = 0.25, -- 图片自身不透明度，0～1
+background_image_brightness = 0.45, -- 图片亮度，0～1；与窗口透明度独立
+background_blur = true, -- KDE/KWin 背景模糊，需桌面启用模糊效果
+opacity = 0.85, -- 终端纯色背景不透明度
+```
+
+图片居中覆盖窗口并随窗口尺寸缩放；支持绝对路径和 `~/`。
+为显示模糊效果应保留一定透明度。桌面不支持 KDE 模糊协议时自动降级；
+图片读取或解码失败时使用纯色背景，原因会显示在设置面板的背景页，
+修复文件后自动恢复。
+
+### 关闭保护与运行诊断
+
+默认 `confirm_close = true`。检测到终端前台任务时，关闭标签、窗格或整个 Tay
+会显示确认面板：Ctrl+Enter 或点击 Close 确认，Enter / Esc 或点击 Cancel 取消。
+空闲 Shell 直接关闭。需要明确跳过保护时使用 `tay quit --force`；
+脚本也可以使用 `tay confirm-close` / `tay cancel-close`。
+注意：0.1.0-34 之前 `tay quit` 无条件退出；从本版起有前台任务时改为显示确认，
+依赖旧行为的脚本或快捷键请改用 `tay quit --force`。
+保护基于 Linux 控制终端的前台进程组，不是未保存文件或所有后台任务的检测器。
+
+`tay status` 查询运行中的 daemon，显示实际快捷键绑定反馈、窗口及 GPU 阶段、
+模糊请求与应用状态、配置路径、会话数量和最近反馈；不会启动新 daemon。
+`tay doctor` 同时显示环境能力与运行状态。Portal 接口可用不等于快捷键已获授权。
+托盘显示实际快捷键、窗口状态与标签数量。安装升级后需保存工作并重启 daemon。
+
+### 平台支持边界
+
+Tay 当前要求 Wayland、wlr-layer-shell，以及可用的 GPU 渲染后端。
+隔离 KWin 桌面已覆盖呼出、隐藏、焦点、Portal 与托盘模拟服务和布局恢复；
+其他桌面需要分别验证 layer-shell、全局快捷键和托盘能力。
+不提供 layer-shell 的桌面当前无法启动 Tay，没有普通窗口回退。
+模糊是可选增强，依赖桌面提供 KDE 模糊协议；物理快捷键、输入法、多屏及分数缩放
+仍应在目标桌面人工验收，自动化通过不代表这些环境全部通过。
+
+设置面板支持 Tab / Shift+Tab 或方向键导航、Enter 操作、Esc 关闭；
+`tay settings appearance`、`tay settings background`、`tay settings shortcuts` 可直达页面。
+文件选择需要桌面 FileChooser Portal；不可用时仍可编辑本地图片路径。
+浮层沿用当前文字渲染与字号体系，尚未拆分独立的界面字体大小。

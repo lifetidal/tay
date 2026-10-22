@@ -68,6 +68,7 @@ pub(crate) fn compose(
         window_icons: vec![],
         chrome_panels: vec![],
         tab_bar_rows: 0,
+        opaque_background: false,
         scrollbar: None,
         selection: None,
         preedit: None,

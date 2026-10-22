@@ -253,6 +253,20 @@ pub struct TayApp {
     pane_output_dirty: bool,
     pane_smoke: Option<(std::path::PathBuf, u8)>,
     active_pane: PaneId,
+    autosaver: crate::persist::Autosaver,
+    autosave_at: Option<Instant>,
+    pending_close_counts: (usize, usize),
+    pending_close: Option<PendingClose>,
+    /// 确认框打开期间任务计数的上次复查时间(任务自行结束就更新数字)。
+    close_refresh_at: Option<Instant>,
+    last_feedback: String,
+    last_desktop_summary: String,
+    settings_page: u8,
+    settings_focus: usize,
+    settings_drag: Option<(crate::chrome::Field, Config)>,
+    settings_feedback: String,
+    appearance_undo: Option<Config>,
+    wallpaper_picker: Option<mpsc::Receiver<Result<String, String>>>,
     settings_open: bool,
     hotkey_status: String,
     tray_status_tx: Option<mpsc::SyncSender<String>>,
@@ -351,6 +365,15 @@ impl GpuPhase {
             GpuPhase::Ready => false,
         }
     }
+
+    /// `tay status` 面向用户的可读阶段名(Debug 格式不是给人看的)。
+    fn label(&self) -> &'static str {
+        match self {
+            GpuPhase::Ready => "就绪",
+            GpuPhase::AwaitingConfigure { rebuild: true } => "等待重建确认",
+            GpuPhase::AwaitingConfigure { rebuild: false } => "等待尺寸确认",
+        }
+    }
 }
 
 struct QuickState {
@@ -363,6 +386,12 @@ impl QuickState {
     fn resolve(&self) -> Option<&crate::quickselect::Match> {
         self.matches.iter().find(|m| m.label == self.typed)
     }
+}
+
+#[derive(Clone)]
+enum PendingClose {
+    Panes(Vec<PaneId>),
+    Window,
 }
 
 impl TayApp {
@@ -412,6 +441,19 @@ impl TayApp {
             pane_output_dirty: false,
             pane_smoke: std::env::var_os("TAY_PANES_SMOKE").map(|path| (path.into(), 0)),
             active_pane,
+            autosaver: Default::default(),
+            autosave_at: None,
+            pending_close_counts: (0, 0),
+            pending_close: None,
+            close_refresh_at: None,
+            last_feedback: String::new(),
+            last_desktop_summary: String::new(),
+            settings_page: 0,
+            settings_focus: 0,
+            settings_drag: None,
+            settings_feedback: String::new(),
+            appearance_undo: None,
+            wallpaper_picker: None,
             settings_open: false,
             hotkey_status,
             tray_status_tx: None,
@@ -580,6 +622,7 @@ impl TayApp {
         }
         .map_err(|e| format!("创建 surface 失败: {e}"))?;
 
+        ctx.set_background_blur(self.config.background_blur);
         let size = ctx.surface_size();
         let shot = self.shot.as_ref().map(|(p, n)| (p.as_str(), *n));
         let renderer = tay_render::Renderer::new(
@@ -598,6 +641,8 @@ impl TayApp {
             .max(1);
         log::info!("网格 {cols}×{rows} @ {cw:.1}×{ch:.1}px 单元格");
         self.dims = Some((cols, rows));
+        let mut renderer = renderer;
+        renderer.update_colors(&self.config);
         self.renderer = Some(renderer);
         self.instance = Some(instance);
         Ok((cols, rows))
@@ -778,9 +823,8 @@ impl TayApp {
     }
     /// 优雅退出:把标签骨架写入会话文件(`tay resurrect` 恢复)。
     /// 保存失败只记日志,不阻断退出(quit 语义优先)。
-    fn write_session_file(&self) {
-        let tabs: Vec<_> = self
-            .layouts
+    fn session_snapshot(&self) -> Vec<crate::persist::PersistTab> {
+        self.layouts
             .iter()
             .filter_map(|tab| {
                 let ids = tab.root.ids();
@@ -811,10 +855,19 @@ impl TayApp {
                     panes,
                 })
             })
-            .collect();
+            .collect()
+    }
+    fn write_session_file(&self) -> bool {
+        let tabs = self.session_snapshot();
         match crate::persist::save(&tabs, self.active_index()) {
-            Ok(()) => log::info!("会话文件已保存: {} 个标签", tabs.len()),
-            Err(e) => log::warn!("会话文件保存失败: {e}"),
+            Ok(()) => {
+                log::info!("会话文件已保存: {} 个标签", tabs.len());
+                true
+            }
+            Err(e) => {
+                log::warn!("会话文件保存失败: {e}");
+                false
+            }
         }
     }
 
@@ -832,7 +885,10 @@ impl TayApp {
             return;
         }
         self.shutting_down = true;
-        self.write_session_file();
+        self.autosaver.finish();
+        if self.write_session_file() {
+            crate::persist::mark_clean();
+        }
         self.stop_sessions();
     }
 
@@ -1004,14 +1060,52 @@ impl TayApp {
             return;
         };
         let ids = tab.root.ids();
+        self.request_close(PendingClose::Panes(ids), ctx);
+    }
+    fn execute_close(&mut self, target: PendingClose, ctx: &mut Ctx<'_>) {
+        if let PendingClose::Window = target {
+            self.shutdown(ctx);
+            return;
+        }
+        let PendingClose::Panes(ids) = target else {
+            return;
+        };
         for id in ids {
-            self.remove_session(id);
+            if self.sessions.iter().any(|(live, _)| live == id) {
+                self.remove_session(id);
+            }
         }
         self.resize_active();
         if self.sessions[self.active_pane].sender.is_none() {
             self.hide(ctx);
         }
         ctx.request_redraw();
+    }
+    fn request_close(&mut self, target: PendingClose, ctx: &mut Ctx<'_>) {
+        let ids = match &target {
+            PendingClose::Window => self.sessions.iter().map(|(id, _)| id).collect(),
+            PendingClose::Panes(ids) => ids.clone(),
+        };
+        let busy = ids
+            .iter()
+            .filter(|id| {
+                self.sessions[**id]
+                    .pid
+                    .is_some_and(crate::close_guard::busy)
+            })
+            .count();
+        if self.config.confirm_close && busy > 0 {
+            self.pending_close_counts = (ids.len(), busy);
+            self.pending_close = Some(target);
+            self.show(ctx);
+            self.status(
+                format!("{busy} 个会话正在运行任务；Ctrl+Enter 确认关闭，Enter / Esc 取消"),
+                ctx,
+            );
+            ctx.request_redraw();
+        } else {
+            self.execute_close(target, ctx);
+        }
     }
     fn close_pane(&mut self, ctx: &mut Ctx<'_>) {
         self.remove_session(self.active_pane);
@@ -1141,13 +1235,24 @@ impl TayApp {
     }
 
     fn refresh_appearance(&mut self, ctx: &mut Ctx<'_>, previous: &Config) {
+        self.appearance_undo = Some(previous.clone());
+        self.settings_feedback = "已保存到 Lua · 可撤销上次修改".into();
+        let geometry_changed = self.config.font != previous.font
+            || self.config.tab_bar.compact != previous.tab_bar.compact
+            || self.config.tab_bar.visible != previous.tab_bar.visible;
         if let Some(r) = &mut self.renderer {
-            r.update_font(&self.config, ctx.scale_factor());
+            if self.config.font != previous.font {
+                r.update_font(&self.config, ctx.scale_factor());
+            }
             r.update_colors(&self.config);
-            let (w, h) = r.surface_size();
-            self.relayout(ctx, w, h, true);
+            if geometry_changed {
+                let (w, h) = r.surface_size();
+                self.relayout(ctx, w, h, true);
+            }
         }
-        self.update_session_colors();
+        if self.config.colors != previous.colors {
+            self.update_session_colors();
+        }
         self.save_appearance(ctx, previous);
         ctx.request_redraw();
     }
@@ -1165,7 +1270,7 @@ impl TayApp {
             }
             Action::CloseWindow => {
                 // 窗口 × 按钮 = 优雅退出:与 tay quit 同路写会话文件。
-                self.shutdown(ctx);
+                self.request_close(PendingClose::Window, ctx);
             }
             Action::Clock => { /* 非交互:点击无操作 */ }
             Action::Hotkeys => {
@@ -1188,8 +1293,84 @@ impl TayApp {
             Action::Settings => {
                 self.settings_open = !self.settings_open;
                 self.editing = None;
-                let (w, h) = ctx.surface_size();
-                self.relayout(ctx, w, h, true);
+                self.settings_focus = 0;
+                self.settings_drag = None;
+                self.settings_feedback.clear();
+            }
+            Action::SettingsPage(page) => {
+                self.settings_page = page;
+                self.settings_focus = 0;
+                self.editing = None;
+                self.settings_feedback.clear();
+            }
+            Action::Theme(index) => {
+                if let Some(theme) = ["default", "midnight", "light", "wezterm"].get(index as usize)
+                {
+                    let previous = self.config.clone();
+                    if crate::appearance::apply(&mut self.config, Field::Theme, theme).is_ok() {
+                        self.refresh_appearance(ctx, &previous);
+                    }
+                }
+            }
+            Action::Level(field, value) => {
+                let previous = self.config.clone();
+                if crate::appearance::apply(&mut self.config, field, &format!("{value}%")).is_ok() {
+                    self.refresh_appearance(ctx, &previous);
+                }
+            }
+            Action::ClearWallpaper => {
+                let previous = self.config.clone();
+                self.config.background_image.clear();
+                self.refresh_appearance(ctx, &previous);
+            }
+            Action::UndoAppearance => {
+                if let Some(undo) = self.appearance_undo.take() {
+                    let previous = self.config.clone();
+                    crate::appearance::restore(&mut self.config, &undo);
+                    ctx.set_background_blur(self.config.background_blur);
+                    self.refresh_appearance(ctx, &previous);
+                } else {
+                    self.status("没有可撤销的外观修改", ctx);
+                }
+            }
+            Action::PickWallpaper => {
+                if self.wallpaper_picker.is_none() {
+                    let (tx, rx) = mpsc::channel();
+                    let wake = self.wake.clone();
+                    match std::thread::Builder::new()
+                        .name("image-picker".into())
+                        .spawn(move || {
+                            let result = async_io::block_on(async {
+                                use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
+                                let request = SelectedFiles::open_file()
+                                    .title("Choose terminal background")
+                                    .multiple(false)
+                                    .filter(
+                                        FileFilter::new("PNG / JPEG")
+                                            .mimetype("image/png")
+                                            .mimetype("image/jpeg"),
+                                    )
+                                    .send()
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                                let files = request.response().map_err(|e| e.to_string())?;
+                                files
+                                    .uris()
+                                    .first()
+                                    .and_then(|uri| crate::settings::local_file_uri(uri.as_str()))
+                                    .ok_or_else(|| "No local image selected".to_string())
+                            });
+                            let _ = tx.send(result);
+                            let _ = (&*wake).write(&[0]);
+                        }) {
+                        Ok(_) => {
+                            self.wallpaper_picker = Some(rx);
+                            self.settings_feedback =
+                                "请在桌面文件选择器中选择 PNG / JPEG 图片".into();
+                        }
+                        Err(error) => self.status(format!("无法打开图片选择器:{error}"), ctx),
+                    }
+                }
             }
             Action::Smaller | Action::Larger => {
                 let previous = self.config.clone();
@@ -1198,8 +1379,41 @@ impl TayApp {
                 .clamp(6.0, 48.0);
                 self.refresh_appearance(ctx, &previous);
             }
+            Action::Blur => {
+                let previous = self.config.clone();
+                self.config.background_blur = !self.config.background_blur;
+                ctx.set_background_blur(self.config.background_blur);
+                self.refresh_appearance(ctx, &previous);
+            }
+            Action::ResetAppearance => {
+                let previous = self.config.clone();
+                crate::appearance::reset(&mut self.config);
+                ctx.set_background_blur(self.config.background_blur);
+                self.refresh_appearance(ctx, &previous);
+            }
+            Action::Diagnostics => {
+                let copied = self.set_clipboard(crate::health::snapshot().replace('\t', "\n"));
+                self.status(
+                    if copied {
+                        "诊断报告已复制"
+                    } else {
+                        "剪贴板不可用;请运行 tay status"
+                    },
+                    ctx,
+                );
+            }
             Action::Edit(field) => {
                 let value = match field {
+                    Field::Theme => self.config.theme.clone(),
+                    Field::Size => self.config.font.size.to_string(),
+                    Field::Opacity => format!("{:.0}%", self.config.opacity * 100.0),
+                    Field::Wallpaper => self.config.background_image.clone(),
+                    Field::ImageBrightness => {
+                        format!("{:.0}%", self.config.background_image_brightness * 100.0)
+                    }
+                    Field::ImageOpacity => {
+                        format!("{:.0}%", self.config.background_image_opacity * 100.0)
+                    }
                     Field::Font => self.config.font.family.clone(),
                     Field::Background => format!(
                         "#{:02x}{:02x}{:02x}",
@@ -1221,27 +1435,12 @@ impl TayApp {
     }
 
     fn apply_edit(&mut self, ctx: &mut Ctx<'_>) {
-        use crate::chrome::Field;
         if let Some((field, value)) = self.editing.take() {
             let previous = self.config.clone();
-            if field == Field::Font {
-                if value.trim().is_empty() {
-                    self.status("字体名称不能为空", ctx);
-                    self.editing = Some((field, value));
-                    return;
-                }
-                self.config.font.family = value.trim().into();
-            } else {
-                let Some(color) = Rgb::from_hex(&value) else {
-                    self.status("请输入 #RRGGBB 颜色", ctx);
-                    self.editing = Some((field, value));
-                    return;
-                };
-                if field == Field::Background {
-                    self.config.colors.background = color;
-                } else {
-                    self.config.colors.foreground = color;
-                }
+            if let Err(error) = crate::appearance::apply(&mut self.config, field, &value) {
+                self.status(error, ctx);
+                self.editing = Some((field, value));
+                return;
             }
             self.refresh_appearance(ctx, &previous);
         }
@@ -1343,11 +1542,9 @@ impl TayApp {
 
             // TAY_RESURRECT=1(tay resurrect 拉起):恢复上次退出保存的
             // 标签骨架(壳/cwd/标题;不恢复网格内容 —— 见 persist.rs)。
-            if let Some((persist_tabs, active)) = std::env::var_os("TAY_RESURRECT")
-                .is_some()
-                .then(crate::persist::load)
-                .flatten()
-            {
+            let recover =
+                std::env::var_os("TAY_RESURRECT").is_some() || crate::persist::recovery_pending();
+            if let Some((persist_tabs, active)) = recover.then(crate::persist::load).flatten() {
                 if !self.restore_sessions(cols, rows, &persist_tabs, active) {
                     let tab = self.start_session(cols, rows)?;
                     self.install_session(tab);
@@ -1357,6 +1554,7 @@ impl TayApp {
                 self.install_session(tab);
             }
 
+            crate::persist::mark_running();
             self.set_ime_area(ctx, (0, 0));
             // 初始 margin 对齐(WindowState 建面时用 -2000 占位防闪屏)。
             self.vis.set_layer_h(self.layer_h);
@@ -1711,6 +1909,14 @@ impl TayApp {
                 text: format!(" 搜索: {query} "),
             });
         }
+        if self.pending_close.is_some() && rows > 0 {
+            overlays.push(tay_render::Overlay {
+                row: rows - 1,
+                col: 0,
+                text: " 正在运行任务：Enter / Esc 取消，Ctrl+Enter 确认关闭（关闭将结束任务） "
+                    .into(),
+            });
+        }
         // 状态 toast(QuickSelect 反馈等):底部一行,约 1.2s 后消失。
         if let Some((msg, at)) = &self.sessions[id].ui.status_msg
             && at.elapsed() < Duration::from_millis(1200)
@@ -1737,6 +1943,7 @@ impl TayApp {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            opaque_background: false,
             scrollbar: self.pane_scrollbar(id, rect, rows),
         }
     }
@@ -2163,14 +2370,19 @@ impl TayApp {
     }
 
     /// 写系统剪贴板(持久实例;失败仅告警一次,不打断操作)。
-    fn set_clipboard(&mut self, text: String) {
+    fn set_clipboard(&mut self, text: String) -> bool {
         match &mut self.clipboard {
-            Some(cb) => {
-                if let Err(e) = cb.set_text(text) {
-                    log::warn!("写剪贴板失败: {e}");
+            Some(cb) => match cb.set_text(text) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!("写剪贴板失败: {error}");
+                    false
                 }
+            },
+            None => {
+                log::warn!("剪贴板不可用");
+                false
             }
-            None => log::warn!("剪贴板不可用(无会话?)"),
         }
     }
 
@@ -2192,6 +2404,10 @@ impl TayApp {
     fn status(&mut self, msg: impl Into<String>, ctx: &mut Ctx<'_>) {
         let msg = msg.into();
         log::info!("{msg}");
+        self.last_feedback = msg.chars().take(512).collect();
+        if self.settings_open {
+            self.settings_feedback = msg.clone();
+        }
         self.sessions[self.active_pane].ui.status_msg = Some((msg, Instant::now()));
         // 到期后醒来重绘一帧清除 toast。
         ctx.request_wake_at(Instant::now() + Duration::from_millis(1200));
@@ -2370,12 +2586,6 @@ impl TayApp {
         // stalled 看门狗(30ms < 50ms 兜底)。
         if self.slowui_at_start && (15..80).contains(&self.frames) {
             std::thread::sleep(Duration::from_millis(30));
-        }
-
-        // 热呼出延迟:呼出指令 → 首帧。
-        if let Some(at) = self.show_at.take() {
-            self.shown_once = true;
-            log::info!("热呼出 {}ms", at.elapsed().as_millis());
         }
 
         // TAY_IME:第 11 帧注入 IME Commit(中文输入链路验收:
@@ -2591,7 +2801,10 @@ impl TayApp {
         }
         let items = self.chrome_items(grid.cols);
         let message = if let Some((field, value)) = &self.editing {
-            format!("Edit {field:?}: {value}_  Enter=save  Esc=cancel  Ctrl+A=replace")
+            format!(
+                "编辑 {}: {value}_  Enter=保存  Esc=取消  Ctrl+A=替换",
+                crate::settings::field_label(field)
+            )
         } else if let Some(action) = self.chrome_hover.filter(|a| {
             if self.settings_open {
                 return false;
@@ -2604,15 +2817,16 @@ impl TayApp {
             )
         }) {
             match action {
-                crate::chrome::Action::Hide => "Minimize: hide window, keep sessions".into(),
-                crate::chrome::Action::Maximize => "Maximize / restore height".into(),
-                _ => "Close window: end all sessions".into(),
+                crate::chrome::Action::Hide => "最小化:隐藏窗口,会话保持运行".into(),
+                crate::chrome::Action::Maximize => "最大化 / 恢复高度".into(),
+                _ => "关闭窗口:结束所有会话".into(),
             }
         } else if self.settings_open {
-            String::new()
+            "外观立即生效并保存 Lua；背景图留空禁用；Shell 仅新会话生效；全局快捷键需重启授权"
+                .into()
         } else {
             format!(
-                "{} | {}: split right | {}: split down | {}: next pane",
+                "{} | {}: 向右分屏 | {}: 向下分屏 | {}: 下一窗格",
                 self.hotkey_status,
                 self.config.binding_hint("split-right"),
                 self.config.binding_hint("split-down"),
@@ -2640,6 +2854,37 @@ impl TayApp {
                 self.settings_open,
             );
         }
+        if self.settings_open {
+            let focused =
+                crate::settings::layout(grid.cols, grid.rows, self.settings_page, &self.config)
+                    .get(self.settings_focus)
+                    .map(|item| item.action);
+            crate::settings::paint(
+                &mut grid,
+                &self.config,
+                self.settings_page,
+                self.chrome_hover.or(focused),
+                self.editing.as_ref(),
+                &crate::settings::OverlayInfo {
+                    status: &crate::health::snapshot(),
+                    feedback: &self.settings_feedback,
+                    background_error: self
+                        .renderer
+                        .as_ref()
+                        .and_then(|renderer| renderer.background_error())
+                        .as_deref(),
+                    undo_available: self.appearance_undo.is_some(),
+                },
+            );
+        }
+        if self.pending_close.is_some() {
+            crate::close_guard::paint(
+                &mut grid,
+                &self.config,
+                self.pending_close_counts.0,
+                self.pending_close_counts.1,
+            );
+        }
         let alpha = self.config.opacity.clamp(0.0, 1.0);
         {
             let renderer = self.renderer.as_mut().expect("renderer 未初始化");
@@ -2655,6 +2900,13 @@ impl TayApp {
                         // commit 才会被 KWin 响应(pre_present 的空 commit
                         // 注册不触发 done,会导致帧循环停摆)。
                         ctx.arm_frame_after_present();
+                        if let Some(at) = self.show_at.take() {
+                            self.shown_once = true;
+                            log::info!(
+                                "首帧已提交 {}ms（实际可见性由合成器决定）",
+                                at.elapsed().as_millis()
+                            );
+                        }
                     }
                 }
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -2677,10 +2929,11 @@ impl TayApp {
             ctx.request_redraw();
         }
 
-        // TAY_SHOT:截图完成后退出。
+        // TAY_SHOT:截图完成后退出。走正常关闭(保存布局并清除恢复
+        // 标记)—— 诊断退出是有意退出,不应让下次启动复活旧布局。
         if self.renderer.as_ref().is_some_and(|r| r.shot_taken()) {
             log::info!("截图完成,退出");
-            ctx.exit();
+            self.shutdown(ctx);
             return;
         }
 
@@ -2699,7 +2952,7 @@ impl TayApp {
                     "基准(滚动输出下 {n} 帧):avg {avg:.2}ms p50 {p50:.2}ms p99 {p99:.2}ms max {max:.2}ms ≈ {:.0} fps",
                     1000.0 / avg.max(0.001)
                 );
-                ctx.exit();
+                self.shutdown(ctx);
             }
         }
     }
@@ -2723,6 +2976,119 @@ impl Handler for TayApp {
         }
         if self.shutting_down {
             return;
+        }
+        if self.pending_close.is_some() {
+            match &event {
+                WEvent::PointerButton {
+                    button: MouseButtonIdx::Left,
+                    pressed: true,
+                    x,
+                    y,
+                } => {
+                    if let (Some(renderer), Some((cols, rows))) = (&self.renderer, self.dims) {
+                        let (cw, ch) = renderer.cell_size();
+                        let col = ((*x - renderer.padding() as f64) / cw as f64).floor();
+                        let row = ((*y - renderer.padding() as f64) / ch as f64).floor();
+                        let rows = rows + crate::chrome::rows(&self.config, self.settings_open);
+                        if col >= 0.0
+                            && row >= 0.0
+                            && let Some(confirm) =
+                                crate::close_guard::hit(cols, rows, col as usize, row as usize)
+                        {
+                            let target = self.pending_close.take();
+                            if let Some(target) = target
+                                && confirm
+                            {
+                                self.execute_close(target, ctx);
+                            }
+                            self.sessions[self.active_pane].ui.status_msg = None;
+                            ctx.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                WEvent::PointerButton { .. }
+                | WEvent::PointerMoved { .. }
+                | WEvent::Scroll { .. }
+                | WEvent::Ime(_) => return,
+                _ => {}
+            }
+        }
+        if self.settings_open {
+            match &event {
+                WEvent::PointerMoved { x, y } | WEvent::PointerButton { x, y, .. } => {
+                    if let (Some(renderer), Some((cols, rows))) = (&self.renderer, self.dims) {
+                        let (cw, ch) = renderer.cell_size();
+                        let pad = renderer.padding() as f64;
+                        let col = ((*x - pad) / cw as f64).floor();
+                        let row = ((*y - pad) / ch as f64).floor();
+                        let rows = rows + crate::chrome::rows(&self.config, false);
+                        let items =
+                            crate::settings::layout(cols, rows, self.settings_page, &self.config);
+                        if matches!(
+                            &event,
+                            WEvent::PointerButton {
+                                button: MouseButtonIdx::Left,
+                                pressed: false,
+                                ..
+                            }
+                        ) {
+                            if let Some((_, start)) = self.settings_drag.take() {
+                                self.appearance_undo = Some(start);
+                            }
+                            return;
+                        }
+                        if let WEvent::PointerMoved { .. } = &event
+                            && let Some((field, _)) = &self.settings_drag
+                            && let Some(action) = crate::settings::drag_level(&items, *field, col)
+                        {
+                            let current = match field {
+                                crate::chrome::Field::Opacity => self.config.opacity,
+                                crate::chrome::Field::ImageOpacity => {
+                                    self.config.background_image_opacity
+                                }
+                                _ => self.config.background_image_brightness,
+                            };
+                            if let crate::chrome::Action::Level(_, level) = action
+                                && (current * 100.).round() as u8 != level
+                            {
+                                self.chrome_action(action, ctx);
+                            }
+                            return;
+                        }
+                        let hit = items.iter().position(|item| {
+                            row == item.row as f64
+                                && col >= item.start as f64
+                                && col < item.end as f64
+                        });
+                        ctx.set_pointer_over_control(hit.is_some());
+                        let hovered = hit.map(|index| items[index].action);
+                        if self.chrome_hover != hovered {
+                            self.chrome_hover = hovered;
+                            ctx.request_redraw();
+                        }
+                        if matches!(
+                            &event,
+                            WEvent::PointerButton {
+                                button: MouseButtonIdx::Left,
+                                pressed: true,
+                                ..
+                            }
+                        ) && let Some(index) = hit
+                        {
+                            self.settings_focus = index;
+                            if let crate::chrome::Action::Level(field, _) = items[index].action {
+                                self.settings_drag = Some((field, self.config.clone()));
+                            }
+                            self.chrome_action(items[index].action, ctx);
+                        }
+                    }
+                    return;
+                }
+                WEvent::Scroll { .. } => return,
+                WEvent::Ime(_) if self.editing.is_none() => return,
+                _ => {}
+            }
         }
         if self.pane_pointer(ctx, &event) {
             return;
@@ -2825,7 +3191,7 @@ impl Handler for TayApp {
             let row = ((*y - pad) / ch as f64).floor();
             let col = ((*x - pad) / cw as f64).floor();
             if row >= 0.0 && row < (crate::chrome::rows(&self.config, self.settings_open) as f64) {
-                if *pressed && col >= 0.0 && !(row as usize == 3 && self.editing.is_some()) {
+                if *pressed && col >= 0.0 && self.editing.is_none() {
                     let items = self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80));
                     if let Some(a) = crate::chrome::hit(&items, row as usize, col as usize) {
                         self.chrome_action(a, ctx);
@@ -2912,6 +3278,8 @@ impl Handler for TayApp {
                 // `tay pin` 临时暂停。
                 if !focused
                     && self.config.hide_on_focus_out
+                    && self.pending_close.is_none()
+                    && !self.settings_open
                     && !self.vis.pinned()
                     && self.vis.wants_keyboard()
                 => {
@@ -2933,6 +3301,18 @@ impl Handler for TayApp {
                     }
                     return;
                 }
+                if self.pending_close.is_some() {
+                    match key.key {
+                        KeyKind::Named(tay_window::NamedKey::Escape) => { self.pending_close = None; self.sessions[self.active_pane].ui.status_msg=None; }
+                        KeyKind::Named(tay_window::NamedKey::Enter) if !key.repeat => {
+                            if let Some(target) = self.pending_close.take() && mods.ctrl { self.execute_close(target, ctx); }
+                            self.sessions[self.active_pane].ui.status_msg=None;
+                        }
+                        _ => {}
+                    }
+                    ctx.request_redraw();
+                    return;
+                }
                 if self.editing.is_some() {
                     if pressed {
                         use tay_window::NamedKey;
@@ -2940,6 +3320,10 @@ impl Handler for TayApp {
                             KeyKind::Named(NamedKey::Escape)=>self.editing=None,
                             KeyKind::Named(NamedKey::Enter)=>self.apply_edit(ctx),
                             KeyKind::Named(NamedKey::Backspace)=>{if let Some((_,v))=&mut self.editing{v.pop();}},
+                            KeyKind::Char('v'|'V') if mods.ctrl=>{
+                                let text=self.clipboard.as_mut().and_then(|clipboard|clipboard.get_text().ok());
+                                if let (Some((_,value)),Some(text))=(&mut self.editing,text) {value.extend(text.chars().filter(|c|!c.is_control()).take(4096));}
+                            },
                             KeyKind::Char('a'|'A') if mods.ctrl=>{if let Some((_,v))=&mut self.editing{v.clear();}},
                             _ if !mods.ctrl && !mods.alt && !mods.meta=>{if let (Some((_,v)),Some(text))=(&mut self.editing,&key.text){v.push_str(text);}},
                             _=>{},
@@ -2951,6 +3335,26 @@ impl Handler for TayApp {
                 if !pressed {
                     return;
                 }
+                if self.settings_open {
+                    use tay_window::NamedKey;
+                    let (cols,rows)=self.dims.unwrap_or((80,24));
+                    let items=crate::settings::layout(cols,rows+crate::chrome::rows(&self.config,false),self.settings_page,&self.config);
+                    match key.key {
+                        KeyKind::Named(NamedKey::Escape)=>self.chrome_action(crate::chrome::Action::Settings,ctx),
+                        KeyKind::Named(NamedKey::Tab|NamedKey::ArrowDown|NamedKey::ArrowRight)=>{
+                            if !items.is_empty() {self.settings_focus=(self.settings_focus+if mods.shift {items.len()-1}else{1})%items.len();}
+                            self.chrome_hover=None;
+                        }
+                        KeyKind::Named(NamedKey::ArrowUp|NamedKey::ArrowLeft)=>{
+                            if !items.is_empty() {self.settings_focus=(self.settings_focus+items.len()-1)%items.len();}
+                            self.chrome_hover=None;
+                        }
+                        KeyKind::Named(NamedKey::Enter) if !key.repeat=>{if let Some(item)=items.get(self.settings_focus){self.chrome_action(item.action,ctx);}}
+                        KeyKind::Char('z'|'Z') if mods.ctrl && !key.repeat=>self.chrome_action(crate::chrome::Action::UndoAppearance,ctx),
+                        _=>{}
+                    }
+                    ctx.request_redraw();return;
+                }
                 // 用户 Lua 键位(config.keys):优先级最高(覆盖内置
                 // 快捷键与 QuickSelect 标签),但**只在按下时**触发 ——
                 // release 也携带相同 mods,放在 pressed 守卫之前会
@@ -2961,7 +3365,7 @@ impl Handler for TayApp {
                     use crate::chrome::Action;
                     match action.as_str() {
                         "split-right"=>self.split_pane(Axis::Columns,ctx), "split-down"=>self.split_pane(Axis::Rows,ctx),
-                        "next-pane"=>self.next_pane(ctx), "close-pane"=>self.close_pane(ctx), "zoom-pane"=>self.zoom_pane(ctx),
+                        "next-pane"=>self.next_pane(ctx), "close-pane"=>self.request_close(PendingClose::Panes(vec![self.active_pane]),ctx), "zoom-pane"=>self.zoom_pane(ctx),
                         "new-tab"=>self.new_tab(ctx), "close-tab"=>self.close_tab(self.active_index(),ctx),
                         "next-tab"=>self.switch_tab((self.active_index()+1)%self.layouts.len(),ctx),
                         "previous-tab"=>self.switch_tab((self.active_index()+self.layouts.len()-1)%self.layouts.len(),ctx),
@@ -3354,22 +3758,27 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::Toggle => self.toggle(ctx),
                         crate::ipc::IpcCommand::Show => self.show(ctx),
                         crate::ipc::IpcCommand::Hide => self.hide(ctx),
+                        crate::ipc::IpcCommand::ForceQuit => { self.shutdown(ctx); return; }
+                        crate::ipc::IpcCommand::ConfirmClose => {
+                            if let Some(target) = self.pending_close.take() { self.execute_close(target,ctx); }
+                        }
+                        crate::ipc::IpcCommand::CancelClose => { self.pending_close=None;ctx.request_redraw(); }
                         crate::ipc::IpcCommand::Quit => {
                             log::info!("收到 quit");
-                            self.shutdown(ctx);
-                            return;
+                            self.request_close(PendingClose::Window, ctx);
                         }
                         crate::ipc::IpcCommand::SplitRight => self.split_pane(Axis::Columns,ctx),
                         crate::ipc::IpcCommand::SplitDown => self.split_pane(Axis::Rows,ctx),
                         crate::ipc::IpcCommand::NextPane => self.next_pane(ctx),
-                        crate::ipc::IpcCommand::ClosePane => self.close_pane(ctx),
+                        crate::ipc::IpcCommand::ClosePane => self.request_close(PendingClose::Panes(vec![self.active_pane]),ctx),
                         crate::ipc::IpcCommand::ZoomPane => self.zoom_pane(ctx),
                         crate::ipc::IpcCommand::NewTab => {self.new_tab(ctx);self.show(ctx);},
                         crate::ipc::IpcCommand::NextTab => self.switch_tab((self.active_index()+1)%self.layouts.len(),ctx),
                         crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_index(),ctx),
                         crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
-                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;let (w,h)=ctx.surface_size();self.relayout(ctx,w,h,true);self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;self.settings_focus=0;self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::SettingsPage(page) => {self.settings_open=true;self.settings_page=page;self.settings_focus=0;self.show(ctx);ctx.request_redraw();},
                         crate::ipc::IpcCommand::Pin => {
                             let pinned = self.vis.toggle_pin();
                             log::info!(
@@ -3449,6 +3858,11 @@ impl Handler for TayApp {
                                     let padding_changed = fresh.padding != self.config.padding;
                                     let chrome_changed=fresh.tab_bar.compact!=self.config.tab_bar.compact || fresh.tab_bar.visible!=self.config.tab_bar.visible;
                                     self.config = *fresh;
+                                    // 外部编辑会覆盖面板改过的外观:旧撤销快照若保留,
+                                    // 点「撤销上次修改」会把用户手写的新值一并回退。
+                                    self.appearance_undo = None;
+                                    self.settings_drag = None;
+                                    ctx.set_background_blur(self.config.background_blur);
                                     self.update_session_colors();
 
                                     // 即时生效字段。
@@ -3474,7 +3888,7 @@ impl Handler for TayApp {
                                 }
                                 crate::config::Reload::Err { repeat, error } => {
                                     if !repeat {
-                                        self.status("配置无效，保留当前设置；请检查 tayd.log", ctx);
+                                        self.status(format!("配置无效，保留当前设置：{error}"), ctx);
                                         log::error!(
                                             "配置重载失败,沿用旧配置: {error} \
 (期望版本与运行配置分离,见 config.rs)"
@@ -3486,7 +3900,7 @@ impl Handler for TayApp {
             }
 
             }
-            WEvent::CloseRequested => self.shutdown(ctx),
+            WEvent::CloseRequested => self.request_close(PendingClose::Window, ctx),
 
             // 输出回退/尺寸变化(多显示器):重设高度并重新对齐 margin。
             // 未初始化(首轮 roundtrip 事件)时忽略,走 CanCreateSurfaces 路径。
@@ -3511,6 +3925,63 @@ impl Handler for TayApp {
             WEvent::OutputChanged => {}
 
             WEvent::AboutToWait => {
+                if let Some(result)=self.wallpaper_picker.as_ref().and_then(|rx|rx.try_recv().ok()) {
+                    self.wallpaper_picker=None;
+                    match result {
+                        Ok(path)=>{let previous=self.config.clone();self.config.background_image=path;self.refresh_appearance(ctx,&previous);}
+                        Err(error)=>self.status(format!("图片选择已取消或不可用:{error};可改用编辑图片路径"),ctx),
+                    }
+                }
+                // 确认框打开期间,任务可能自己结束:定期复查前台进程组,
+                // 避免「将结束 3 个任务」在任务已退出后仍显示旧数字。
+                if self.pending_close.is_some()
+                    && self.close_refresh_at.is_none_or(|at| at.elapsed() >= Duration::from_millis(500))
+                {
+                    self.close_refresh_at = Some(Instant::now());
+                    if let Some(target) = self.pending_close.clone() {
+                        let ids: Vec<PaneId> = match &target {
+                            PendingClose::Window => self.sessions.iter().map(|(id, _)| id).collect(),
+                            PendingClose::Panes(ids) => ids.clone(),
+                        };
+                        let busy = ids.iter().filter(|id| {
+                            self.sessions.iter().any(|(live, _)| live == **id)
+                                && self.sessions[**id].pid.is_some_and(crate::close_guard::busy)
+                        }).count();
+                        if busy != self.pending_close_counts.1 {
+                            self.pending_close_counts.1 = busy;
+                            ctx.request_redraw();
+                        }
+                    }
+                }
+                if self.threads_started && !self.shutting_down {
+                    if self.autosave_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1)) {
+                        self.autosave_at = Some(Instant::now());
+                        self.autosaver.submit(self.session_snapshot(), self.active_index());
+                    }
+                    ctx.request_wake_at(self.autosave_at.unwrap_or_else(Instant::now) + Duration::from_secs(1));
+                }
+                let summary = format!("{} | {} | {} 个标签", self.hotkey_status,
+                    if self.vis.is_hidden() { "已隐藏" } else { "可见" }, self.layouts.len());
+                if summary != self.last_desktop_summary
+                    && let Some(tx) = &self.tray_status_tx
+                    && tx.try_send(summary.clone()).is_ok() {
+                    self.last_desktop_summary = summary;
+                }
+                crate::health::publish(format!(
+                    "version={}\tpid={}\tconfig={}\tshortcut={}\twindow={}\tgpu={}\t{}\ttabs={}\tpanes={}\tconfirmation={}\tsettings={}\tsettings_page={}\tterminal_dims={}\tlast_feedback={}",
+                    env!("CARGO_PKG_VERSION"), std::process::id(), Config::config_path().display(),
+                    self.hotkey_status.replace(['\n', '\t'], " "),
+                    if self.vis.is_hidden() { "已隐藏" } else if self.vis.wants_keyboard() { "显示中" } else { "收起中" },
+                    self.gpu_phase.label(), ctx.diagnostic_state(), self.layouts.len(), self.sessions.len(),
+                    self.pending_close.is_some(), self.settings_open, self.settings_page,
+                    self.dims.map(|(cols, rows)| format!("{cols}×{rows}")).unwrap_or_else(|| "未知".into()),
+                    self.last_feedback.replace(['\n', '\t'], " ")
+                ));
+                if let Some(renderer) = &mut self.renderer {
+                    if renderer.poll_background() { ctx.request_redraw(); }
+                    if renderer.has_background_image() { ctx.request_wake_at(Instant::now()+Duration::from_secs(1)); }
+                }
+
                 // 呼出/收起动画步进。
                 self.step_animation(ctx);
                 // toast 到期:清除并重绘一帧(否则残留到旧画面里)。

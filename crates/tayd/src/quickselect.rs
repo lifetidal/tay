@@ -147,6 +147,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            opaque_background: false,
             scrollbar: None,
         }
     }
@@ -217,6 +218,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            opaque_background: false,
             scrollbar: None,
         };
         let m = build(&g);

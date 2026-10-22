@@ -3,6 +3,7 @@
 //! 输入是设备无关的 [`Grid`](Grid 为终端网格快照,tayd 从 alacritty_terminal
 //! 提取),输出一个 wgpu 渲染帧。本 crate 不依赖 alacritty_terminal。
 
+mod wallpaper;
 use std::borrow::Cow;
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
@@ -119,6 +120,8 @@ pub enum PanelCorners {
 #[derive(Clone, Debug)]
 pub struct ChromePanel {
     pub row: usize,
+    /// Explicit height for modal panels; zero uses the header row height.
+    pub rows: usize,
     pub start: usize,
     pub end: usize,
     pub background: Rgb,
@@ -192,6 +195,8 @@ pub struct Grid {
     pub chrome_panels: Vec<ChromePanel>,
     /// 顶部标签栏占用的网格行数；文字与图标在此高度内居中。
     pub tab_bar_rows: usize,
+    /// Modal UI must stay opaque even when a cell uses the terminal default color.
+    pub opaque_background: bool,
     pub scrollbar: Option<Scrollbar>,
     pub selection: Option<SelectionRange>,
     pub preedit: Option<Preedit>,
@@ -215,7 +220,64 @@ struct ImageDraw {
     key: (u32, usize),
     rect: [f32; 4],
     z: i32,
+    wallpaper: bool,
     clip: [u32; 4],
+}
+
+impl ImageDraw {
+    fn new(
+        img: &RenderImage,
+        wallpaper: bool,
+        cell: (f32, f32),
+        padding: f32,
+        size: (u32, u32),
+    ) -> Self {
+        let key = (
+            img.id,
+            std::sync::Arc::as_ptr(&img.rgba) as *const () as usize,
+        );
+        let mut rect = [
+            img.col as f32 * cell.0 + padding,
+            img.row as f32 * cell.1 + padding,
+            img.cols as f32 * cell.0,
+            img.rows as f32 * cell.1,
+        ];
+        if wallpaper {
+            let scale = (size.0 as f32 / img.w as f32).max(size.1 as f32 / img.h as f32);
+            let w = img.w as f32 * scale;
+            let h = img.h as f32 * scale;
+            rect = [(size.0 as f32 - w) / 2.0, (size.1 as f32 - h) / 2.0, w, h];
+        }
+        let clip = img
+            .clip
+            .map(|(x, y, w, h)| {
+                let left = (padding + x as f32 * cell.0).floor().max(0.0) as u32;
+                let top = (padding + y as f32 * cell.1).floor().max(0.0) as u32;
+                let right = (padding + (x + w) as f32 * cell.0).ceil().max(0.0) as u32;
+                let bottom = (padding + (y + h) as f32 * cell.1).ceil().max(0.0) as u32;
+                [
+                    left.min(size.0),
+                    top.min(size.1),
+                    right.min(size.0).saturating_sub(left),
+                    bottom.min(size.1).saturating_sub(top),
+                ]
+            })
+            .unwrap_or([0, 0, size.0, size.1]);
+        ImageDraw {
+            key,
+            rect,
+            z: img.z,
+            wallpaper,
+            clip,
+        }
+    }
+    fn in_pass(&self, above: bool, wallpaper: bool) -> bool {
+        if wallpaper {
+            self.wallpaper
+        } else {
+            !self.wallpaper && (self.z > 0) == above
+        }
+    }
 }
 
 /// bg 四边形的管线常量。
@@ -257,6 +319,9 @@ pub struct Renderer {
 
     fg_default: Color,
     bg_default: Rgb,
+    wallpaper: Option<RenderImage>,
+    wallpaper_config: (String, f32, f32),
+    background_checked: Option<std::time::Instant>,
     /// 光标/选区色(config colors.cursor / colors.selection,
     /// 热重载即时生效 —— 此前硬编码,用户在 Lua 里改这两个
     /// 颜色不生效,2026-10-19 修复)。
@@ -836,6 +901,9 @@ impl Renderer {
                 config.colors.foreground.2,
             ),
             bg_default: config.colors.background,
+            wallpaper: None,
+            wallpaper_config: (String::new(), -1.0, -1.0),
+            background_checked: None,
             cursor_color: config.colors.cursor,
             selection_color: config.colors.selection,
             srgb: format.is_srgb(),
@@ -877,8 +945,59 @@ impl Renderer {
             config.colors.foreground.2,
         );
         self.bg_default = config.colors.background;
+        let background = (
+            config.background_image.clone(),
+            config.background_image_opacity,
+            config.background_image_brightness,
+        );
+        if self.wallpaper_config != background {
+            self.wallpaper = None;
+            self.img_cache.clear();
+        }
+        self.wallpaper_config = background;
+        self.background_checked = None;
+        self.poll_background();
         self.cursor_color = config.colors.cursor;
         self.selection_color = config.colors.selection;
+    }
+
+    pub fn poll_background(&mut self) -> bool {
+        if self
+            .background_checked
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(250))
+        {
+            return false;
+        }
+        self.background_checked = Some(std::time::Instant::now());
+        let loaded = wallpaper::request(
+            &self.wallpaper_config.0,
+            self.wallpaper_config.1,
+            self.wallpaper_config.2,
+        );
+        let next = if self.wallpaper_config.0.is_empty() {
+            None
+        } else {
+            // A busy cache or pending retry must not flash a loaded background away.
+            loaded.or_else(|| self.wallpaper.clone())
+        };
+        let changed = match (&self.wallpaper, &next) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(&a.rgba, &b.rgba),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            self.wallpaper = next;
+            self.img_cache.clear();
+        }
+        changed
+    }
+    pub fn has_background_image(&self) -> bool {
+        !self.wallpaper_config.0.is_empty()
+    }
+
+    /// 最近一次背景图片解码失败原因(设置面板显示;成功或无图时为 None)。
+    pub fn background_error(&self) -> Option<String> {
+        wallpaper::last_error()
     }
 
     /// 更新字体与字号，复用 GPU 和会话；调用方同步重算网格。
@@ -994,52 +1113,26 @@ impl Renderer {
     /// 上传新图像纹理(架构 §6:数据身份 = Arc 指针,零哈希零
     /// 上传;缓存按当前可见集保留,删除/替换的图像纹理随帧释放)。
     fn rebuild_images(&mut self, grid: &Grid) {
-        self.current_images = grid
-            .images
+        let images: Vec<_> = self.wallpaper.iter().chain(grid.images.iter()).collect();
+        self.current_images = images
             .iter()
-            .map(|img| {
-                let key = (
-                    img.id,
-                    std::sync::Arc::as_ptr(&img.rgba) as *const () as usize,
-                );
-                let rect = [
-                    img.col as f32 * self.cell.0 + self.padding,
-                    img.row as f32 * self.cell.1 + self.padding,
-                    img.cols as f32 * self.cell.0,
-                    img.rows as f32 * self.cell.1,
-                ];
-                let clip = img
-                    .clip
-                    .map(|(x, y, w, h)| {
-                        let left = (self.padding + x as f32 * self.cell.0).floor().max(0.0) as u32;
-                        let top = (self.padding + y as f32 * self.cell.1).floor().max(0.0) as u32;
-                        let right = (self.padding + (x + w) as f32 * self.cell.0)
-                            .ceil()
-                            .max(0.0) as u32;
-                        let bottom = (self.padding + (y + h) as f32 * self.cell.1)
-                            .ceil()
-                            .max(0.0) as u32;
-                        [
-                            left.min(self.size.0),
-                            top.min(self.size.1),
-                            right.min(self.size.0).saturating_sub(left),
-                            bottom.min(self.size.1).saturating_sub(top),
-                        ]
-                    })
-                    .unwrap_or([0, 0, self.size.0, self.size.1]);
-                ImageDraw {
-                    key,
-                    rect,
-                    z: img.z,
-                    clip,
-                }
+            .copied()
+            .enumerate()
+            .map(|(index, img)| {
+                ImageDraw::new(
+                    img,
+                    self.wallpaper.is_some() && index == 0,
+                    self.cell,
+                    self.padding,
+                    self.size,
+                )
             })
             .collect();
         // 只保留本帧可见图像的缓存项(删除/替换 → 旧纹理随帧释放)。
         let visible: std::collections::HashSet<(u32, usize)> =
             self.current_images.iter().map(|image| image.key).collect();
         self.img_cache.retain(|k, _| visible.contains(k));
-        for img in &grid.images {
+        for img in images {
             let key = (
                 img.id,
                 std::sync::Arc::as_ptr(&img.rgba) as *const () as usize,
@@ -1225,7 +1318,7 @@ impl Renderer {
                 while col + 1 < grid.cols && grid.cells[base + col + 1].bg == bg {
                     col += 1;
                 }
-                if bg == self.bg_default {
+                if bg == self.bg_default && !grid.opaque_background {
                     col += 1;
                     continue;
                 }
@@ -1247,13 +1340,24 @@ impl Renderer {
             let x = pad + panel.start as f32 * cw;
             let y = pad + panel.row as f32 * ch;
             let w = (panel.end - panel.start) as f32 * cw;
-            let ch = if panel.row == 0 {
+            let ch = if panel.rows > 0 {
+                ch * panel.rows as f32
+            } else if panel.row == 0 {
                 ch * grid.tab_bar_rows.max(1) as f32
             } else {
                 ch
             };
-            let inset = (ch * 0.1).max(1.0);
-            let radius = (ch * 0.28).min(w * 0.5);
+            let inset = if panel.rows > 0 {
+                1.0
+            } else {
+                (ch * 0.1).max(1.0)
+            };
+            let radius = if panel.rows > 0 {
+                (self.cell.1 * 0.6).min(14.0)
+            } else {
+                ch * 0.28
+            }
+            .min(w * 0.5);
             let mask = to_linear(panel.background, self.srgb);
             for rect in [[x, y, w, inset], [x, y + ch - inset, w, inset]] {
                 self.quads.push(Quad { rect, color: mask });
@@ -1591,6 +1695,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            self.draw_images(&mut pass, false, true);
             if !self.quads.is_empty() {
                 pass.set_pipeline(&self.bg_pipeline);
                 pass.set_bind_group(0, &self.locals_bind, &[]);
@@ -1599,12 +1704,12 @@ impl Renderer {
                 pass.draw(0..6, 0..self.quads.len() as u32);
             }
             // 图像:z<=0 在文本之下。
-            self.draw_images(&mut pass, false);
+            self.draw_images(&mut pass, false, false);
             self.text
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| format!("文本渲染失败: {e}"))?;
             // 图像:z>0 在文本之上。
-            self.draw_images(&mut pass, true);
+            self.draw_images(&mut pass, true, false);
         }
 
         // TAY_SHOT:渲染 N 帧后抓取当前帧并退出(capture 消耗 encoder)。
@@ -1624,11 +1729,11 @@ impl Renderer {
     }
 
     /// 画 kitty 图像(`above` = 文本之上)。
-    fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, above: bool) {
+    fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, above: bool, wallpaper: bool) {
         for image in self
             .current_images
             .iter()
-            .filter(|image| (image.z > 0) == above)
+            .filter(|image| image.in_pass(above, wallpaper))
         {
             let key = image.key;
             let rect = image.rect;
@@ -1747,6 +1852,31 @@ fn grid_default_fg(grid: &Grid) -> Rgb {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn minimum_kitty_z_keeps_cell_geometry_and_terminal_pass() {
+        let img = super::RenderImage {
+            id: 42,
+            clip: None,
+            row: 2,
+            col: 3,
+            cols: 4,
+            rows: 5,
+            w: 2,
+            h: 2,
+            z: i32::MIN,
+            rgba: vec![255; 16].into(),
+        };
+        let terminal = super::ImageDraw::new(&img, false, (10.0, 20.0), 3.0, (800, 600));
+        assert_eq!(terminal.rect, [33.0, 43.0, 40.0, 100.0]);
+        assert!(terminal.in_pass(false, false));
+        assert!(!terminal.in_pass(false, true));
+        assert!(!terminal.in_pass(true, false));
+        let wallpaper = super::ImageDraw::new(&img, true, (10.0, 20.0), 3.0, (800, 600));
+        assert_eq!(wallpaper.rect, [0.0, -100.0, 800.0, 800.0]);
+        assert!(wallpaper.in_pass(false, true));
+        assert!(!wallpaper.in_pass(false, false));
+    }
+
     use super::*;
     #[test]
     fn scrollbar_geometry_and_drag_agree_at_both_ends() {
@@ -1865,6 +1995,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            opaque_background: false,
             scrollbar: None,
         };
         grid.cells[1].zerowidth = Some("\u{308}".into());
@@ -1917,6 +2048,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            opaque_background: false,
             scrollbar: None,
         };
         let draws = text_cells(&grid, Rgb(0, 160, 128));

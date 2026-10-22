@@ -128,6 +128,15 @@ fn cmd_doctor() {
             "未运行(tay toggle 会自动拉起)"
         }
     );
+    if daemon {
+        match send("status") {
+            Ok(status) if status.contains("version=") => {
+                println!("运行状态:\n{}", status.replace('\t', "\n"))
+            }
+            Ok(_) => println!("运行状态: 旧版 daemon 不支持；请保存工作后重启新版"),
+            Err(e) => println!("运行状态: 查询失败：{e}"),
+        }
+    }
     // portal。
     let portal = Command::new("gdbus")
         .args([
@@ -150,7 +159,7 @@ fn cmd_doctor() {
     println!(
         "热键 portal:   {}",
         if portal {
-            format!("✓({shortcut} 首次需系统确认)")
+            format!("接口可用（配置请求 {shortcut}；实际授权见运行状态）")
         } else {
             "不可用(见下)".into()
         }
@@ -206,10 +215,60 @@ fn cmd_keys() -> std::io::Result<()> {
 #[allow(clippy::zombie_processes)]
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "toggle".into());
+    let cmd = if cmd == "quit" && std::env::args().nth(2).as_deref() == Some("--force") {
+        "quit-force".into()
+    } else {
+        cmd
+    };
+    let cmd = if cmd == "settings" {
+        match std::env::args().nth(2).as_deref() {
+            Some("appearance") => "settings-appearance".into(),
+            Some("background") => "settings-background".into(),
+            Some("shortcuts") => "settings-shortcuts".into(),
+            _ => cmd,
+        }
+    } else {
+        cmd
+    };
     let cmd = match cmd.as_str() {
-        "toggle" | "show" | "hide" | "quit" | "pin" | "new-tab" | "next-tab" | "close-tab"
-        | "settings" | "maximize" | "restore" | "split-right" | "split-down" | "next-pane"
-        | "close-pane" | "zoom-pane" => cmd,
+        "toggle"
+        | "show"
+        | "hide"
+        | "quit"
+        | "pin"
+        | "new-tab"
+        | "next-tab"
+        | "close-tab"
+        | "settings"
+        | "maximize"
+        | "restore"
+        | "split-right"
+        | "split-down"
+        | "next-pane"
+        | "settings-appearance"
+        | "settings-background"
+        | "settings-shortcuts"
+        | "close-pane"
+        | "zoom-pane"
+        | "quit-force"
+        | "confirm-close"
+        | "cancel-close" => cmd,
+        "status" => {
+            match send("status") {
+                Ok(status) if status.contains("version=") => {
+                    println!("{}", status.replace('\t', "\n"))
+                }
+                Ok(status) => {
+                    eprintln!("运行中的 daemon 不支持状态查询：{status}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("tay status: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
         "config" => {
             cmd_config();
             return;
@@ -276,7 +335,7 @@ fn main() {
         "--daemon" => return, // 被 CLI 拉起时:正常初始化 daemon
         _ => {
             eprintln!(
-                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|split-right|split-down|next-pane|close-pane|zoom-pane|settings|maximize|restore|resurrect|config|keys|doctor](默认 toggle)"
+                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|split-right|split-down|next-pane|close-pane|zoom-pane|settings|maximize|restore|resurrect|config|keys|status|doctor|confirm-close|cancel-close](默认 toggle；quit --force 跳过保护)"
             );
             std::process::exit(2);
         }
@@ -291,7 +350,10 @@ fn main() {
         }
         Err(_) => {
             // 冷启动:拉起 daemon 后重试(§4.3 降级路径)。
-            if matches!(cmd.as_str(), "hide" | "quit") {
+            if matches!(
+                cmd.as_str(),
+                "hide" | "quit" | "quit-force" | "confirm-close" | "cancel-close"
+            ) {
                 return;
             }
             let mut child = spawn_daemon(false).unwrap_or_else(|e| {

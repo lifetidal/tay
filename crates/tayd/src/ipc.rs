@@ -140,12 +140,16 @@ pub enum IpcCommand {
     Show,
     Hide,
     Quit,
+    ForceQuit,
+    ConfirmClose,
+    CancelClose,
     /// 临时固定:暂停失焦自动隐藏(再发一次解除)。
     Pin,
     NewTab,
     NextTab,
     CloseTab,
     Settings,
+    SettingsPage(u8),
     Maximize,
     Restore,
 }
@@ -167,11 +171,18 @@ fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixS
             break;
         }
         let cmd = line.trim();
+        if cmd == "status" {
+            let _ = writeln!(reader.get_mut(), "{}", crate::health::snapshot());
+            continue;
+        }
         let parsed = match cmd {
             "toggle" => Some(IpcCommand::Toggle),
             "show" => Some(IpcCommand::Show),
             "hide" => Some(IpcCommand::Hide),
             "quit" => Some(IpcCommand::Quit),
+            "quit-force" => Some(IpcCommand::ForceQuit),
+            "confirm-close" => Some(IpcCommand::ConfirmClose),
+            "cancel-close" => Some(IpcCommand::CancelClose),
             "pin" => Some(IpcCommand::Pin),
             "split-right" => Some(IpcCommand::SplitRight),
             "split-down" => Some(IpcCommand::SplitDown),
@@ -182,6 +193,9 @@ fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixS
             "next-tab" => Some(IpcCommand::NextTab),
             "close-tab" => Some(IpcCommand::CloseTab),
             "settings" => Some(IpcCommand::Settings),
+            "settings-appearance" => Some(IpcCommand::SettingsPage(0)),
+            "settings-background" => Some(IpcCommand::SettingsPage(1)),
+            "settings-shortcuts" => Some(IpcCommand::SettingsPage(2)),
             "maximize" => Some(IpcCommand::Maximize),
             "restore" => Some(IpcCommand::Restore),
             "" => continue,

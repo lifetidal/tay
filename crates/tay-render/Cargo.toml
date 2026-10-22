@@ -11,7 +11,7 @@ wgpu = "30"
 tay-config.workspace = true
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
-image = { workspace = true, features = ["png"] }
+image = { workspace = true, features = ["png", "jpeg"] }
 log.workspace = true
 
 unicode-width = "0.2"

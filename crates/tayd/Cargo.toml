@@ -26,6 +26,7 @@ tay-render.workspace = true
 alacritty_terminal.workspace = true
 arboard.workspace = true
 unicode-width = "0.2"
+percent-encoding = "2"
 ashpd.workspace = true
 zbus.workspace = true
 async-io.workspace = true

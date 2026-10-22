@@ -29,27 +29,21 @@ fn notify(tx: &SyncSender<HotkeyTriggered>, wake: &UnixStream, event: HotkeyTrig
 #[derive(Default)]
 struct ActivationGate {
     pressed: bool,
-    pressed_at: Option<Instant>,
 }
 impl ActivationGate {
     fn activated(&mut self, own: &str, session: &str, id: &str) -> bool {
         self.activated_at(own, session, id, Instant::now())
     }
-    fn activated_at(&mut self, own: &str, session: &str, id: &str, now: Instant) -> bool {
-        let stale = self
-            .pressed_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(2));
-        if own != session || id != "toggle" || (self.pressed && !stale) {
+    fn activated_at(&mut self, own: &str, session: &str, id: &str, _now: Instant) -> bool {
+        if own != session || id != "toggle" || self.pressed {
             return false;
         }
         self.pressed = true;
-        self.pressed_at = Some(now);
         true
     }
     fn deactivated(&mut self, own: &str, session: &str, id: &str) {
         if own == session && id == "toggle" {
             self.pressed = false;
-            self.pressed_at = None;
         }
     }
 }
@@ -209,12 +203,12 @@ pub fn spawn(tx: SyncSender<HotkeyTriggered>, wake: Arc<UnixStream>, trigger: St
 mod tests {
     use super::*;
     #[test]
-    fn missing_release_does_not_disable_shortcut_forever() {
+    fn holding_shortcut_does_not_repeat_after_two_seconds() {
         let mut gate = ActivationGate::default();
         let now = Instant::now();
         assert!(gate.activated_at("/ours", "/ours", "toggle", now));
         assert!(!gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_millis(100)));
-        assert!(gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_secs(3)));
+        assert!(!gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_secs(3)));
         gate.deactivated("/ours", "/ours", "toggle");
         assert!(gate.activated_at(
             "/ours",

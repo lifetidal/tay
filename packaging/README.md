@@ -7,7 +7,7 @@
 ```bash
 sudo pacman -S --needed base-devel rust
 ./tools/package-arch.sh
-sudo pacman -U ./dist/arch/tay-0.1.0-23-$(uname -m).pkg.tar.zst
+sudo pacman -U ./dist/arch/tay-0.1.0-34-$(uname -m).pkg.tar.zst
 ```
 
 使用 rustup 管理 Rust 时，可保留现有工具链。打包需要支持 Rust 2024 edition 的工具链。

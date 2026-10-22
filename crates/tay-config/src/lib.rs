@@ -368,6 +368,11 @@ pub struct Config {
     pub padding: f32,
     /// 默认背景不透明度 0.0–1.0,文字/控件保持不透明;1.0 = 完全不透明(Wayland 模糊是增强项,见 DESIGN §6.4)。
     pub opacity: f32,
+    pub background_image: String,
+    pub background_image_opacity: f32,
+    pub background_image_brightness: f32,
+    pub background_blur: bool,
+    pub confirm_close: bool,
     /// 呼出时终端高度占输出高度的百分比。
     pub height_percent: u32,
     /// 呼出/收起动画时长(ms),0 = 无动画。
@@ -393,6 +398,11 @@ impl Default for Config {
             shell: String::new(),
             padding: 3.0,
             opacity: 1.0,
+            background_image: String::new(),
+            background_image_opacity: 0.25,
+            background_image_brightness: 0.45,
+            background_blur: false,
+            confirm_close: true,
             height_percent: 45,
             animation_ms: 150,
             hide_on_focus_out: true,
@@ -596,6 +606,27 @@ impl Config {
         }
         if let Some(v) = get_num(&t, "opacity")? {
             cfg.opacity = v as f32;
+        }
+        if let Some(v) = get_str(&t, "background_image")? {
+            cfg.background_image = v;
+        }
+        if let Some(v) = get_num(&t, "background_image_opacity")? {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err("background_image_opacity 需为 0–1".into());
+            }
+            cfg.background_image_opacity = v as f32;
+        }
+        if let Some(v) = get_num(&t, "background_image_brightness")? {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                return Err("background_image_brightness 需为 0–1".into());
+            }
+            cfg.background_image_brightness = v as f32;
+        }
+        if let Some(v) = get_bool(&t, "background_blur")? {
+            cfg.background_blur = v;
+        }
+        if let Some(v) = get_bool(&t, "confirm_close")? {
+            cfg.confirm_close = v;
         }
         if let Some(ft) = get_table(&t, "font")? {
             if let Some(v) = get_str(&ft, "family")? {
@@ -869,6 +900,11 @@ return {{
   padding = {pad},
   -- 默认背景不透明度 0–1（文字和控件保持清晰）
   opacity = {op},
+  background_image = {wallpaper:?},
+  background_image_opacity = {wallpaper_opacity},
+  background_image_brightness = {wallpaper_brightness},
+  background_blur = {blur},
+  confirm_close = {confirm_close},
 
   -- 字体(即时生效)
   font = {{ family = {ff:?}, size = {fs}, weight = {fw} }},
@@ -975,6 +1011,11 @@ return {{
             out = self.output,
             pad = self.padding,
             op = self.opacity,
+            wallpaper = self.background_image,
+            wallpaper_opacity = self.background_image_opacity,
+            wallpaper_brightness = self.background_image_brightness,
+            blur = self.background_blur,
+            confirm_close = self.confirm_close,
             ff = self.font.family,
             fs = self.font.size,
             fw = self.font.weight,
@@ -1019,7 +1060,7 @@ return {{
         let mut merged = toml::Value::try_from(fresh).map_err(|e| e.to_string())?;
         let desired = toml::Value::try_from(self).map_err(|e| e.to_string())?;
         let old = toml::Value::try_from(previous).map_err(|e| e.to_string())?;
-        for key in ["font", "colors"] {
+        for key in ["font", "colors", "tab_bar"] {
             for (field, value) in desired[key].as_table().ok_or("外观表无效")? {
                 if old[key].get(field) != Some(value) {
                     merged[key]
@@ -1029,8 +1070,17 @@ return {{
                 }
             }
         }
-        if desired["opacity"] != old["opacity"] {
-            merged["opacity"] = desired["opacity"].clone();
+        for key in [
+            "theme",
+            "opacity",
+            "background_image",
+            "background_image_opacity",
+            "background_image_brightness",
+            "background_blur",
+        ] {
+            if desired[key] != old[key] {
+                merged[key] = desired[key].clone();
+            }
         }
         let config: Config = merged.try_into().map_err(|e| e.to_string())?;
         config.save_appearance_source(path, &original)
@@ -1056,10 +1106,12 @@ return {{
         let current = toml::Value::try_from(self).map_err(|e| e.to_string())?;
         let base = toml::Value::try_from(base).map_err(|e| e.to_string())?;
         let mut assignments = String::new();
-        for key in ["font", "colors"] {
+        for key in ["font", "colors", "tab_bar"] {
             let mut values = String::new();
             for (field, value) in current[key].as_table().ok_or("外观表无效")? {
-                if base[key].get(field) != Some(value) {
+                if base[key].get(field) != Some(value)
+                    || (key == "tab_bar" && current[key] != base[key])
+                {
                     values.push_str(&format!(
                         "__tay_config.{key}.{field} = {}\n",
                         lua_value(value)?
@@ -1073,8 +1125,20 @@ return {{
                 assignments.push_str(&values);
             }
         }
-        if current["opacity"] != base["opacity"] {
-            assignments.push_str(&format!("__tay_config.opacity = {}\n", self.opacity));
+        for key in [
+            "theme",
+            "opacity",
+            "background_image",
+            "background_image_opacity",
+            "background_image_brightness",
+            "background_blur",
+        ] {
+            if current[key] != base[key] {
+                assignments.push_str(&format!(
+                    "__tay_config.{key} = {}\n",
+                    lua_value(&current[key])?
+                ));
+            }
         }
         let tail = if tail.is_empty() {
             "return __tay_config\n"
@@ -1200,7 +1264,7 @@ fn lua_user_tail(text: &str, config: &Config) -> Result<String, String> {
     }
     let values = toml::Value::try_from(config).map_err(|e| e.to_string())?;
     let mut allowed = std::collections::BTreeSet::new();
-    for key in ["font", "colors"] {
+    for key in ["font", "colors", "tab_bar"] {
         allowed.insert(format!("__tay_config.{key} = __tay_config.{key} or {{}}"));
         for (field, value) in values[key].as_table().ok_or("外观表无效")? {
             allowed.insert(format!(
@@ -1209,7 +1273,16 @@ fn lua_user_tail(text: &str, config: &Config) -> Result<String, String> {
             ));
         }
     }
-    allowed.insert(format!("__tay_config.opacity = {}", config.opacity));
+    for key in [
+        "theme",
+        "opacity",
+        "background_image",
+        "background_image_opacity",
+        "background_image_brightness",
+        "background_blur",
+    ] {
+        allowed.insert(format!("__tay_config.{key} = {}", lua_value(&values[key])?));
+    }
     if fields.lines().any(|line| !allowed.contains(line)) {
         return Err(
             "Lua 界面字段区含手写代码，请移到 TAY_UI_FIELDS_BEGIN 之前；保留文件不覆盖".into(),
@@ -1246,6 +1319,7 @@ fn lua_value(value: &toml::Value) -> Result<String, String> {
             quoted.push('"');
             Ok(quoted)
         }
+        toml::Value::Boolean(value) => Ok(value.to_string()),
         toml::Value::Integer(n) => Ok(n.to_string()),
         toml::Value::Float(n) => Ok(n.to_string()),
         toml::Value::Array(items) => Ok(format!(
@@ -1396,6 +1470,40 @@ mod tests {
 
     /// Lua 模板 roundtrip:to_lua 写出的文件必然可重新加载出
     /// 同一配置(模板生成/迁移共用同一序列化)。
+    #[test]
+    fn extended_appearance_delta_roundtrips_without_losing_lua_logic() {
+        let dir = std::env::temp_dir().join(format!("tay-extended-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.lua");
+        let source =
+            "-- preserve this\nlocal shell='/bin/fish'; return {shell=shell,theme='midnight'}";
+        std::fs::write(&path, source).unwrap();
+        let previous = Config::from_lua(source).unwrap();
+        let mut changed = previous.clone();
+        changed.background_image = "/tmp/a \"quoted\".png".into();
+        changed.background_image_opacity = 0.6;
+        changed.background_image_brightness = 0.7;
+        changed.background_blur = true;
+        changed.opacity = 0.8;
+        changed.tab_bar.clock_background = Rgb::new(1, 2, 3);
+        changed.save_appearance_delta_at(&previous, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(source));
+        assert_eq!(Config::from_lua(&text).unwrap(), changed);
+        // A second save must recognize its own bool/string/tab-bar assignments.
+        changed.save_appearance_delta_at(&changed, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn lua_background_settings_parse_and_validate() {
+        let cfg = Config::from_lua(r#"return { background_image='/tmp/wall.png', background_image_opacity=0.35, background_blur=true }"#).unwrap();
+        assert_eq!(cfg.background_image, "/tmp/wall.png");
+        assert_eq!(cfg.background_image_opacity, 0.35);
+        assert!(cfg.background_blur);
+        assert!(Config::from_lua("return {background_image_opacity=2}").is_err());
+        assert!(Config::from_lua("return {background_blur='yes'}").is_err());
+    }
     #[test]
     fn tab_bar_config_roundtrips_and_rejects_invalid_styles() {
         let c = Config::from_lua(

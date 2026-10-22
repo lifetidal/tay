@@ -12,6 +12,7 @@ wayland-protocols-wlr.workspace = true
 wayland-protocols.workspace = true
 log.workspace = true
 libc = "0.2"
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 
 [dev-dependencies]
 xkbcommon = "0.8"

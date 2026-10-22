@@ -4,7 +4,7 @@
 //!
 //! 只保存骨架,**不保存终端网格内容**(alacritty Term 不可序列化);
 //! 滚动历史/图像/命令块的完整恢复留作后续(需要内核侧状态导出)。
-//! 崩溃(非优雅退出)不会更新会话文件 —— 文件只在 quit 时写。
+//! 后台线程合并自动保存；异常退出遗留 running 标记，下次启动先恢复再保存。
 
 use std::path::{Path, PathBuf};
 
@@ -120,6 +120,88 @@ fn load_at(path: &Path) -> Option<(Vec<PersistTab>, usize)> {
     Some((file.tabs, active))
 }
 
+/// One background writer; bounded queue coalesces edits, unchanged snapshots do
+/// not touch disk. Joining before the final save prevents older writes winning.
+#[derive(Default)]
+pub(crate) struct Autosaver {
+    tx: Option<std::sync::mpsc::SyncSender<(Vec<PersistTab>, usize)>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl Autosaver {
+    pub(crate) fn submit(&mut self, tabs: Vec<PersistTab>, active: usize) {
+        self.submit_at(tabs, active, path());
+    }
+    fn submit_at(&mut self, tabs: Vec<PersistTab>, active: usize, target: PathBuf) {
+        if self.tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<PersistTab>, usize)>(1);
+            match std::thread::Builder::new()
+                .name("session-save".into())
+                .spawn(move || {
+                    let mut saved = None;
+                    while let Ok(mut next) = rx.recv() {
+                        // A short debounce also lets multiple layout operations coalesce.
+                        while let Ok(newer) = rx.recv_timeout(std::time::Duration::from_millis(300))
+                        {
+                            next = newer;
+                        }
+                        if saved.as_ref() != Some(&next) {
+                            match save_at(&target, &next.0, next.1) {
+                                Ok(()) => saved = Some(next),
+                                Err(error) => log::warn!("布局自动保存失败：{error}"),
+                            }
+                        }
+                    }
+                }) {
+                Ok(worker) => {
+                    self.tx = Some(tx);
+                    self.worker = Some(worker);
+                }
+                Err(error) => {
+                    log::warn!("无法创建布局保存线程：{error}");
+                    return;
+                }
+            }
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send((tabs, active));
+        }
+    }
+    pub(crate) fn finish(&mut self) {
+        self.tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+impl Drop for Autosaver {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// An unclean previous run should restore before autosaving a fresh layout.
+pub(crate) fn recovery_pending() -> bool {
+    path().with_extension("running").exists()
+}
+pub(crate) fn mark_running() {
+    let marker = path().with_extension("running");
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&marker, std::process::id().to_string())
+    })();
+    if let Err(error) = result {
+        log::warn!("无法写入恢复标记：{error}");
+    }
+}
+pub(crate) fn mark_clean() {
+    let marker = path().with_extension("running");
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(&std::process::id().to_string()) {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +303,46 @@ mod tests {
         .unwrap();
         assert!(load_at(&path).is_none());
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod autosave_tests {
+    use super::*;
+    #[test]
+    fn background_save_survives_without_shutdown_and_final_save_wins() {
+        let dir = std::env::temp_dir().join(format!("tay-autosave-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("session.toml");
+        let _ = std::fs::remove_file(&target);
+        let tab = PersistTab {
+            shell: "/bin/sh".into(),
+            cwd: Some("/tmp".into()),
+            title: "first".into(),
+            panes: vec![],
+            layout: None,
+            focused: 0,
+            zoomed: false,
+        };
+        let mut saver = Autosaver::default();
+        saver.submit_at(vec![tab.clone()], 0, target.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while load_at(&target).is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        saver.submit_at(vec![tab.clone()], 0, target.clone());
+        saver.finish();
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().modified().unwrap(),
+            mtime
+        );
+        let mut final_tab = tab;
+        final_tab.title = "final".into();
+        save_at(&target, &[final_tab.clone()], 0).unwrap();
+        drop(saver);
+        assert_eq!(load_at(&target).unwrap().0, vec![final_tab]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

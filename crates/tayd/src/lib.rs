@@ -45,3 +45,8 @@ mod panes;
 mod composite;
 
 mod tray;
+
+mod appearance;
+mod close_guard;
+mod health;
+mod settings;
