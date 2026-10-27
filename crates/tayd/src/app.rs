@@ -194,7 +194,7 @@ struct PaneView {
     vi_search_query: Option<String>,
     view: crate::view::ViewMap,
     kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
-    status_msg: Option<(String, Instant)>,
+    status_msg: Option<(String, Instant, Duration)>,
 }
 struct PaneSession {
     ui: PaneView,
@@ -303,6 +303,8 @@ pub struct TayApp {
     /// 「首次 init」与「输出回退重建」(后者无会话时也要重建渲染器,
     /// 不能重开会话)。
     initialized: bool,
+    /// 设计 A:本进程首次呼出时提示一次快捷键(不占栏行,toast 呈现)。
+    hint_shown: bool,
 
     frames: u32,
     bench_started: bool,
@@ -469,6 +471,7 @@ impl TayApp {
             hotkey_rx,
             wake,
             threads_started: false,
+            hint_shown: false,
             initialized: false,
             frames: 0,
             bench_started: false,
@@ -516,6 +519,19 @@ impl TayApp {
         self.show_at = Some(Instant::now());
         // 呼出即渲染首帧(内容可能已过时;同时完成热呼出延迟测量)。
         ctx.request_redraw();
+        // 设计 A:首次呼出提示一次常用快捷键(toast,4s 消失;不占栏行)。
+        // 诊断会话(TAY_SHOT/BENCH)不提示,避免污染截图/基准。
+        if !self.hint_shown && self.shot.is_none() && self.bench.is_none() {
+            self.hint_shown = true;
+            self.status_hint(
+                format!(
+                    "{} 呼出/收起 | Ctrl+Shift+T 新标签 | Ctrl+, 设置 | {} 向右分屏",
+                    self.config.global_shortcut,
+                    self.config.binding_hint("split-right"),
+                ),
+                ctx,
+            );
+        }
     }
 
     /// 收起。
@@ -1233,53 +1249,11 @@ impl TayApp {
         }
     }
 
-    /// 栏最后一行显示的帮助/编辑消息(渲染与命中测试共用同一来源:
-    /// 消息行上没有控件,点击不得触发行 0 的动作)。
-    fn chrome_message(&self) -> String {
-        if let Some((field, value)) = &self.editing {
-            format!(
-                "编辑 {}: {value}_  Enter=保存  Esc=取消  Ctrl+A=替换",
-                crate::settings::field_label(field)
-            )
-        } else if let Some(action) = self.chrome_hover.filter(|a| {
-            if self.settings_open {
-                return false;
-            }
-            matches!(
-                a,
-                crate::chrome::Action::Hide
-                    | crate::chrome::Action::Maximize
-                    | crate::chrome::Action::CloseWindow
-            )
-        }) {
-            match action {
-                crate::chrome::Action::Hide => "最小化:隐藏窗口,会话保持运行".into(),
-                crate::chrome::Action::Maximize => "最大化 / 恢复高度".into(),
-                _ => "关闭窗口:结束所有会话".into(),
-            }
-        } else if self.settings_open {
-            "外观立即生效并保存 Lua；背景图留空禁用；Shell 仅新会话生效；全局快捷键需重启授权"
-                .into()
-        } else {
-            format!(
-                "{} | {}: 向右分屏 | {}: 向下分屏 | {}: 下一窗格",
-                self.hotkey_status,
-                self.config.binding_hint("split-right"),
-                self.config.binding_hint("split-down"),
-                self.config.binding_hint("next-pane")
-            )
-        }
-    }
-
-    /// 栏消息行索引(渲染与命中测试共用):消息占据栏的最后一行。
-    /// 不构造消息字符串 —— chrome_message 的每个分支都非空,消息行
-    /// 确定性地等于 rows-1;指针移动每事件都调这里,构造整条字符串
-    /// (实测 ~16 次分配/次)纯属浪费。
-    fn chrome_message_row(&self) -> Option<usize> {
-        let rows = crate::chrome::rows(&self.config, self.settings_open);
-        (rows >= 2).then(|| rows - 1)
-    }
-
+    /// 设计 A:栏不再有常驻消息行,标签块恢复铺满整栏。提示去向:
+    /// ①设置面板内嵌提示行(settings::paint,编辑态时切换为编辑帮助);
+    /// ②终端底部 toast(首次呼出快捷键提示、快捷键授权异常);
+    /// ③托盘悬浮/设置页状态行(快捷键状态的常驻位)。窗口控制图标
+    /// 是通用符号(最小化/最大化/关闭),悬停不再解释。
     fn update_session_colors(&self) {
         for (_, tab) in self.sessions.iter() {
             if let Some(sender) = &tab.sender {
@@ -1974,9 +1948,9 @@ impl TayApp {
                     .into(),
             });
         }
-        // 状态 toast(QuickSelect 反馈等):底部一行,约 1.2s 后消失。
-        if let Some((msg, at)) = &self.sessions[id].ui.status_msg
-            && at.elapsed() < Duration::from_millis(1200)
+        // 状态 toast(QuickSelect 反馈等):底部一行,按各自时长消失。
+        if let Some((msg, at, for_ms)) = &self.sessions[id].ui.status_msg
+            && at.elapsed() < *for_ms
             && rows > 0
         {
             overlays.push(tay_render::Overlay {
@@ -2460,15 +2434,25 @@ impl TayApp {
 
     /// 状态 toast:底部一行反馈(约 1.2s 后消失),同时记日志。
     fn status(&mut self, msg: impl Into<String>, ctx: &mut Ctx<'_>) {
+        self.status_for(msg, ctx, Duration::from_millis(1200));
+    }
+
+    /// 提示 toast:需要阅读的说明性文字,4s 后消失(设计 A:快捷键
+    /// 提示与授权异常走这里,不占栏行)。
+    fn status_hint(&mut self, msg: impl Into<String>, ctx: &mut Ctx<'_>) {
+        self.status_for(msg, ctx, Duration::from_millis(4000));
+    }
+
+    fn status_for(&mut self, msg: impl Into<String>, ctx: &mut Ctx<'_>, for_ms: Duration) {
         let msg = msg.into();
         log::info!("{msg}");
         self.last_feedback = msg.chars().take(512).collect();
         if self.settings_open {
             self.settings_feedback = msg.clone();
         }
-        self.sessions[self.active_pane].ui.status_msg = Some((msg, Instant::now()));
+        self.sessions[self.active_pane].ui.status_msg = Some((msg, Instant::now(), for_ms));
         // 到期后醒来重绘一帧清除 toast。
-        ctx.request_wake_at(Instant::now() + Duration::from_millis(1200));
+        ctx.request_wake_at(Instant::now() + for_ms);
         ctx.request_redraw();
     }
 
@@ -2858,7 +2842,8 @@ impl TayApp {
             self.set_ime_area(ctx, self.cursor_pos());
         }
         let items = self.chrome_items(grid.cols);
-        let message = self.chrome_message();
+        // 设计 A:栏无消息行,标签块铺满整栏(decorate 的消息参数
+        // 常空;tab_panel_rows = tab_bar_rows)。
         // 极简模式(tab_bar.visible = false)跳过操作栏:终端占满
         // 全高;设置面板展开时临时恢复(rows > 0)。
         let chrome_rows = crate::chrome::rows(&self.config, self.settings_open);
@@ -2873,7 +2858,7 @@ impl TayApp {
             crate::chrome::decorate(
                 &mut grid,
                 &items,
-                &message,
+                "",
                 &self.config,
                 self.chrome_hover,
                 self.maximized,
@@ -3187,12 +3172,10 @@ impl Handler for TayApp {
             let col = ((*x - pad) / cw as f64).floor();
             let row = ((*y - pad) / ch as f64).floor();
             let bar_rows = crate::chrome::rows(&self.config, self.settings_open);
-            let message_row = self.chrome_message_row();
             let hovered = if col >= 0.0 && row >= 0.0 && row < bar_rows as f64 {
                 crate::chrome::hit(
                     &self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80)),
                     bar_rows,
-                    message_row,
                     row as usize,
                     col as usize,
                 )
@@ -3236,13 +3219,9 @@ impl Handler for TayApp {
             if row >= 0.0 && row < (bar_rows as f64) {
                 if *pressed && col >= 0.0 && self.editing.is_none() {
                     let items = self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80));
-                    if let Some(a) = crate::chrome::hit(
-                        &items,
-                        bar_rows,
-                        self.chrome_message_row(),
-                        row as usize,
-                        col as usize,
-                    ) {
+                    if let Some(a) =
+                        crate::chrome::hit(&items, bar_rows, row as usize, col as usize)
+                    {
                         self.chrome_action(a, ctx);
                     }
                 }
@@ -3875,8 +3854,18 @@ impl Handler for TayApp {
                     }
                 }
                 // portal 热键。
-                while let Ok(event)=self.hotkey_rx.try_recv(){match event{crate::hotkey::HotkeyTriggered::Toggle=>self.toggle(ctx),crate::hotkey::HotkeyTriggered::Status(s)=>{if let Some(tx) = &self.tray_status_tx { let _ = tx.try_send(s.clone()); }
-                    self.hotkey_status=s;ctx.request_redraw();}}}
+                while let Ok(event)=self.hotkey_rx.try_recv(){match event{crate::hotkey::HotkeyTriggered::Toggle=>self.toggle(ctx),crate::hotkey::HotkeyTriggered::Status(s)=>{
+                    // 设计 A:授权成功静默(常驻位在托盘/设置页);
+                    // 「未分配/未就绪」才 toast 提示用户行动,且只在
+                    // 状态变化时提示一次。诊断会话不提示。
+                    let actionable = !s.starts_with("全局快捷键：");
+                    let changed = s != self.hotkey_status;
+                    if let Some(tx) = &self.tray_status_tx { let _ = tx.try_send(s.clone()); }
+                    self.hotkey_status=s.clone();
+                    if actionable && changed && self.shot.is_none() && self.bench.is_none() {
+                        self.status_hint(s, ctx);
+                    }
+                    ctx.request_redraw();}}}
                 // 配置热重载(§M3:文件 mtime 变化 → 重载颜色等运行时字段)。
                 let path = tay_config::Config::config_path();
                 let mtime = std::fs::metadata(path).ok().and_then(|m|m.modified().ok());
@@ -4097,7 +4086,7 @@ impl Handler for TayApp {
                 // toast 到期:清除并重绘一帧(否则残留到旧画面里)。
                 if self.sessions[self.active_pane].ui.status_msg
                     .as_ref()
-                    .is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(1200))
+                    .is_some_and(|(_, at, for_ms)| at.elapsed() >= *for_ms)
                 {
                     self.sessions[self.active_pane].ui.status_msg = None;
                     ctx.request_redraw();

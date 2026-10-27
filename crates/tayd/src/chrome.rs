@@ -215,19 +215,9 @@ pub fn layout(
     items
 }
 
-/// 命中测试:`bar_rows` 内的行都映射到条目所在行(0),消息行除外
-/// (消息占栏的最后一行,上面没有控件,点击不得触发行 0 的动作 ——
-/// 否则帮助文字下方的隐藏/关闭控件列会变成不可见的破坏性点击目标)。
-pub fn hit(
-    items: &[Item],
-    bar_rows: usize,
-    message_row: Option<usize>,
-    row: usize,
-    col: usize,
-) -> Option<Action> {
-    if Some(row) == message_row {
-        return None;
-    }
+/// 命中测试:`bar_rows` 内的行都映射到条目所在行(0) —— 标签块
+/// 铺满整栏,栏内任意行点击都是同一组控件(设计 A:栏不再有消息行)。
+pub fn hit(items: &[Item], bar_rows: usize, row: usize, col: usize) -> Option<Action> {
     let row = if row < bar_rows { 0 } else { row };
     items
         .iter()
@@ -489,9 +479,9 @@ mod tests {
             assert!(items.iter().all(|i| i.row == 0 && i.end <= cols));
             for item in &items {
                 for col in item.start..item.end {
-                    assert_eq!(hit(&items, 2, None, 0, col), Some(item.action));
+                    assert_eq!(hit(&items, 2, 0, col), Some(item.action));
                     assert_eq!(
-                        hit(&items, 2, None, 1, col),
+                        hit(&items, 2, 1, col),
                         Some(item.action),
                         "加高区域下半部分可点击"
                     );
@@ -520,35 +510,9 @@ mod tests {
         let tab = items.iter().find(|i| i.action == Action::Tab(0)).unwrap();
         // 3 行都是同一组控件的点击延伸;栏外(第 3 行起)不得命中。
         for row in 0..3 {
-            assert_eq!(hit(&items, 3, None, row, tab.start), Some(Action::Tab(0)));
+            assert_eq!(hit(&items, 3, row, tab.start), Some(Action::Tab(0)));
         }
-        assert_eq!(hit(&items, 3, None, 3, tab.start), None);
-    }
-
-    #[test]
-    fn message_row_is_not_a_click_target() {
-        // 消息占据栏的最后一行:该行任何列都不得触发行 0 的控件
-        // (否则帮助文字下方的隐藏/关闭列是不可见的破坏性点击目标)。
-        let items = layout(
-            120,
-            &["shell".into()],
-            0,
-            false,
-            &Config::default(),
-            "18:42",
-        );
-        let close = items
-            .iter()
-            .find(|i| i.action == Action::CloseWindow)
-            .unwrap();
-        let hide = items.iter().find(|i| i.action == Action::Hide).unwrap();
-        assert_eq!(
-            hit(&items, 2, Some(1), 0, close.start),
-            Some(Action::CloseWindow)
-        );
-        assert_eq!(hit(&items, 2, Some(1), 1, close.start), None);
-        assert_eq!(hit(&items, 2, Some(1), 1, hide.start), None);
-        assert_eq!(hit(&items, 2, Some(1), 0, hide.start), Some(Action::Hide));
+        assert_eq!(hit(&items, 3, 3, tab.start), None);
     }
 
     #[test]
@@ -562,8 +526,8 @@ mod tests {
                     .find(|i| i.row == 0 && i.action == action)
                     .unwrap();
                 assert!(item.start >= previous);
-                assert_eq!(hit(&items, 2, None, 0, item.start), Some(action));
-                assert_eq!(hit(&items, 2, None, 0, item.end - 1), Some(action));
+                assert_eq!(hit(&items, 2, 0, item.start), Some(action));
+                assert_eq!(hit(&items, 2, 0, item.end - 1), Some(action));
                 previous = item.end;
             }
             assert_eq!(previous, cols);
@@ -806,7 +770,7 @@ mod tests {
             for i in &items {
                 assert!(i.end <= cols, "项不越界");
                 for col in i.start..i.end {
-                    assert_eq!(hit(&items, 2, None, i.row, col), Some(i.action));
+                    assert_eq!(hit(&items, 2, i.row, col), Some(i.action));
                 }
             }
         }

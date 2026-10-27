@@ -353,6 +353,21 @@ pub(crate) fn paint(
         bg,
         true,
     );
+    // 设计 A:设置提示从栏消息行移进面板内(标题与页签之间的一行):
+    // 常驻提示跟随设置上下文,编辑字段时同位置切换为编辑帮助。
+    // 面板太矮时不画(h < 5:提示行会挤掉全部内容行,退化布局里
+    // 宁可没有提示也要保住按钮)。
+    if h >= 5 {
+        let hint = if let Some((field, value)) = editing {
+            format!(
+                "编辑 {}: {value}_  Enter=保存  Esc=取消  Ctrl+A=替换",
+                field_label(field)
+            )
+        } else {
+            "外观立即生效并保存；背景图留空=禁用；Shell 仅新会话生效；快捷键修改需重启授权".into()
+        };
+        put(grid, y + 1, x + 2, x + w - 2, &hint, muted, bg, false);
+    }
     let items = layout(grid.cols, grid.rows, page, c);
     for item in &items {
         let unavailable = matches!(item.action, Action::UndoAppearance) && !info.undo_available;
@@ -551,5 +566,82 @@ mod tests {
                 .count(),
             4
         );
+    }
+    #[test]
+    fn hint_row_shows_settings_hint_and_switches_to_editing_help() {
+        let c = Config::default();
+        let (cols, rows) = (80, 20);
+        let cell = tay_render::Cell {
+            c: ' ',
+            fg: tay_config::Rgb(255, 255, 255),
+            bg: tay_config::Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+            zerowidth: None,
+        };
+        let make_grid = || tay_render::Grid {
+            cols,
+            rows,
+            cells: vec![cell.clone(); cols * rows],
+            cursor: (0, 0),
+            cursor_shape: tay_render::CursorShape::Beam,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            tab_panel_rows: 0,
+            opaque_background: false,
+            scrollbar: None,
+        };
+        let info = OverlayInfo {
+            status: "",
+            feedback: "",
+            background_error: None,
+            undo_available: false,
+        };
+        // 常规态:标题下一行(栏下 y+1)是设置提示。
+        let mut grid = make_grid();
+        paint(&mut grid, &c, 0, None, None, &info);
+        let (_, y, _, _) = rect(cols, rows, crate::chrome::rows(&c, false));
+        let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        assert!(row_text.contains("外观立即生效"));
+        // 编辑态:同一行切换为编辑帮助,含字段名与保存/取消键。
+        let mut grid = make_grid();
+        paint(
+            &mut grid,
+            &c,
+            0,
+            None,
+            Some(&(Field::Font, "JetBrainsMono".into())),
+            &info,
+        );
+        let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        assert!(row_text.contains("编辑 字体"));
+        assert!(row_text.contains("Enter=保存"));
+        // 矮面板(h < 5)不画提示行,内容行保留。
+        let mut grid = make_grid();
+        grid.rows = crate::chrome::rows(&c, false) + 4;
+        paint(&mut grid, &c, 0, None, None, &info);
+        let (_, y, _, _) = rect(cols, grid.rows, crate::chrome::rows(&c, false));
+        let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        assert!(!row_text.contains("外观立即生效"));
     }
 }
