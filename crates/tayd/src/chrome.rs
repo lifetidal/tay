@@ -374,6 +374,10 @@ pub fn decorate(
     // 原 rows>=4 守卫永远不成立,消息从未画出)。
     // then(惰性):rows==0(tab_bar.visible=false)时不得计算 rows-1。
     let message_row = (!message.is_empty() && rows >= 2).then(|| rows - 1);
+    // 有消息行时,行 0 的圆角面板只铺到消息行之上 —— 否则面板
+    // (rows:0 语义 = 铺满 tab_bar_rows)盖进消息行,消息文字压在
+    // 标签面板上(「全局快捷键…」行覆盖顶层标签的产品反馈)。
+    grid.tab_panel_rows = rows.saturating_sub(usize::from(message_row.is_some()));
     if let Some(mrow) = message_row {
         for c in &mut header[mrow * grid.cols..(mrow + 1) * grid.cols] {
             *c = base.clone();
@@ -649,6 +653,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            tab_panel_rows: 0,
             opaque_background: false,
             scrollbar: None,
         };
@@ -696,6 +701,7 @@ mod tests {
                 window_icons: vec![],
                 chrome_panels: vec![],
                 tab_bar_rows: 0,
+                tab_panel_rows: 0,
                 opaque_background: false,
                 scrollbar: None,
             }
@@ -719,11 +725,15 @@ mod tests {
         assert_eq!(with_message.cells[42].c, 'l');
         assert_eq!(with_message.cells[43].c, 'p');
         assert_eq!(with_message.cells[80].c, 'z');
+        // 有消息时行 0 面板只铺 1 行(2 − 1):圆角面板不得盖进消息行,
+        // 否则消息文字压在标签面板上(「全局快捷键…覆盖顶层标签」回归)。
+        assert_eq!(with_message.tab_panel_rows, 1);
         // 无消息时最后一行仍是首行样式的延伸(可点击高亮)。
         let mut plain = grid();
         decorate(&mut plain, &items, "", &config, None, false, false);
         assert_eq!(plain.cells[40].c, ' ');
         assert_eq!(plain.cells[80].c, 'z');
+        assert_eq!(plain.tab_panel_rows, 2);
     }
 
     #[test]
@@ -761,6 +771,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            tab_panel_rows: 0,
             opaque_background: false,
             scrollbar: None,
         };

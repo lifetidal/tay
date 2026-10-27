@@ -195,6 +195,9 @@ pub struct Grid {
     pub chrome_panels: Vec<ChromePanel>,
     /// 顶部标签栏占用的网格行数；文字与图标在此高度内居中。
     pub tab_bar_rows: usize,
+    /// 行 0 面板/图标/字形实际铺的行数(≤ tab_bar_rows):有消息行时
+    /// 比栏少 1,消息行落在面板之外,不会被标签圆角面板盖住。
+    pub tab_panel_rows: usize,
     /// Modal UI must stay opaque even when a cell uses the terminal default color.
     pub opaque_background: bool,
     pub scrollbar: Option<Scrollbar>,
@@ -304,6 +307,7 @@ pub struct Renderer {
     glyph_buffers: std::collections::HashMap<GlyphKey, CachedGlyph>,
     glyph_draws: Vec<GlyphDraw>,
     tab_bar_rows: usize,
+    tab_panel_rows: usize,
     font_metrics: Metrics,
     preedit_buffer: Buffer,
     preedit_pos: Option<(usize, usize)>,
@@ -886,6 +890,7 @@ impl Renderer {
             glyph_buffers: Default::default(),
             glyph_draws: Vec::new(),
             tab_bar_rows: 0,
+            tab_panel_rows: 0,
             font_metrics: Metrics::new(font_size_px, cell_h),
             preedit_buffer,
             preedit_pos: None,
@@ -1105,6 +1110,7 @@ impl Renderer {
     /// 用新的网格快照重建文本缓冲与四边形。渲染帧之前调用。
     pub fn update(&mut self, grid: &Grid) {
         self.tab_bar_rows = grid.tab_bar_rows;
+        self.tab_panel_rows = grid.tab_panel_rows;
         self.rebuild_text(grid);
         self.rebuild_quads(grid);
         self.rebuild_images(grid);
@@ -1343,7 +1349,7 @@ impl Renderer {
             let ch = if panel.rows > 0 {
                 ch * panel.rows as f32
             } else if panel.row == 0 {
-                ch * grid.tab_bar_rows.max(1) as f32
+                ch * grid.tab_panel_rows.max(1) as f32
             } else {
                 ch
             };
@@ -1504,7 +1510,7 @@ impl Renderer {
         // Vector window controls: independent of fonts and font fallback.
         for icon in &grid.window_icons {
             let icon_height = if icon.row == 0 {
-                ch * grid.tab_bar_rows.max(1) as f32
+                ch * grid.tab_panel_rows.max(1) as f32
             } else {
                 ch
             };
@@ -1617,7 +1623,7 @@ impl Renderer {
                 let top = self.padding
                     + draw.row as f32 * self.cell.1
                     + if draw.row == 0 {
-                        self.tab_bar_rows.saturating_sub(1) as f32 * self.cell.1 * 0.5
+                        self.tab_panel_rows.saturating_sub(1) as f32 * self.cell.1 * 0.5
                     } else {
                         0.0
                     };
@@ -1995,6 +2001,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            tab_panel_rows: 0,
             opaque_background: false,
             scrollbar: None,
         };
@@ -2048,6 +2055,7 @@ mod tests {
             window_icons: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
+            tab_panel_rows: 0,
             opaque_background: false,
             scrollbar: None,
         };

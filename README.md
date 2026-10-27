@@ -15,7 +15,7 @@ Wayland 上,没装任何配置也能直接干活。常驻后台，实际呼出�
 
 ```bash
 ./tools/package-arch.sh --offline
-sudo pacman -U ./dist/arch/tay-0.1.0-37-$(uname -m).pkg.tar.zst
+sudo pacman -U ./dist/arch/tay-0.1.0-38-$(uname -m).pkg.tar.zst
 ```
 
 或者直接从源码装:
