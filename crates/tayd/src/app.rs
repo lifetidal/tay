@@ -194,7 +194,8 @@ struct PaneView {
     vi_search_query: Option<String>,
     view: crate::view::ViewMap,
     kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
-    status_msg: Option<(String, Instant, Duration)>,
+    /// toast 队列(按各自时长依次呈现;容量 3,新入队挤掉最旧)。
+    status_msg: Vec<(String, Instant, Duration)>,
 }
 struct PaneSession {
     ui: PaneView,
@@ -262,6 +263,9 @@ pub struct TayApp {
     last_feedback: String,
     last_desktop_summary: String,
     settings_page: u8,
+    /// 设置面板开合动画:(开始时刻, 是否在打开)。90ms 平滑步进,
+    /// 关闭时 settings_open 已为 false,面板仍画到动画结束。
+    settings_anim: Option<(Instant, bool)>,
     settings_focus: usize,
     settings_drag: Option<(crate::chrome::Field, Config)>,
     settings_feedback: String,
@@ -446,6 +450,7 @@ impl TayApp {
             last_feedback: String::new(),
             last_desktop_summary: String::new(),
             settings_page: 0,
+            settings_anim: None,
             settings_focus: 0,
             settings_drag: None,
             settings_feedback: String::new(),
@@ -602,8 +607,9 @@ impl TayApp {
             }
             ctx.unmap();
         }
-        if self.vis.animating() {
+        if self.vis.animating() || self.settings_anim.is_some() {
             // 下一动画步(~8ms 粒度,≈125 步/秒,150ms 动画 ≈ 19 步)。
+            // 面板开合动画复用同一 deadline 机制。
             ctx.set_anim_deadline(Some(Instant::now() + Duration::from_millis(8)));
         } else {
             ctx.set_anim_deadline(None);
@@ -649,7 +655,7 @@ impl TayApp {
         let pad = renderer.padding();
         let cols = ((size.0 as f32 - 2.0 * pad) / cw).floor().max(2.0) as usize;
         let rows = (((size.1 as f32 - 2.0 * pad) / ch).floor() as usize)
-            .saturating_sub(crate::chrome::rows(&self.config, self.settings_open))
+            .saturating_sub(crate::chrome::rows(&self.config, self.settings_visible()))
             .max(1);
         log::info!("网格 {cols}×{rows} @ {cw:.1}×{ch:.1}px 单元格");
         self.dims = Some((cols, rows));
@@ -1212,6 +1218,21 @@ impl TayApp {
         exited
     }
 
+    /// 面板绘制/栏几何的统一可见性:开合动画期间(关闭时
+    /// settings_open 已为 false)栏与面板仍按可见处理。
+    fn settings_visible(&self) -> bool {
+        self.settings_open || self.settings_anim.is_some()
+    }
+
+    /// 面板开合:翻转状态并启动 90ms 动画;状态未变时不重启动画
+    /// (IPC 重复 settings 命令、齿轮连点不闪烁)。
+    fn animate_settings(&mut self, opening: bool) {
+        if self.settings_open != opening {
+            self.settings_anim = Some((Instant::now(), opening));
+        }
+        self.settings_open = opening;
+    }
+
     fn chrome_items(&self, cols: usize) -> Vec<crate::chrome::Item> {
         let titles: Vec<_> = self
             .layouts
@@ -1302,7 +1323,7 @@ impl TayApp {
             }
             Action::Clock => { /* 非交互:点击无操作 */ }
             Action::Hotkeys => {
-                self.settings_open = false;
+                self.animate_settings(false);
                 let (w, h) = ctx.surface_size();
                 self.relayout(ctx, w, h, true);
                 self.status(
@@ -1319,7 +1340,7 @@ impl TayApp {
                 }
             }
             Action::Settings => {
-                self.settings_open = !self.settings_open;
+                self.animate_settings(!self.settings_open);
                 self.editing = None;
                 self.settings_focus = 0;
                 self.settings_drag = None;
@@ -1637,7 +1658,8 @@ impl TayApp {
             let pad = r.padding();
             ctx.set_ime_cursor_area(
                 (col + self.pane_rect().x) as f32 * cw + pad,
-                (row + self.pane_rect().y + crate::chrome::rows(&self.config, self.settings_open))
+                (row + self.pane_rect().y
+                    + crate::chrome::rows(&self.config, self.settings_visible()))
                     as f32
                     * ch
                     + pad,
@@ -1664,7 +1686,7 @@ impl TayApp {
         let pad = r.padding();
         let cols = ((width as f32 - 2.0 * pad) / cw).floor().max(2.0) as usize;
         let rows = (((height as f32 - 2.0 * pad) / ch).floor() as usize)
-            .saturating_sub(crate::chrome::rows(&self.config, self.settings_open))
+            .saturating_sub(crate::chrome::rows(&self.config, self.settings_visible()))
             .max(1);
         if Some((cols, rows)) != self.dims {
             self.sessions[self.active_pane].ui.scrollbar_drag = None;
@@ -1715,7 +1737,7 @@ impl TayApp {
         let pad = r.padding() as f64;
         let c = ((x - pad) / cw as f64).floor();
         let row = ((y - pad) / ch as f64).floor()
-            - crate::chrome::rows(&self.config, self.settings_open) as f64;
+            - crate::chrome::rows(&self.config, self.settings_visible()) as f64;
         (c >= 0.0 && row >= 0.0).then_some((c as usize, row as usize))
     }
     fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
@@ -1948,9 +1970,13 @@ impl TayApp {
                     .into(),
             });
         }
-        // 状态 toast(QuickSelect 反馈等):底部一行,按各自时长消失。
-        if let Some((msg, at, for_ms)) = &self.sessions[id].ui.status_msg
-            && at.elapsed() < *for_ms
+        // 状态 toast(QuickSelect 反馈等):底部一行,队列首条未过期的
+        // 按各自时长消失,到期后下一条接续。
+        if let Some((msg, _, _)) = self.sessions[id]
+            .ui
+            .status_msg
+            .iter()
+            .find(|(_, at, for_ms)| at.elapsed() < *for_ms)
             && rows > 0
         {
             overlays.push(tay_render::Overlay {
@@ -2046,7 +2072,7 @@ impl TayApp {
             return None;
         }
         let total = snap.total_lines.max(term_rows);
-        let chrome_rows = crate::chrome::rows(&self.config, self.settings_open) as f32;
+        let chrome_rows = crate::chrome::rows(&self.config, self.settings_visible()) as f32;
         if total <= term_rows {
             return None;
         }
@@ -2450,7 +2476,12 @@ impl TayApp {
         if self.settings_open {
             self.settings_feedback = msg.clone();
         }
-        self.sessions[self.active_pane].ui.status_msg = Some((msg, Instant::now(), for_ms));
+        let toasts = &mut self.sessions[self.active_pane].ui.status_msg;
+        // 队列容量 3:连续反馈不互相顶掉,4s 提示不会被 1.2s 反馈覆盖。
+        if toasts.len() >= 3 {
+            toasts.remove(0);
+        }
+        toasts.push((msg, Instant::now(), for_ms));
         // 到期后醒来重绘一帧清除 toast。
         ctx.request_wake_at(Instant::now() + for_ms);
         ctx.request_redraw();
@@ -2508,7 +2539,7 @@ impl TayApp {
         };
         let (cw, ch) = renderer.cell_size();
         let pad = renderer.padding();
-        let chrome = crate::chrome::rows(&self.config, self.settings_open);
+        let chrome = crate::chrome::rows(&self.config, self.settings_visible());
         let pixel = |x: usize, y: usize| {
             (
                 (pad + (x as f32 + 0.5) * cw) as f64,
@@ -2846,7 +2877,7 @@ impl TayApp {
         // 常空;tab_panel_rows = tab_bar_rows)。
         // 极简模式(tab_bar.visible = false)跳过操作栏:终端占满
         // 全高;设置面板展开时临时恢复(rows > 0)。
-        let chrome_rows = crate::chrome::rows(&self.config, self.settings_open);
+        let chrome_rows = crate::chrome::rows(&self.config, self.settings_visible());
         if chrome_rows > 0 {
             // 栏内时钟:唤醒下一次分钟边界(+1s 余量)重绘;其余
             // 时间随既有重绘更新,空闲不额外唤醒(0% CPU 目标)。
@@ -2862,10 +2893,25 @@ impl TayApp {
                 &self.config,
                 self.chrome_hover,
                 self.maximized,
-                self.settings_open,
+                self.settings_visible(),
             );
         }
-        if self.settings_open {
+        // 面板开合动画:90ms 平滑步进(开=从栏向下展开,关=向上收起);
+        // 动画结束帧先清状态再算 reveal,末帧永远是完整/无面板。
+        if self
+            .settings_anim
+            .is_some_and(|(start, _)| start.elapsed() >= Duration::from_millis(90))
+        {
+            self.settings_anim = None;
+        }
+        let reveal = if let Some((start, opening)) = self.settings_anim {
+            let t = (start.elapsed().as_secs_f32() / 0.09).clamp(0.0, 1.0);
+            let eased = t * t * (3.0 - 2.0 * t);
+            if opening { eased } else { 1.0 - eased }
+        } else {
+            1.0
+        };
+        if self.settings_visible() {
             let focused =
                 crate::settings::layout(grid.cols, grid.rows, self.settings_page, &self.config)
                     .get(self.settings_focus)
@@ -2876,6 +2922,7 @@ impl TayApp {
                 self.settings_page,
                 self.chrome_hover.or(focused),
                 self.editing.as_ref(),
+                reveal,
                 &crate::settings::OverlayInfo {
                     status: &crate::health::snapshot(),
                     feedback: &self.settings_feedback,
@@ -3000,7 +3047,8 @@ impl Handler for TayApp {
                         let (cw, ch) = renderer.cell_size();
                         let col = ((*x - renderer.padding() as f64) / cw as f64).floor();
                         let row = ((*y - renderer.padding() as f64) / ch as f64).floor();
-                        let rows = rows + crate::chrome::rows(&self.config, self.settings_open);
+                        let rows =
+                            rows + crate::chrome::rows(&self.config, self.settings_visible());
                         if col >= 0.0
                             && row >= 0.0
                             && let Some(confirm) =
@@ -3012,7 +3060,7 @@ impl Handler for TayApp {
                             {
                                 self.execute_close(target, ctx);
                             }
-                            self.sessions[self.active_pane].ui.status_msg = None;
+                            self.sessions[self.active_pane].ui.status_msg.clear();
                             ctx.request_redraw();
                         }
                     }
@@ -3025,7 +3073,7 @@ impl Handler for TayApp {
                 _ => {}
             }
         }
-        if self.settings_open {
+        if self.settings_open && self.settings_anim.is_none() {
             match &event {
                 WEvent::PointerMoved { x, y } | WEvent::PointerButton { x, y, .. } => {
                     if let (Some(renderer), Some((cols, rows))) = (&self.renderer, self.dims) {
@@ -3171,7 +3219,7 @@ impl Handler for TayApp {
             let pad = r.padding() as f64;
             let col = ((*x - pad) / cw as f64).floor();
             let row = ((*y - pad) / ch as f64).floor();
-            let bar_rows = crate::chrome::rows(&self.config, self.settings_open);
+            let bar_rows = crate::chrome::rows(&self.config, self.settings_visible());
             let hovered = if col >= 0.0 && row >= 0.0 && row < bar_rows as f64 {
                 crate::chrome::hit(
                     &self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80)),
@@ -3215,7 +3263,7 @@ impl Handler for TayApp {
             let pad = r.padding() as f64;
             let row = ((*y - pad) / ch as f64).floor();
             let col = ((*x - pad) / cw as f64).floor();
-            let bar_rows = crate::chrome::rows(&self.config, self.settings_open);
+            let bar_rows = crate::chrome::rows(&self.config, self.settings_visible());
             if row >= 0.0 && row < (bar_rows as f64) {
                 if *pressed && col >= 0.0 && self.editing.is_none() {
                     let items = self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80));
@@ -3364,10 +3412,10 @@ impl Handler for TayApp {
                 }
                 if self.pending_close.is_some() {
                     match key.key {
-                        KeyKind::Named(tay_window::NamedKey::Escape) => { self.pending_close = None; self.sessions[self.active_pane].ui.status_msg=None; }
+                        KeyKind::Named(tay_window::NamedKey::Escape) => { self.pending_close = None; self.sessions[self.active_pane].ui.status_msg.clear(); }
                         KeyKind::Named(tay_window::NamedKey::Enter) if !key.repeat => {
                             if let Some(target) = self.pending_close.take() && mods.ctrl { self.execute_close(target, ctx); }
-                            self.sessions[self.active_pane].ui.status_msg=None;
+                            self.sessions[self.active_pane].ui.status_msg.clear();
                         }
                         _ => {}
                     }
@@ -3838,8 +3886,8 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_index(),ctx),
                         crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
-                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
-                        crate::ipc::IpcCommand::SettingsPage(page) => {self.settings_open=true;self.settings_page=page;self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::Settings => {self.animate_settings(true);self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::SettingsPage(page) => {self.animate_settings(true);self.settings_page=page;self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
                         crate::ipc::IpcCommand::Pin => {
                             let pinned = self.vis.toggle_pin();
                             log::info!(
@@ -4084,12 +4132,16 @@ impl Handler for TayApp {
                 // 呼出/收起动画步进。
                 self.step_animation(ctx);
                 // toast 到期:清除并重绘一帧(否则残留到旧画面里)。
-                if self.sessions[self.active_pane].ui.status_msg
-                    .as_ref()
-                    .is_some_and(|(_, at, for_ms)| at.elapsed() >= *for_ms)
                 {
-                    self.sessions[self.active_pane].ui.status_msg = None;
-                    ctx.request_redraw();
+                    let toasts = &mut self.sessions[self.active_pane].ui.status_msg;
+                    let popped = std::mem::take(toasts)
+                        .into_iter()
+                        .skip_while(|(_, at, for_ms)| at.elapsed() >= *for_ms)
+                        .collect::<Vec<_>>();
+                    if popped.len() != toasts.len() {
+                        ctx.request_redraw();
+                    }
+                    *toasts = popped;
                 }
                 // 可视铃:到期清除;未到期衰减重绘并唤醒到期时刻。
                 // 与动画并发时动画的 8ms 步进自带重绘,不覆盖其 deadline。

@@ -166,7 +166,7 @@ pub fn layout(
         x += 1;
     }
     if extra > 0 {
-        for (n, (text, action)) in [(" + ", Action::New), ("   ", Action::Settings)]
+        for (n, (text, action)) in [("   ", Action::New), ("   ", Action::Settings)]
             .into_iter()
             .enumerate()
         {
@@ -403,6 +403,7 @@ pub fn decorate(
     for item in items.iter().filter(|i| i.row == 0) {
         use tay_render::WindowIconKind;
         let kind = match item.action {
+            Action::New => WindowIconKind::Add,
             Action::Settings => WindowIconKind::Settings,
             Action::Hide => WindowIconKind::Minimize,
             Action::Maximize => {

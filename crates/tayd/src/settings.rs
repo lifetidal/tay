@@ -333,9 +333,14 @@ pub(crate) fn paint(
     page: u8,
     focus: Option<Action>,
     editing: Option<&(Field, String)>,
+    reveal: f32,
     info: &OverlayInfo<'_>,
 ) {
     let (x, y, w, h) = rect(grid.cols, grid.rows, crate::chrome::rows(c, true));
+    // 开合动画:面板从栏向下展开 / 向上收起(整行粒度)。reveal==0
+    // 时不推面板不画任何行 —— ChromePanel 的 rows:0 是「铺满整栏」
+    // 语义,绝不能把空面板当标签面板画。
+    let visible_h = ((h as f32 * reveal).ceil() as usize).min(h);
     let fg = c.colors.foreground;
     let backdrop = c.tab_bar.background;
     let bg = mix(backdrop, fg, 0.06);
@@ -343,52 +348,57 @@ pub(crate) fn paint(
     let raised = mix(bg, fg, 0.10);
     let accent = c.tab_bar.accent;
     for cell in &mut grid.cells {
-        cell.bg = mix(cell.bg, backdrop, 0.65);
-        cell.fg = mix(cell.fg, bg, 0.65);
+        cell.bg = mix(cell.bg, backdrop, 0.65 * reveal);
+        cell.fg = mix(cell.fg, bg, 0.65 * reveal);
     }
     let surround = grid
         .cells
         .get(y * grid.cols + x)
         .map(|cell| cell.bg)
         .unwrap_or(bg);
-    grid.chrome_panels.push(tay_render::ChromePanel {
-        row: y,
-        rows: h,
-        start: x,
-        end: x + w,
-        background: surround,
-        accent: None,
-        corners: tay_render::PanelCorners::All,
-    });
-    for row in y..y + h {
+    if visible_h > 0 {
+        grid.chrome_panels.push(tay_render::ChromePanel {
+            row: y,
+            rows: visible_h,
+            start: x,
+            end: x + w,
+            background: surround,
+            accent: None,
+            corners: tay_render::PanelCorners::All,
+        });
+    }
+    for row in y..y + visible_h {
         put(grid, row, x, x + w, "", fg, bg, false);
     }
-    put(
-        grid,
-        y,
-        x + 1,
-        (x + w).saturating_sub(8),
-        " 设置",
-        fg,
-        bg,
-        true,
-    );
+    if visible_h >= 1 {
+        put(
+            grid,
+            y,
+            x + 1,
+            (x + w).saturating_sub(8),
+            " 设置",
+            fg,
+            bg,
+            true,
+        );
+    }
     // 设计 A:设置提示从栏消息行移进面板内(标题与页签之间的一行):
     // 常驻提示跟随设置上下文,编辑字段时同位置切换为编辑帮助。
     // 面板太矮时不画(h < 5:提示行会挤掉全部内容行,退化布局里
     // 宁可没有提示也要保住按钮)。
-    if h >= 5 {
+    if h >= 5 && y + 1 < y + visible_h {
         let hint = if let Some((field, value)) = editing {
             format!(
                 "编辑 {}: {value}_  Enter=保存  Esc=取消  Ctrl+A=替换",
                 field_label(field)
             )
         } else {
-            // 按页提示:只讲本页语义,不把别的页的信息掺进来。
+            // 按页提示:只讲本页语义,不把别的页的信息掺进来;
+            // 尾部固定面板内键盘路径(Tab 循环焦点 / Esc 关闭)。
             match page {
-                0 => "外观立即生效并保存；Ctrl+Z 撤销上次修改",
-                1 => "背景图留空=禁用；滑条拖动即时生效",
-                _ => "全局快捷键修改需重启并完成桌面授权；窗口内快捷键即时生效",
+                0 => "外观立即生效并保存；Ctrl+Z 撤销上次修改 ·Tab 切换·Esc 关闭",
+                1 => "背景图留空=禁用；滑条拖动即时生效 ·Tab 切换·Esc 关闭",
+                _ => "全局快捷键修改需重启授权；窗口内快捷键即时生效 ·Tab 切换·Esc 关闭",
             }
             .into()
         };
@@ -396,6 +406,9 @@ pub(crate) fn paint(
     }
     let items = layout(grid.cols, grid.rows, page, c);
     for item in &items {
+        if item.row >= y + visible_h {
+            continue;
+        }
         let unavailable = matches!(item.action, Action::UndoAppearance) && !info.undo_available;
         let active = item.selected || (focus == Some(item.action) && !unavailable);
         let color = if unavailable {
@@ -436,7 +449,9 @@ pub(crate) fn paint(
             .split('\t')
             .find_map(|s| s.strip_prefix("shortcut="))
             .unwrap_or("快捷键绑定待确认");
-        put(grid, y + 3, x + 2, x + w - 2, shortcut, muted, bg, false);
+        if y + 3 < y + visible_h {
+            put(grid, y + 3, x + 2, x + w - 2, shortcut, muted, bg, false);
+        }
         let cell = (x + w - 2).saturating_sub(x + 2) / 2;
         let mut slot = 0;
         for (action, label) in KEY_LABELS {
@@ -445,7 +460,7 @@ pub(crate) fn paint(
                 continue;
             }
             let row = y + 5 + slot / 2;
-            if row >= y + h - 1 {
+            if row >= y + h - 1 || row >= y + visible_h {
                 break;
             }
             let col = x + 2 + (slot % 2) * cell;
@@ -630,7 +645,7 @@ mod tests {
         };
         // 常规态:标题下一行(栏下 y+1)是设置提示。
         let mut grid = make_grid();
-        paint(&mut grid, &c, 0, None, None, &info);
+        paint(&mut grid, &c, 0, None, None, 1.0, &info);
         let (_, y, _, _) = rect(cols, rows, crate::chrome::rows(&c, true));
         let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
             .iter()
@@ -646,6 +661,7 @@ mod tests {
             0,
             None,
             Some(&(Field::Font, "JetBrainsMono".into())),
+            1.0,
             &info,
         );
         let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
@@ -658,7 +674,7 @@ mod tests {
         // 矮面板(h < 5)不画提示行,内容行保留。
         let mut grid = make_grid();
         grid.rows = crate::chrome::rows(&c, true) + 4;
-        paint(&mut grid, &c, 0, None, None, &info);
+        paint(&mut grid, &c, 0, None, None, 1.0, &info);
         let (_, y, _, _) = rect(cols, grid.rows, crate::chrome::rows(&c, true));
         let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
             .iter()
@@ -705,7 +721,7 @@ mod tests {
             background_error: None,
             undo_available: false,
         };
-        paint(&mut grid, &c, 2, None, None, &info);
+        paint(&mut grid, &c, 2, None, None, 1.0, &info);
         let (x, y, w, h) = rect(cols, rows, crate::chrome::rows(&c, true));
         // 状态行在 y+3,显示 health 快照里的快捷键授权状态。
         let status: String = grid.cells[(y + 3) * cols..(y + 4) * cols]
@@ -729,5 +745,56 @@ mod tests {
         // 清单行不越出面板(整行粒度)。
         let last_list_row = y + 5 + KEY_LABELS.len() / 2;
         assert!(last_list_row < y + h);
+    }
+    #[test]
+    fn reveal_clips_paint_by_rows_and_zero_reveal_pushes_no_panel() {
+        let c = Config::default();
+        let (cols, rows) = (80, 20);
+        let cell = tay_render::Cell {
+            c: 'z',
+            fg: tay_config::Rgb(255, 255, 255),
+            bg: tay_config::Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+            zerowidth: None,
+        };
+        let make_grid = || tay_render::Grid {
+            cols,
+            rows,
+            cells: vec![cell.clone(); cols * rows],
+            cursor: (0, 0),
+            cursor_shape: tay_render::CursorShape::Beam,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            tab_panel_rows: 0,
+            opaque_background: false,
+            scrollbar: None,
+        };
+        let info = OverlayInfo {
+            status: "shortcut=x",
+            feedback: "",
+            background_error: None,
+            undo_available: false,
+        };
+        let (_, y, _, h) = rect(cols, rows, crate::chrome::rows(&c, true));
+        // 半开:仅 y..y+ceil(h/2) 被画(该范围外保留 'z' 原格)。
+        let mut grid = make_grid();
+        paint(&mut grid, &c, 0, None, None, 0.5, &info);
+        let visible_h = ((h as f32 * 0.5).ceil() as usize).min(h);
+        assert_eq!(grid.chrome_panels.len(), 1);
+        assert_eq!(grid.chrome_panels[0].rows, visible_h);
+        assert_eq!(grid.cells[(y + visible_h) * cols].c, 'z');
+        // reveal=0:不推面板(rows:0 是「铺满整栏」语义,不能误用)。
+        let mut grid = make_grid();
+        paint(&mut grid, &c, 0, None, None, 0.0, &info);
+        assert!(grid.chrome_panels.is_empty());
     }
 }

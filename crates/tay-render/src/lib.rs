@@ -47,6 +47,7 @@ pub enum WindowIconKind {
     Restore,
     Close,
     Settings,
+    Add,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct WindowIcon {
@@ -1575,6 +1576,10 @@ impl Renderer {
                 WindowIconKind::Close => {
                     line(x, y, x + side, y + side);
                     line(x + side, y, x, y + side);
+                }
+                WindowIconKind::Add => {
+                    line(x, y + side * 0.5, x + side, y + side * 0.5);
+                    line(x + side * 0.5, y, x + side * 0.5, y + side);
                 }
             }
         }
