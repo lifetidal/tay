@@ -121,10 +121,10 @@ pub fn layout(
     let mut tab_w = config.tab_bar.tab_width as usize;
     let page = (usable / tab_w).max(1);
     if count > page {
-        // 每标签预算 =(可用宽 − 每标签 3 列关闭钮)/ 总数。
-        let per = usable.saturating_sub(3 * count) / count;
+        // 每标签预算 =(可用宽 − 关闭钮 3 列 − 芯片间隔 2 列)/ 总数。
+        let per = usable.saturating_sub(5 * count) / count;
         if per >= 4 {
-            tab_w = per + 3;
+            tab_w = per + 5;
         }
     }
     let page = (usable / tab_w).max(1);
@@ -163,7 +163,8 @@ pub fn layout(
             selected: i == active,
         });
         x += close_w;
-        x += 1;
+        // 芯片间隔 2 列:非活动标签各自成块,不再连成一条。
+        x += 2;
     }
     if extra > 0 {
         for (n, (text, action)) in [("   ", Action::New), ("   ", Action::Settings)]

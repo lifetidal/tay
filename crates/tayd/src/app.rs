@@ -251,6 +251,8 @@ pub struct TayApp {
     sessions: Sessions<PaneSession>,
     layouts: Vec<PaneTab>,
     divider_drag: Option<Divider>,
+    /// 指针停在分隔条上(或相邻 1 格)时的悬停高亮矩形。
+    divider_hover: Option<crate::panes::Rect>,
     pane_output_dirty: bool,
     pane_smoke: Option<(std::path::PathBuf, u8)>,
     active_pane: PaneId,
@@ -439,6 +441,7 @@ impl TayApp {
                 zoomed: false,
             }],
             divider_drag: None,
+            divider_hover: None,
             pane_output_dirty: false,
             pane_smoke: std::env::var_os("TAY_PANES_SMOKE").map(|path| (path.into(), 0)),
             active_pane,
@@ -543,6 +546,7 @@ impl TayApp {
     fn hide(&mut self, ctx: &mut Ctx<'_>) {
         self.sessions[self.active_pane].ui.scrollbar_drag = None;
         self.sessions[self.active_pane].ui.dragging = false;
+        self.divider_hover = None;
         ctx.request_keyboard(false, false);
         match self.vis.hide(self.config.animation_ms) {
             crate::visibility::VisOutcome::None => {}
@@ -1043,6 +1047,24 @@ impl TayApp {
         ctx.request_redraw();
     }
     fn pane_pointer(&mut self, ctx: &mut Ctx<'_>, event: &WEvent) -> bool {
+        if let WEvent::PointerMoved { x, y } = event {
+            // 分隔条悬停(拖动中不重算,拖动条由 divider_drag 高亮):
+            // 命中格或相邻 1 格内亮起强调色,给出「可拖」暗示。
+            let hover = if self.divider_drag.is_some() {
+                self.divider_hover
+            } else {
+                self.window_cell(*x, *y).and_then(|(col, row)| {
+                    let (_, dividers) = self.pane_geometry();
+                    dividers.into_iter().map(|d| d.rect).find(|r| {
+                        col + 1 >= r.x && col <= r.x + r.w && row + 1 >= r.y && row <= r.y + r.h
+                    })
+                })
+            };
+            if hover != self.divider_hover {
+                self.divider_hover = hover;
+                ctx.request_redraw();
+            }
+        }
         if let WEvent::PointerMoved { x, y } = event
             && let Some(divider) = self.divider_drag.clone()
         {
@@ -2045,6 +2067,8 @@ impl TayApp {
                 vec![(leaves[0].1, grid, true)],
                 &[],
                 &self.config.colors,
+                None,
+                self.config.tab_bar.accent,
             );
         }
         let mut panes = Vec::new();
@@ -2053,7 +2077,18 @@ impl TayApp {
             panes.push((rect, self.build_pane_grid(id, rect), id == focused));
         }
         let (cols, rows) = self.dims.unwrap_or((80, 24));
-        crate::composite::compose(cols, rows, panes, &dividers, &self.config.colors)
+        crate::composite::compose(
+            cols,
+            rows,
+            panes,
+            &dividers,
+            &self.config.colors,
+            self.divider_drag
+                .as_ref()
+                .map(|d| d.rect)
+                .or(self.divider_hover),
+            self.config.tab_bar.accent,
+        )
     }
 
     /// 滚动条指示器(终端区,不含操作栏):视口位置与占比。

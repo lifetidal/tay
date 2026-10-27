@@ -1,6 +1,6 @@
 //! Compose pane-local grids without letting selection, labels or images cross panes.
 use crate::panes::{Axis, Divider, Rect};
-use tay_config::Colors;
+use tay_config::{Colors, Rgb};
 use tay_render::{Cell, CursorShape, Grid};
 use unicode_width::UnicodeWidthChar;
 fn put(
@@ -48,6 +48,9 @@ pub(crate) fn compose(
     panes: Vec<(Rect, Grid, bool)>,
     dividers: &[Divider],
     colors: &Colors,
+    // 悬停/拖动中的分隔条矩形:高亮为强调色,给出「可拖」暗示。
+    divider_hot: Option<Rect>,
+    accent: Rgb,
 ) -> Grid {
     let blank = Cell {
         c: ' ',
@@ -160,6 +163,7 @@ pub(crate) fn compose(
         }
     }
     for line in dividers {
+        let hot = divider_hot.is_some_and(|r| r == line.rect);
         for y in line.rect.y..line.rect.y + line.rect.h {
             for x in line.rect.x..line.rect.x + line.rect.w {
                 if x < cols && y < rows {
@@ -168,7 +172,8 @@ pub(crate) fn compose(
                         Axis::Columns => '│',
                         Axis::Rows => '─',
                     };
-                    cell.fg = colors.cursor;
+                    cell.fg = if hot { accent } else { colors.cursor };
+                    cell.bold = hot;
                 }
             }
         }
@@ -181,7 +186,7 @@ mod tests {
     use super::*;
     fn grid(cols: usize, rows: usize, c: char) -> Grid {
         let colors = tay_config::Colors::default();
-        let mut g = compose(cols, rows, vec![], &[], &colors);
+        let mut g = compose(cols, rows, vec![], &[], &colors, None, Rgb(0, 0, 0));
         for cell in &mut g.cells {
             cell.c = c;
         }
@@ -240,6 +245,8 @@ mod tests {
             vec![(a, left, false), (b, right, true)],
             &[],
             &colors,
+            None,
+            Rgb(0, 0, 0),
         );
         assert_eq!(output.cursor, (10, 0));
         assert_eq!(output.cells[1].bg, colors.selection);
