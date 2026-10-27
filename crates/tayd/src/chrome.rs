@@ -5,14 +5,15 @@ use tay_config::{Config, Rgb};
 use tay_render::{Cell, Grid};
 use unicode_width::UnicodeWidthChar;
 
-pub fn rows(config: &Config, _settings: bool) -> usize {
+pub fn rows(config: &Config, settings: bool) -> usize {
     if !config.tab_bar.visible {
-        0
-    } else if config.tab_bar.compact {
-        2
-    } else {
-        3
+        // 极简模式:设置面板展开时临时恢复操作栏(关闭齿轮/时钟锚点
+        // 仍在原位,面板钳在栏下);面板关闭即收回。
+        if !settings {
+            return 0;
+        }
     }
+    if config.tab_bar.compact { 2 } else { 3 }
 }
 fn truncate(text: &str, width: usize) -> String {
     let mut used = 0;
@@ -499,6 +500,17 @@ mod tests {
         assert!(items.iter().any(|i| i.text.contains("中文")));
         assert_eq!(rows(&config, false), 2);
         assert_eq!(rows(&config, true), 2);
+    }
+
+    #[test]
+    fn minimal_mode_restores_the_bar_while_settings_are_open() {
+        let mut config = Config::default();
+        config.tab_bar.visible = false;
+        // 极简模式平时无栏;设置面板展开时临时恢复(紧凑 2 行)。
+        assert_eq!(rows(&config, false), 0);
+        assert_eq!(rows(&config, true), 2);
+        config.tab_bar.compact = false;
+        assert_eq!(rows(&config, true), 3);
     }
 
     #[test]

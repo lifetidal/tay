@@ -3033,7 +3033,7 @@ impl Handler for TayApp {
                         let pad = renderer.padding() as f64;
                         let col = ((*x - pad) / cw as f64).floor();
                         let row = ((*y - pad) / ch as f64).floor();
-                        let rows = rows + crate::chrome::rows(&self.config, false);
+                        let rows = rows + crate::chrome::rows(&self.config, true);
                         let items =
                             crate::settings::layout(cols, rows, self.settings_page, &self.config);
                         if matches!(
@@ -3078,7 +3078,7 @@ impl Handler for TayApp {
                         let (px, py, pw, ph) = crate::settings::rect(
                             cols,
                             rows,
-                            crate::chrome::rows(&self.config, false),
+                            crate::chrome::rows(&self.config, true),
                         );
                         let inside = col >= px as f64
                             && col < (px + pw) as f64

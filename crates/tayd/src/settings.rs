@@ -3,6 +3,24 @@ use crate::chrome::{Action, Field, Item};
 use tay_config::{Config, Rgb};
 use tay_render::{Cell, Grid};
 use unicode_width::UnicodeWidthChar;
+/// 窗口内快捷键清单(页 3 展示;binding_hint 取当前生效按键,
+/// unbound 行跳过 —— 用户在 keys 里改键/禁用后实时反映)。
+/// hide/maximize 不进清单:状态行已显示全局快捷键,窗口控制按钮
+/// 就在栏上,重复展示徒增噪音。
+const KEY_LABELS: &[(&str, &str)] = &[
+    ("new-tab", "新标签"),
+    ("close-tab", "关闭标签"),
+    ("next-tab", "下一标签"),
+    ("previous-tab", "上一标签"),
+    ("copy", "复制"),
+    ("paste", "粘贴"),
+    ("settings", "设置"),
+    ("split-right", "向右分屏"),
+    ("split-down", "向下分屏"),
+    ("next-pane", "下一窗格"),
+    ("close-pane", "关闭窗格"),
+    ("zoom-pane", "放大窗格"),
+];
 pub(crate) fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
     Rgb::new(
         (a.0 as f32 * (1. - t) + b.0 as f32 * t) as u8,
@@ -36,7 +54,7 @@ pub(crate) fn rect(cols: usize, rows: usize, bar_rows: usize) -> (usize, usize, 
 }
 pub(crate) fn layout(cols: usize, rows: usize, page: u8, c: &Config) -> Vec<Item> {
     // 面板永远从栏之下开始(栏高与调用方一致:bar_rows = tab_bar 行数)。
-    let bar_rows = crate::chrome::rows(c, false);
+    let bar_rows = crate::chrome::rows(c, true);
     let (x, y, w, h) = rect(cols, rows, bar_rows);
     if w < 4 || h < 4 {
         return vec![Item {
@@ -238,17 +256,19 @@ pub(crate) fn layout(cols: usize, rows: usize, page: u8, c: &Config) -> Vec<Item
             );
         }
         _ => {
+            // 状态行(y+3)与窗口内快捷键清单(y+5 起)由 paint 直接绘制
+            // (展示性内容不进布局,键盘焦点不会停在不可交互的行上)。
             add(
-                y + base + step,
+                y + 4,
                 left,
-                right,
+                mid,
                 " 配置桌面快捷键 > ".into(),
                 Action::Hotkeys,
                 false,
             );
             add(
-                y + 9,
-                left,
+                y + 4,
+                mid,
                 right,
                 " 复制诊断报告 ".into(),
                 Action::Diagnostics,
@@ -315,7 +335,7 @@ pub(crate) fn paint(
     editing: Option<&(Field, String)>,
     info: &OverlayInfo<'_>,
 ) {
-    let (x, y, w, h) = rect(grid.cols, grid.rows, crate::chrome::rows(c, false));
+    let (x, y, w, h) = rect(grid.cols, grid.rows, crate::chrome::rows(c, true));
     let fg = c.colors.foreground;
     let backdrop = c.tab_bar.background;
     let bg = mix(backdrop, fg, 0.06);
@@ -364,7 +384,13 @@ pub(crate) fn paint(
                 field_label(field)
             )
         } else {
-            "外观立即生效并保存；背景图留空=禁用；Shell 仅新会话生效；快捷键修改需重启授权".into()
+            // 按页提示:只讲本页语义,不把别的页的信息掺进来。
+            match page {
+                0 => "外观立即生效并保存；Ctrl+Z 撤销上次修改",
+                1 => "背景图留空=禁用；滑条拖动即时生效",
+                _ => "全局快捷键修改需重启并完成桌面授权；窗口内快捷键即时生效",
+            }
+            .into()
         };
         put(grid, y + 1, x + 2, x + w - 2, &hint, muted, bg, false);
     }
@@ -401,42 +427,39 @@ pub(crate) fn paint(
             grid, item.row, item.start, item.end, &item.text, button_fg, button_bg, active,
         );
     }
-    if page == 2 {
-        // 状态行/提示行从 layout 的**实际按钮行**推导:按钮被 add()
-        // 过滤(面板太矮)时提示不画 —— 不再重复 base/step 公式,
-        // 也消除了 h=5 时「状态在而按钮不在」的孤儿行。
+    if page == 2 && h >= 5 {
+        // 全局快捷键授权状态固定 y+3;窗口内快捷键清单从 y+5 起,
+        // 每行两个 —— 展示性内容不进布局,键盘焦点不停在不可
+        // 交互的行上。行超面板即停(整行粒度,不截半行)。
         let shortcut = info
             .status
             .split('\t')
             .find_map(|s| s.strip_prefix("shortcut="))
             .unwrap_or("快捷键绑定待确认");
-        if let Some(hotkeys) = items.iter().find(|i| i.action == Action::Hotkeys)
-            && hotkeys.row > y
-        {
+        put(grid, y + 3, x + 2, x + w - 2, shortcut, muted, bg, false);
+        let cell = (x + w - 2).saturating_sub(x + 2) / 2;
+        let mut slot = 0;
+        for (action, label) in KEY_LABELS {
+            let key = c.binding_hint(action);
+            if key == "unbound" {
+                continue;
+            }
+            let row = y + 5 + slot / 2;
+            if row >= y + h - 1 {
+                break;
+            }
+            let col = x + 2 + (slot % 2) * cell;
             put(
                 grid,
-                hotkeys.row - 1,
-                x + 2,
-                x + w - 2,
-                shortcut,
-                muted,
+                row,
+                col,
+                col + cell.saturating_sub(1),
+                &format!(" {label}  {key} "),
+                fg,
                 bg,
                 false,
             );
-        }
-        if let Some(diagnostics) = items.iter().find(|i| i.action == Action::Diagnostics)
-            && diagnostics.row > y
-        {
-            put(
-                grid,
-                diagnostics.row - 1,
-                x + 2,
-                x + w - 2,
-                "高级诊断:tay status / tay doctor",
-                muted,
-                bg,
-                false,
-            );
+            slot += 1;
         }
     }
     if h > 13 && page == 0 {
@@ -608,7 +631,7 @@ mod tests {
         // 常规态:标题下一行(栏下 y+1)是设置提示。
         let mut grid = make_grid();
         paint(&mut grid, &c, 0, None, None, &info);
-        let (_, y, _, _) = rect(cols, rows, crate::chrome::rows(&c, false));
+        let (_, y, _, _) = rect(cols, rows, crate::chrome::rows(&c, true));
         let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
             .iter()
             .filter(|c| !c.wide_spacer)
@@ -634,14 +657,77 @@ mod tests {
         assert!(row_text.contains("Enter=保存"));
         // 矮面板(h < 5)不画提示行,内容行保留。
         let mut grid = make_grid();
-        grid.rows = crate::chrome::rows(&c, false) + 4;
+        grid.rows = crate::chrome::rows(&c, true) + 4;
         paint(&mut grid, &c, 0, None, None, &info);
-        let (_, y, _, _) = rect(cols, grid.rows, crate::chrome::rows(&c, false));
+        let (_, y, _, _) = rect(cols, grid.rows, crate::chrome::rows(&c, true));
         let row_text: String = grid.cells[(y + 1) * cols..(y + 2) * cols]
             .iter()
             .filter(|c| !c.wide_spacer)
             .map(|c| c.c)
             .collect();
         assert!(!row_text.contains("外观立即生效"));
+    }
+    #[test]
+    fn shortcuts_page_lists_effective_bindings_from_config() {
+        let c = Config::default();
+        let (cols, rows) = (80, 20);
+        let cell = tay_render::Cell {
+            c: ' ',
+            fg: tay_config::Rgb(255, 255, 255),
+            bg: tay_config::Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+            zerowidth: None,
+        };
+        let mut grid = tay_render::Grid {
+            cols,
+            rows,
+            cells: vec![cell; cols * rows],
+            cursor: (0, 0),
+            cursor_shape: tay_render::CursorShape::Beam,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            tab_panel_rows: 0,
+            opaque_background: false,
+            scrollbar: None,
+        };
+        let info = OverlayInfo {
+            status: "shortcut=CTRL+grave",
+            feedback: "",
+            background_error: None,
+            undo_available: false,
+        };
+        paint(&mut grid, &c, 2, None, None, &info);
+        let (x, y, w, h) = rect(cols, rows, crate::chrome::rows(&c, true));
+        // 状态行在 y+3,显示 health 快照里的快捷键授权状态。
+        let status: String = grid.cells[(y + 3) * cols..(y + 4) * cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        assert!(status.contains("CTRL+grave"));
+        // 清单从 y+5 起,默认配置的 new-tab 绑定是 Ctrl+t。
+        let first: String = grid.cells[(y + 5) * cols..(y + 6) * cols]
+            .iter()
+            .filter(|c| !c.wide_spacer)
+            .map(|c| c.c)
+            .collect();
+        assert!(
+            first.contains("新标签") && first.contains("Ctrl+t"),
+            "{first}"
+        );
+        assert_eq!(h, 16.min(rows - crate::chrome::rows(&c, true)));
+        let _ = (x, w);
+        // 清单行不越出面板(整行粒度)。
+        let last_list_row = y + 5 + KEY_LABELS.len() / 2;
+        assert!(last_list_row < y + h);
     }
 }
