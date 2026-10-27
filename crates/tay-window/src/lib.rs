@@ -134,7 +134,6 @@ pub enum Event {
         pixel_x: f32,
         pixel_y: f32,
     },
-    CloseRequested,
     RedrawRequested,
     /// 跨线程唤醒(PTY 输出到达)。
     ProxyWake,
@@ -142,8 +141,9 @@ pub enum Event {
     AboutToWait,
     /// 绑定输出消失或尺寸/缩放变化:应用应重设 layer 高度并重提 margin。
     OutputChanged,
-    /// layer 角色已重建到新的 wl_surface(输出移除回退):应用必须
-    /// 重建 wgpu surface 与渲染器,并完成 configure 握手后才可呈现。
+    /// layer 角色已重建到新的 wl_surface(输出移除回退)或已退役
+    /// (输出全灭挂起):应用必须丢弃旧 wgpu surface 与渲染器;
+    /// 重建分支还要完成 configure 握手后才可呈现。
     SurfaceReplaced,
 }
 
@@ -181,6 +181,13 @@ impl Ctx<'_> {
         )
     }
     pub fn set_background_blur(&mut self, enabled: bool) {
+        if self.state.awaiting_output {
+            // 输出全灭挂起期间不创建模糊对象:旧 surface 已被合成器
+            // 关闭,恢复路径(create_renderer → set_background_blur)
+            // 会在新 surface 上按配置重新申请。
+            self.state.blur_requested = enabled;
+            return;
+        }
         if self.state.blur_requested == enabled && (!enabled || self.state.blur.is_some()) {
             return;
         }
@@ -287,6 +294,12 @@ impl Ctx<'_> {
     /// 不复发)。
     pub fn wake_present(&mut self) {
         self.state.stalled = false;
+        if self.state.awaiting_output {
+            // 输出全灭期间没有可呈现的 surface:忽略呼出,
+            // 输出恢复(new_output)后按现有 vis 状态重建。
+            log::warn!("呼出请求被忽略:没有可用输出");
+            return;
+        }
         if self.state.phase != SurfacePhase::Unmapped {
             return;
         }
@@ -569,6 +582,9 @@ struct WindowState {
     layer_shell: LayerShell,
     /// layer surface 绑定的输出(输出销毁 → 回退合成器默认)。
     bound_output: Option<wl_output::WlOutput>,
+    /// 所有输出同时消失(layer surface 已被合成器关闭):挂起等待
+    /// new_output 恢复重建。常驻 daemon 不因输出移除退出。
+    awaiting_output: bool,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<ThemedPointer>,
     shm: Shm,
@@ -653,6 +669,7 @@ impl WindowState {
             requested_size: (0, 480),
             layer_shell,
             bound_output: None,
+            awaiting_output: false,
             keyboard: None,
             pointer: None,
             shm: Shm::bind(&globals, &qh2).map_err(|e| format!("wl_shm: {e}"))?,
@@ -726,6 +743,13 @@ impl WindowState {
         while let Some(ev) = self.pending.pop_front() {
             self.emit(handler, ev);
         }
+        // 退役 surface 此刻才可销毁:此前入队的 SurfaceReplaced
+        // 都已在本轮(或更早的)drain 送达 app,渲染器已在处理时
+        // drop —— wgpu 销毁 swapchain 时会 marshal 旧 surface,
+        // 必须活过 app 的 handler。ProxyWake/AboutToWait 直接派发
+        // 阶段发生的 rebind 其 SurfaceReplaced 仍留在队列、其
+        // 退役条目也未销毁,下一轮 drain 送达后再到这里清除。
+        self.retired.clear();
     }
 
     /// 帧回调未在途时请求之(附一次 commit,保证回调被合成器确认)。
@@ -991,7 +1015,23 @@ impl OutputHandler for WindowState {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        // 恢复条件:输出全灭挂起中,或当前绑定已指向不存在的输出
+        // (closed 竞态留下的死绑定:重绑后输出全灭、新表面未被再次
+        // 关闭时 awaiting 没有武装,不恢复则 daemon 永远呼不出)。
+        let dead_binding = self
+            .bound_output
+            .as_ref()
+            .is_some_and(|bound| self.output_state.outputs().all(|o| o != *bound));
+        if self.awaiting_output || dead_binding {
+            log::info!("输出恢复,重建 layer surface");
+            self.awaiting_output = false;
+            // 记录绑定:后续分辨率变化/输出移除能正确匹配,不再
+            // 停留在 None(合成器默认)的盲区。
+            self.bound_output = Some(output.clone());
+            self.rebind_layer(Some(&output));
+        }
+    }
 
     fn update_output(
         &mut self,
@@ -1012,19 +1052,59 @@ impl OutputHandler for WindowState {
         _: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        // 指定输出消失的明确回退:重建 layer surface 到合成器默认输出,
-        // 并通知应用重设高度与 margin(原 surface 由 wgpu 继续使用,
-        // 只有 layer 角色重建 —— GPU 资源零重建)。
+        // 绑定输出消失 → 回退到其它输出;全部消失则挂起等恢复。
         if self.bound_output.as_ref() == Some(&output) {
-            log::warn!("呼出所在输出已移除,回退到合成器默认输出");
-            self.rebind_layer(None);
-            self.bound_output = None;
-            self.pending.push_back(Event::OutputChanged);
+            self.output_gone(Some(&output));
         }
     }
 }
 
 impl WindowState {
+    /// 当前 layer surface 被合成器关闭(closed)或绑定输出被销毁:
+    /// 还有其它输出 → 回退重建到合成器默认输出;全部输出消失 →
+    /// 退役 layer 角色、挂起等待 new_output。常驻 daemon 不因
+    /// 输出移除退出 —— 合成器整体关闭由连接断开/分发错误路径兜底。
+    /// `dying` = 触发本次调用的、正在销毁的输出:必须从可用性判断
+    /// 里排除 —— sctk 的 output_destroyed 在把 wl_output 移出
+    /// OutputState **之前**回调,outputs() 此刻仍列出它,否则拔掉
+    /// 最后一台显示器会误走回退重建而不是挂起等待。
+    fn output_gone(&mut self, dying: Option<&wl_output::WlOutput>) {
+        // 回退到某个仍在的**具体输出**并记录绑定:None(合成器默认)
+        // 会让 bound_output 永远为空,此后 update_output/output_destroyed
+        // 再也匹配不到,分辨率变化不再重算高度,高度还会按注册表
+        // 顺序的第一个输出计算。
+        if let Some(fallback) = self.output_state.outputs().find(|o| dying != Some(o)) {
+            let fallback = fallback.clone();
+            log::warn!("layer surface 已关闭/所在输出移除,回退到其它输出");
+            self.bound_output = Some(fallback.clone());
+            // rebind_layer 内部已推 SurfaceReplaced + OutputChanged。
+            self.rebind_layer(Some(&fallback));
+            return;
+        }
+        self.bound_output = None;
+        log::warn!("所有输出已移除,layer surface 被关闭;保持运行等待输出恢复");
+        // 与 rebind_layer 同款清理:模糊对象挂在旧 surface 上,closed
+        // 后不得再向它发请求;恢复路径 create_renderer 按配置重新申请。
+        if let Some(blur) = self.blur.take() {
+            blur.release();
+        }
+        self.blur_requested = false;
+        // 已关 surface 的帧回调不会回来:清在途状态,避免 2s 后
+        // 遮挡 watchdog 误报(恢复时 rebind_layer 会再重置)。
+        self.frame_pending = false;
+        self.frame_armed_at = None;
+        // 退役 layer 角色(closed 后不再向它发请求);wl_surface 退役
+        // 保活 —— app 收到 SurfaceReplaced 才 drop 渲染器,GPU 销毁
+        // swapchain 时仍会 marshal 旧 surface。
+        if let Some(old_layer) = self.layer.take() {
+            self.retired.push((old_layer, self.surface.clone()));
+        }
+        self.phase = SurfacePhase::Unmapped;
+        self.awaiting_output = true;
+        self.pending.push_back(Event::SurfaceReplaced);
+        self.pending.push_back(Event::OutputChanged);
+    }
+
     /// 重建 layer surface 角色绑定到 `output`(None = 合成器默认)。
     /// 复用同一 wl_surface:wgpu/渲染管线不受影响;margin 重置为
     /// 全离屏(-2000),由应用收到 OutputChanged 后重新对齐。
@@ -1032,14 +1112,15 @@ impl WindowState {
         // 协议要求:layer 角色必须建在**没有已提交 buffer 的**新
         // wl_surface 上(已呈现过的 surface 复建角色是协议错误)。
         // 旧 surface 退役保活(GPU 侧销毁 swapchain 时仍会 marshal 它)。
-        // 上一代退役资源此刻才销毁:app 在上一次重建的
-        // SurfaceReplaced 里已销毁渲染器,旧 surface 上不再有
-        // wgpu 引用(sctk 保证先销毁角色再销毁 surface 的顺序)。
+        // 退役资源不在此销毁:rebind 也可能发生在 ProxyWake 直接
+        // 派发阶段(wake_present 呼出),其 SurfaceReplaced 要等
+        // 下一轮 drain 才送达 app —— 期间再来一次输出销毁会再次
+        // 重建,此刻销毁上一代会 hit 到 wgpu 仍持有的 surface
+        // (10-16 coredump 同款)。统一推迟到 drain_pending 末尾销毁。
         if let Some(blur) = self.blur.take() {
             blur.release();
         }
         self.blur_requested = false;
-        self.retired.clear();
         // 当前这一代退役**保活**:app 要等 SurfaceReplaced 事件
         // 才 drop 渲染器,surface 必须先活过 wgpu 的销毁。
         if let Some(old_layer) = self.layer.take() {
@@ -1088,7 +1169,15 @@ impl LayerShellHandler for WindowState {
         if layer.wl_surface() != &self.surface {
             return;
         }
-        self.pending.push_back(Event::CloseRequested);
+        // 合成器关闭 layer surface = 所在输出已移除(合成器整体退出
+        // 由连接断开/分发错误路径兜底)。下拉终端是常驻 daemon:
+        // 回退或挂起等待,不把 closed 当"用户关窗口"退出。
+        // 不把 bound_output 当 dying 排除:closed 不保证是输出移除
+        // (协议只说「不再显示」),单显示器上若因其它原因被关闭,
+        // 排除唯一输出会挂起等待一个永远不会来的 new_output。
+        // 拔最后一台显示器时即使重绑到正在销毁的输出,新表面会被
+        // 再次 closed,第二轮时输出已从 state 移除 → 收敛到挂起。
+        self.output_gone(None);
     }
 
     fn configure(

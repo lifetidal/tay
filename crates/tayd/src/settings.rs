@@ -23,13 +23,21 @@ pub(crate) fn field_label(field: &Field) -> &'static str {
         Field::Theme => "主题",
     }
 }
-pub(crate) fn rect(cols: usize, rows: usize) -> (usize, usize, usize, usize) {
+/// 面板矩形:顶部**不得进入操作栏**(bar_rows)—— 矮窗口时若按
+/// 居中公式,面板会盖住栏(齿轮/标签被遮挡,且指针命中与绘制
+/// 分离);可用高度 = 总行数 − 栏高,上限 16。
+pub(crate) fn rect(cols: usize, rows: usize, bar_rows: usize) -> (usize, usize, usize, usize) {
     let w = cols.saturating_sub(4).min(88).max(cols.min(4));
-    let h = rows.saturating_sub(2).min(16).max(rows.min(2));
-    ((cols - w) / 2, (rows - h) / 2, w, h)
+    // 可用高度 = 总行数 − 栏高(最小网格 3 行,栏 2 行 → h ≥ 1);
+    // 退化网格(行数 ≤ 栏高)时钳回网格内,保证 item 永不越界。
+    let h = rows.saturating_sub(bar_rows).min(16);
+    let y = ((rows - h) / 2).max(bar_rows).min(rows.saturating_sub(1));
+    ((cols - w) / 2, y, w, h)
 }
 pub(crate) fn layout(cols: usize, rows: usize, page: u8, c: &Config) -> Vec<Item> {
-    let (x, y, w, h) = rect(cols, rows);
+    // 面板永远从栏之下开始(栏高与调用方一致:bar_rows = tab_bar 行数)。
+    let bar_rows = crate::chrome::rows(c, false);
+    let (x, y, w, h) = rect(cols, rows, bar_rows);
     if w < 4 || h < 4 {
         return vec![Item {
             row: y,
@@ -307,7 +315,7 @@ pub(crate) fn paint(
     editing: Option<&(Field, String)>,
     info: &OverlayInfo<'_>,
 ) {
-    let (x, y, w, h) = rect(grid.cols, grid.rows);
+    let (x, y, w, h) = rect(grid.cols, grid.rows, crate::chrome::rows(c, false));
     let fg = c.colors.foreground;
     let backdrop = c.tab_bar.background;
     let bg = mix(backdrop, fg, 0.06);
@@ -345,7 +353,8 @@ pub(crate) fn paint(
         bg,
         true,
     );
-    for item in layout(grid.cols, grid.rows, page, c) {
+    let items = layout(grid.cols, grid.rows, page, c);
+    for item in &items {
         let unavailable = matches!(item.action, Action::UndoAppearance) && !info.undo_available;
         let active = item.selected || (focus == Some(item.action) && !unavailable);
         let color = if unavailable {
@@ -377,23 +386,43 @@ pub(crate) fn paint(
             grid, item.row, item.start, item.end, &item.text, button_fg, button_bg, active,
         );
     }
-    if h > 6 && page == 2 {
+    if page == 2 {
+        // 状态行/提示行从 layout 的**实际按钮行**推导:按钮被 add()
+        // 过滤(面板太矮)时提示不画 —— 不再重复 base/step 公式,
+        // 也消除了 h=5 时「状态在而按钮不在」的孤儿行。
         let shortcut = info
             .status
             .split('\t')
             .find_map(|s| s.strip_prefix("shortcut="))
             .unwrap_or("快捷键绑定待确认");
-        put(grid, y + 4, x + 2, x + w - 2, shortcut, muted, bg, false);
-        put(
-            grid,
-            y + 8,
-            x + 2,
-            x + w - 2,
-            "高级诊断:tay status / tay doctor",
-            muted,
-            bg,
-            false,
-        );
+        if let Some(hotkeys) = items.iter().find(|i| i.action == Action::Hotkeys)
+            && hotkeys.row > y
+        {
+            put(
+                grid,
+                hotkeys.row - 1,
+                x + 2,
+                x + w - 2,
+                shortcut,
+                muted,
+                bg,
+                false,
+            );
+        }
+        if let Some(diagnostics) = items.iter().find(|i| i.action == Action::Diagnostics)
+            && diagnostics.row > y
+        {
+            put(
+                grid,
+                diagnostics.row - 1,
+                x + 2,
+                x + w - 2,
+                "高级诊断:tay status / tay doctor",
+                muted,
+                bg,
+                false,
+            );
+        }
     }
     if h > 13 && page == 0 {
         put(
@@ -424,9 +453,10 @@ pub(crate) fn paint(
         && let Some(error) = info.background_error
     {
         format!("图片加载失败:{error}")
-    } else if page == 1 && !c.background_image.is_empty() && c.opacity >= 1.0 {
-        // 首次选图最常见的困惑:opacity 默认 1.0,图片被纯色背景完全遮挡。
-        "窗口不透明度 100%:图片会被完全遮挡,请调低「窗口不透明度」".into()
+    } else if page == 1 && !c.background_image.is_empty() && c.background_image_opacity >= 1.0 {
+        // 图片强度 100% 时壁纸完全不透明:窗口不透明度只作用于底色,
+        // 调它压不暗壁纸(终端文字绘制在壁纸之上,不会被遮住)。
+        "图片强度 100%:壁纸不透明,窗口不透明度不再影响它,请调低「图片强度」".into()
     } else if !info.feedback.is_empty() {
         info.feedback.into()
     } else {

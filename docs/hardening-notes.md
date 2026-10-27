@@ -1197,3 +1197,236 @@
   behavior 未实测 —— 本机为 KDE。IME ping-pong 修复基于协议语义
   (smithay 客户端示例同款行为),在 KWin 实测正常,其它合成器的
   text-input 行为未验证。
+
+## 输出移除不再退出 + wgpu/wl_surface 生命周期(2026-10-26)
+
+### 问题确认(实机日志 + coredump)
+- 坞站/USB-C 闪断 → 所有 Wayland 输出同时消失(plasmashell 等全部
+  KDE 应用打印 `There are no outputs - creating placeholder screen`,
+  用户感知为「状态栏崩掉」);KWin 按 wlr-layer-shell 协议给绑定在
+  该输出上的 layer surface 发 `closed`。
+- 旧行为:`closed` → `CloseRequested` → `request_close(Window)` →
+  `shutdown` → 整个 daemon 退出(2026-10-26 10:54:48 实机复现,
+  服务干净退出)。
+- 叠加两个段错误(9 个 coredump):
+  - 10-16 六次:退出 drop 链 `TayApp → Renderer → wgpu
+    Surface::unconfigure → vkDestroySwapchainKHR` 在已销毁的
+    wl_surface proxy 上 marshal(libwayland-client 读 0x174)。
+    根因:`SurfaceReplaced` 带 `sender.is_some()` 守卫,无会话时
+    忽略 → 渲染器未 drop → 下一次重建 `retired.clear()` 释放了
+    wgpu 仍在引用的 proxy。
+  - 10-19 三次:主循环 `EventQueue::flush` 在 wayland-backend
+    `store_and_return_error` 里段错误,KWin 报 `error in client
+    communication`(连接级失败路径;本轮未单独修复,需持续观察)。
+
+### 修复
+- `closed` 不再退出:与 `output_destroyed` 共用 `output_gone()` ——
+  还有其它输出 → `rebind_layer(None)` 回退;全部输出消失 → 退役
+  layer 角色、`phase = Unmapped`、`awaiting_output` 挂起,等
+  `new_output` 恢复重建。合成器整体退出由连接断开/分发错误路径
+  兜底(事件循环 Err 退出)。`Event::CloseRequested` 变体删除
+  (用户主动退出走托盘/IPC/动作,与合成器事件无关)。
+- `SurfaceReplaced` 无条件 drop 渲染器(去掉会话守卫);
+  `Resized` 握手以新增 `initialized` 字段区分「首次 init」与
+  「输出回退重建」,无会话的回退重建不会误开新会话。
+- `finish_shutdown` 显式 `renderer = None`:wgpu 先于窗口层销毁,
+  不再依赖 drop 顺序。
+- 自查修复(同轮 review):挂起分支释放 KDE 模糊对象并清帧在途
+  状态;`set_background_blur` 挂起期间只记录意图不建对象;
+  `OutputChanged` 守卫改为 `initialized`(无窗格时输出恢复也要
+  重设高度,否则挂起期间热重载过高度会握手失败卡死)。
+
+### 验证
+- `cargo test --workspace` 全绿(183+28+14)、`cargo check` 通过。
+- 本机实测:启动 → `tay status`(IPC/GPU 就绪)→ `tay hide` →
+  `tay quit` 干净退出,无 coredump(10-16 型 teardown 段错误已消除)。
+- **未验证**:真实输出移除/恢复路径(需热插拔显示器)未实测 ——
+  逻辑与现有 TAY_REBIND 验收路径同构,留待下次坞站闪断实测。
+
+## 输出移除修复的二轮 review 定点修复(2026-10-26)
+
+- **retired 销毁时机**:`rebind_layer` 里的 `retired.clear()` 移到
+  `drain_pending` 末尾。原实现假设「rebind 时上一次 SurfaceReplaced
+  已送达」,但 wake_present 的 rebind 发生在 ProxyWake 直接派发阶段,
+  其 SurfaceReplaced 要等下一轮 drain —— 期间输出销毁会再次重建并
+  clear,销毁 wgpu 仍持有的 surface(10-16 coredump 同款 UAF)。
+  现在统一在 drain 末尾销毁:此刻此前入队的 SurfaceReplaced 都已
+  送达,app 已 drop 渲染器。
+- **最后一台显示器拔掉的判断**:sctk 0.21.1 的 `output_destroyed`
+  在把 wl_output 移出 OutputState **之前**回调,`outputs()` 此刻仍
+  列出正在销毁的输出,导致 `output_gone` 误判「还有其它输出」而走
+  回退重建。现在 `output_gone(dying)` 显式排除正在销毁的输出;
+  closed 路径传 None(极端时序下至多多走一轮 bounded 重绑后收敛)。
+
+## 全库 review 的 13 项既有问题定点修复(2026-10-26)
+
+review 代理对 diff 之外做了全库扫掠,13 项确认后全部修复:
+
+- **快捷键**:`ActivationGate` 恢复 2s 陈旧按下自愈(一次丢失的
+  Deactivated 不再永久锁死全局 toggle;测试反转为
+  `stale_press_self_heals`)。
+- **关闭保护**:`close_guard` 除前台进程组外,扫描 shell 的存活
+  子进程(R/S/T;Z/X 除外)—— Ctrl+Z 挂起任务与后台任务关闭时
+  不再静默被杀;`live_children` DFS /proc children。
+- **热重载/撤销**:重载结果与运行配置相同(自己的保存写盘触发
+  mtime 监视)时不再清 `appearance_undo`/`settings_drag`,只有
+  外部编辑覆盖才清。
+- **IPC 切设置页**:`Settings`/`SettingsPage` 与 chrome 路径一致,
+  清 editing/settings_drag/settings_feedback(否则方向键被编辑态
+  吞掉、陈旧 drag 在松手时误写撤销)。
+- **选图器**:`try_recv` 区分 Empty/Disconnected—— portal 线程
+  退出后清 `wallpaper_picker`,按钮不再永久失效。
+- **退出持久化**:最终会话写盘失败也 `mark_clean`(干净退出不再
+  被下次启动误判为崩溃恢复;**三轮 review 回退此项**:失败保留
+  .running 走崩溃恢复,避免静默回滚到更旧布局)。
+- **配置钉写**:`save_appearance_source` 去掉 tab_bar 整表钉写条件,
+  只钉写相对基线真正变化的字段;`from_lua` 改为**先按主题推导
+  tab_bar 再覆盖显式字段**(部分指定的表不再落回默认值 ——
+  整表钉写原是为了扛住这个 roundtrip,现在由推导补齐,不再需要);
+  主题切换保留用户定制字段(≠ 当前主题推导的 tab_bar 颜色跨主题
+  存活,如手写时钟色)。
+- **壁纸**:滑条每步换 key 时不再清 `wallpaper`/`img_cache`
+  (陈旧图作回退不闪屏,kitty 内联图不重传);worker 记住最近一次
+  解码失败的身份,同一文件版本不再每秒重试,文件变化后自动恢复。
+- **操作栏**:`hit()` 按栏高映射命中行(非紧凑 3 行栏最下一行不再
+  死区);帮助/编辑消息画在栏的最后一行(原 rows>=4 守卫在栏最多
+  3 行时永不成立,消息从未显示)。
+- **设置浮层**:快捷键页状态行/诊断提示改按 layout 的 base/step
+  计算并做行存在性守卫,不再覆盖按钮或画出面板;背景页提示改指
+  「图片强度」(壁纸画在底色之上,窗口不透明度调不动它)。
+
+测试:全量 **234 通过**(新增 6 个回归:close_guard 子进程扫描、
+chrome 三行命中/消息行、tab_bar 钉写、主题定制保留、快捷键自愈;
+focus-smoke 未重跑)。实机冒烟:启动 → status → quit 干净退出无
+coredump。
+
+## 三轮 review:新修复交互与收敛(2026-10-26)
+
+三轮 review 对 13 项修复本身再做一轮对抗审查,15 项发现全部
+确认并修复(多为新修复之间的交互缺陷):
+
+- **消息行不可点击**:hit() 排除消息行(否则帮助文字下方的
+  隐藏/关闭列是不可见的破坏性点击目标);消息行计算改惰性
+  `then(|| rows-1)`(rows=0 不再下溢)。
+- **init 前重建不卡死**:SurfaceReplaced 内补 `request_layer_height`
+  (OutputChanged 被 initialized 守卫忽略的窗口期,新 layer 沿用旧
+  尺寸导致 ±1 握手永远失败);重建握手(rebuild=true)接受合成器
+  最终高度为准,不再因钳制卡空白;未初始化时直接走 init。
+- **退出持久化回退**:最终写盘失败**保留** .running(按崩溃恢复
+  还原最近一次自动保存,优于静默回滚到更旧 session 文件)。
+- **颜色编辑即时重推导 tab_bar**(apply 时同步,不等 mtime 重载;
+  保存/重载失败也不留错配);主题切换基线改用**当前 colors 推导**
+  (颜色驱动的偏移不再误判为用户定制,切主题不会留下深色栏配
+  浅色标签);重推导保留布局字段与相对旧推导的定制字段。
+- **tab_bar 钉写只写用户定制**:保存时与 `TabBar::from_colors`
+  比较,颜色推导字段不钉(回退颜色后栏跟随主题,不被旧钉写锁死);
+  布局字段按基线比较;其余表(font/colors)保持剥离基线。
+- **close_guard 排除 nohup**:SigIgn bit1(SIGHUP)忽略的进程不算
+  忙碌(否则确认框频繁误报,用户养成盲目 Ctrl+Enter 习惯);
+  挂起(T)任务无论如何都算。
+- **快捷键自愈改为解锁不触发**:2s 陈旧按下只清闸门,重发型
+  合成器按住不放不再每 2s 抖动;下一次真正按下正常触发。
+- **壁纸失败 30s 退避**:同一文件版本失败后不每秒重试(坏图不
+  空转),退避到期或文件变化自动重试(瞬时失败可恢复)。
+- **输出跟踪绑定具体输出**:output_gone 回退到仍在的**具体**
+  wl_output 并记录 bound_output(None 会让后续分辨率变化/移除
+  永远匹配不到);new_output 恢复时绑定到新输出;closed 把
+  bound_output 作为 dying 排除(拔最后一台显示器正确挂起)。
+- **设置页**:诊断提示行只在「复制诊断报告」按钮存在时画
+  (h>10)。
+
+测试:**236 全绿**(新增消息行命中、颜色编辑重推导回归等),
+clippy 0 警告、fmt/diff 干净;实机冒烟启动→status→quit 干净
+退出无 coredump。
+
+## 四轮 review:子代理实测验证与收尾(2026-10-26)
+
+四轮主代理死于 API 错误,但 10 个验证子代理完成,12 项发现
+(部分带实机测量/合成器源码佐证)全部处理:
+
+- **close_guard SigIgn 位错(实测铁证)**:掩码 bit N = 信号 N+1,
+  原 `mask & 2` 检查的是 SIGINT;nohup 过滤完全失效且测试因
+  reparenting 失真。改 `mask & 1`;测试改为 shell `wait` 保活 +
+  直接断言,可判别。
+- **busy() 短路**:先解析 stat,前台进程组占用 tty/无 tty 时不走
+  /proc 子树扫描(2Hz 门控轮询里省 3 次 proc 读/次)。
+- **快捷键自愈恢复触发式**:真实合成器的按住重复 ~30ms(远小于
+  2s,被去重抑制),丢失 Deactivated 是真实 GNOME bug(mutter
+  #4846,改修饰键中途不送 release)—— 触发式对真实场景最优,
+  「解锁不触发」只会吞掉真实按下。
+- **closed 不排除 bound_output**:协议只说「不再显示」,KWin 的
+  Alt+F4 会无输出移除地发 closed;排除唯一输出会挂起等待一个
+  永不来的 new_output。恢复为 output_gone(None)(重绑收敛),
+  new_output 增加死绑定检测兜底。
+- **重建分支补 vis.set_layer_h**;通用 Resized 路径在高度漂移时
+  同步 vis(隐藏动画按实际高度,不留底部残影)。
+- **删除不可达分支**:控制流证明 rebuild:true 被独立分支完整
+  处理,混合分支里的 `else if rebuild` 与 `on_resized_handshake`
+  为死代码,已删并更新测试。
+- **SurfaceReplaced 去重**:初始化后不再重复 request_layer_height
+  (OutputChanged 会做);显式 set_top_margin 移除(内部已提交)。
+- **chrome_message_row 不构造字符串**:消息每个分支都非空,行号
+  直接由 rows 推出;指针移动每事件省 ~16 次分配。
+- **settings 页二行位置从 layout items 推导**:消除 base/step 重复
+  与 h=5 孤儿行;壁纸 100% 提示文案改为准确描述(文字画在壁纸
+  之上;真实效果是不透明度滑杆失效)。
+- **壁纸基础像素缓存**:同一文件版本只解码一次,滑条每步只重算
+  透明度/亮度(此前每步全量读盘+解码,4K 图几十上百 ms)。
+- **首次 init ±1 钳制担忧**:子代理证伪 —— KWin/wlroots/sway/
+  Hyprland 对非零请求高度不钳制,实机日志确认,仅作潜在脆弱性
+  记录。
+
+测试:**236 全绿**(含新的可判别 nohup 测试),clippy 0 警告、
+fmt/diff 干净;实机冒烟启动→status→quit 干净退出无 coredump。
+
+### 四轮冒烟自抓回归(同轮修复)
+- 「高度漂移时同步 vis」的通用路径在**握手前**也会命中:初始
+  configure(480)回显落入 fallthrough,把 layer_h 覆盖成 480,
+  真正的 594 configure 到来时 ±1 握手永远不匹配,init 永不执行
+  (daemon 持有 flock、IPC 监听已绑定但无人 accept,表现为
+  `tay status` EAGAIN + 2s 帧回调 stall 告警)。
+- 修复:仅 `gpu_phase == Ready` 时同步 vis/height;握手前的杂散
+  configure 只走 relayout(renderer 为空时是 no-op)。冒烟复验:
+  网格/首帧/status/quit 全通。
+
+## 产品验收修复:设置打开时齿轮失效 + 矮窗口面板遮栏(2026-10-27)
+
+用户以产品经理身份验收,报两个缺陷:
+
+- **设置打开期间齿轮点不动**:settings_open 的指针分支无条件
+  `return`,栏上(面板外)的点击永远到不了 chrome 分支 —— 齿轮
+  无法关闭面板(面板内的「关闭」按钮可用,但产品预期是齿轮
+  开关一致)。修复:面板矩形外的指针事件不再被消费,落到 chrome
+  分支(栏命中/悬停照常);拖动中的移动与释放仍全局消费(滑条
+  可拖出面板边缘)。
+- **矮窗口设置面板遮挡操作栏**:`settings::rect` 居中公式在矮
+  窗口时让面板顶部进入栏区,盖住齿轮/标签,且指针命中与绘制
+  分离。修复:rect 增加 bar_rows 参数,面板顶部钳到栏之下,可用
+  高度 = 总行数 − 栏高;退化网格钳回界内(测试 (2,1) 保持不越界)。
+
+验证:236 测试全绿、clippy 0 警告;实机截图数值对比(设置开关
+两帧)栏第 0 行差异仅时钟数字(~1.9%),面板不再触碰栏区。
+完整验收矩阵(panes/lifecycle/usability/protocol/fish/scrollbar/
+desktop-services/focus-product 八套烟测)见本轮验收结论。
+
+## Review 附带修复:时钟配色死配置 + focus-smoke 截图竞态(2026-10-26)
+
+### 1. tab_bar.clock_background/clock_foreground 从未生效
+- `chrome.rs` 时钟格原来用标签栏背景 + icon_foreground,且
+  `chrome_panels` 只给标签推圆角面板 —— 配置里解析/校验/序列化
+  的时钟配色没有任何消费方(usability-review 验收的「独立高对比
+  圆角色块」设计丢失)。
+- 修复:时钟格改 `style.clock_background/clock_foreground`,
+  面板循环加入 Clock(background=clock_background,四角全圆,
+  无活动标记、不受 hover 影响)。
+- 回归测试 `clock_uses_its_own_colors_and_rounded_panel`;
+  TAY_SHOT 截图对比确认:修复前暗底浅字,修复后亮蓝圆角块+深色字
+  (本机 Lua #58a6ff/#161b25)。
+
+### 2. focus-smoke 隐藏断言竞态
+- `hide()` 在动画开头释放键盘,focus-enter 立刻触发,紧接着的
+  截图可能拍到滑出中的中间帧 —— 成败取决于 spectacle 启动快慢,
+  animation_ms=150 时偶发误报「Tay remained visible after hiding」。
+- 修复:visible/hidden 截图前各 settle `duration/1000 + 0.2s`,
+  等滑入/滑出动画完成再拍(动画结束后的截图延迟不再影响结果)。
+- 验证:focus-smoke 两个动画档(0/150ms)全部 PASS。

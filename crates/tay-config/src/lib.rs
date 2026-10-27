@@ -667,9 +667,10 @@ impl Config {
                 cfg.colors.ansi[i] = parse_hex(color).ok_or("ansi 颜色需要 #RRGGBB")?;
             }
         }
-        let mut tab_bar_given = false;
+        // 未显式给出的字段从主题推导(部分指定时也推导 —— UI 块
+        // 只钉写用户改过的字段,若从默认值起步,换主题推导会丢失)。
+        cfg.tab_bar = TabBar::from_colors(&cfg.colors);
         if let Some(tb) = get_table(&t, "tab_bar")? {
-            tab_bar_given = true;
             if let Some(v) = get_bool(&tb, "visible")? {
                 cfg.tab_bar.visible = v;
             }
@@ -712,10 +713,6 @@ impl Config {
             if let Some(v) = get_color(&tb, "accent")? {
                 cfg.tab_bar.accent = v;
             }
-        }
-        if !tab_bar_given {
-            // 未显式配置:栏颜色从主题推导,换主题自动协调。
-            cfg.tab_bar = TabBar::from_colors(&cfg.colors);
         }
         cfg.validate()?;
         Ok(cfg)
@@ -1106,12 +1103,10 @@ return {{
         let current = toml::Value::try_from(self).map_err(|e| e.to_string())?;
         let base = toml::Value::try_from(base).map_err(|e| e.to_string())?;
         let mut assignments = String::new();
-        for key in ["font", "colors", "tab_bar"] {
+        for key in ["font", "colors"] {
             let mut values = String::new();
             for (field, value) in current[key].as_table().ok_or("外观表无效")? {
-                if base[key].get(field) != Some(value)
-                    || (key == "tab_bar" && current[key] != base[key])
-                {
+                if base[key].get(field) != Some(value) {
                     values.push_str(&format!(
                         "__tay_config.{key}.{field} = {}\n",
                         lua_value(value)?
@@ -1122,6 +1117,32 @@ return {{
                 assignments.push_str(&format!(
                     "__tay_config.{key} = __tay_config.{key} or {{}}\n"
                 ));
+                assignments.push_str(&values);
+            }
+        }
+        // tab_bar 单独处理:只钉写**用户定制**字段(≠ 当前颜色推导)。
+        // 颜色编辑会整体平移推导值,若按基线比较会把六七个颜色推导
+        // 字段钉进用户文件 —— 回退颜色后栏被旧钉写锁死,不再跟随
+        // 主题。重载时 from_lua 从主题色重新推导,推导字段无需钉。
+        {
+            let derived = toml::Value::try_from(TabBar::from_colors(&self.colors))
+                .map_err(|e| e.to_string())?;
+            let mut values = String::new();
+            for (field, value) in current["tab_bar"].as_table().ok_or("外观表无效")? {
+                let layout = matches!(field.as_str(), "visible" | "compact" | "tab_width");
+                // 布局字段与推导无关,按基线比较;颜色字段 = 用户定制
+                // 且与文件基线不同才钉写。
+                if (layout || derived.get(field) != Some(value))
+                    && base["tab_bar"].get(field) != Some(value)
+                {
+                    values.push_str(&format!(
+                        "__tay_config.tab_bar.{field} = {}\n",
+                        lua_value(value)?
+                    ));
+                }
+            }
+            if !values.is_empty() {
+                assignments.push_str("__tay_config.tab_bar = __tay_config.tab_bar or {}\n");
                 assignments.push_str(&values);
             }
         }
@@ -1795,6 +1816,34 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn ui_save_does_not_pin_unrelated_tab_bar_fields() {
+        // 用户手改一个 tab_bar 字段后再改字体:只钉写相对基线真正
+        // 变化的字段。整表钉写会让主题切换/默认值永远到不了栏,
+        // 还会把用户的整段手写 tab_bar 覆盖掉。
+        let dir = std::env::temp_dir().join(format!("tay-lua-tabbar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.lua");
+        std::fs::write(&path, "return {theme='midnight'}").unwrap();
+        let mut c = Config::try_load_at(&dir).unwrap();
+        c.tab_bar.clock_background = Rgb(0x12, 0x34, 0x56);
+        c.font.size = 13.0;
+        c.save_appearance_at(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // 真正变化的字段被钉写。
+        assert!(text.contains("__tay_config.tab_bar.clock_background ="));
+        assert!(text.contains("__tay_config.font.size ="));
+        // 未变化的 tab_bar 字段不得被整表钉写。
+        assert!(!text.contains("__tay_config.tab_bar.background ="));
+        assert!(!text.contains("__tay_config.tab_bar.accent ="));
+        assert!(!text.contains("__tay_config.tab_bar.danger_foreground ="));
+        assert_eq!(
+            Config::try_load_at(&dir).unwrap().tab_bar.clock_background,
+            Rgb(0x12, 0x34, 0x56)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

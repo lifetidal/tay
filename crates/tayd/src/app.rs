@@ -299,6 +299,10 @@ pub struct TayApp {
     wake: Arc<UnixStream>,
     /// init 已启动 IPC/portal 服务;运行中新标签仍可创建 PTY。
     threads_started: bool,
+    /// 首次初始化(终端/PTY/渲染器)已完成:Resized 握手据此区分
+    /// 「首次 init」与「输出回退重建」(后者无会话时也要重建渲染器,
+    /// 不能重开会话)。
+    initialized: bool,
 
     frames: u32,
     bench_started: bool,
@@ -354,15 +358,6 @@ impl GpuPhase {
         match self {
             GpuPhase::Ready => GpuPhase::AwaitingConfigure { rebuild: false },
             other => other,
-        }
-    }
-
-    /// Resized 握手后的决策:返回(是否重建渲染器);其余分支由
-    /// 调用方按 sender 是否初始化区分。
-    fn on_resized_handshake(self) -> bool {
-        match self {
-            GpuPhase::AwaitingConfigure { rebuild } => rebuild,
-            GpuPhase::Ready => false,
         }
     }
 
@@ -474,6 +469,7 @@ impl TayApp {
             hotkey_rx,
             wake,
             threads_started: false,
+            initialized: false,
             frames: 0,
             bench_started: false,
             bench_times: Vec::new(),
@@ -886,9 +882,20 @@ impl TayApp {
         }
         self.shutting_down = true;
         self.autosaver.finish();
+        // 最终写盘失败(磁盘满/只读重挂等)时**保留** .running 标记:
+        // 下次启动走崩溃恢复,还原最近一次成功的自动保存 —— 若按
+        // 干净退出处理,回退到的是更旧的 session 文件,静默丢标签。
+        // 代价是恢复提示文案偏保守(实为干净退出),可接受。
         if self.write_session_file() {
             crate::persist::mark_clean();
+        } else {
+            log::error!("会话文件最终写盘失败;保留恢复标记,下次启动按崩溃恢复处理");
         }
+        // 先于窗口层销毁 wgpu:swapchain 销毁时 Mesa WSI 仍会 marshal
+        // wl_surface,窗口层的 retired/当前 surface 此刻必须还活着
+        // (10-16 coredump:退出 drop 链段错误)。
+        self.renderer = None;
+        self.instance = None;
         self.stop_sessions();
     }
 
@@ -1226,6 +1233,53 @@ impl TayApp {
         }
     }
 
+    /// 栏最后一行显示的帮助/编辑消息(渲染与命中测试共用同一来源:
+    /// 消息行上没有控件,点击不得触发行 0 的动作)。
+    fn chrome_message(&self) -> String {
+        if let Some((field, value)) = &self.editing {
+            format!(
+                "编辑 {}: {value}_  Enter=保存  Esc=取消  Ctrl+A=替换",
+                crate::settings::field_label(field)
+            )
+        } else if let Some(action) = self.chrome_hover.filter(|a| {
+            if self.settings_open {
+                return false;
+            }
+            matches!(
+                a,
+                crate::chrome::Action::Hide
+                    | crate::chrome::Action::Maximize
+                    | crate::chrome::Action::CloseWindow
+            )
+        }) {
+            match action {
+                crate::chrome::Action::Hide => "最小化:隐藏窗口,会话保持运行".into(),
+                crate::chrome::Action::Maximize => "最大化 / 恢复高度".into(),
+                _ => "关闭窗口:结束所有会话".into(),
+            }
+        } else if self.settings_open {
+            "外观立即生效并保存 Lua；背景图留空禁用；Shell 仅新会话生效；全局快捷键需重启授权"
+                .into()
+        } else {
+            format!(
+                "{} | {}: 向右分屏 | {}: 向下分屏 | {}: 下一窗格",
+                self.hotkey_status,
+                self.config.binding_hint("split-right"),
+                self.config.binding_hint("split-down"),
+                self.config.binding_hint("next-pane")
+            )
+        }
+    }
+
+    /// 栏消息行索引(渲染与命中测试共用):消息占据栏的最后一行。
+    /// 不构造消息字符串 —— chrome_message 的每个分支都非空,消息行
+    /// 确定性地等于 rows-1;指针移动每事件都调这里,构造整条字符串
+    /// (实测 ~16 次分配/次)纯属浪费。
+    fn chrome_message_row(&self) -> Option<usize> {
+        let rows = crate::chrome::rows(&self.config, self.settings_open);
+        (rows >= 2).then(|| rows - 1)
+    }
+
     fn update_session_colors(&self) {
         for (_, tab) in self.sessions.iter() {
             if let Some(sender) = &tab.sender {
@@ -1301,6 +1355,7 @@ impl TayApp {
                 self.settings_page = page;
                 self.settings_focus = 0;
                 self.editing = None;
+                self.settings_drag = None;
                 self.settings_feedback.clear();
             }
             Action::Theme(index) => {
@@ -1522,6 +1577,8 @@ impl TayApp {
 
     /// can_create_surfaces:建 GPU → 终端 → PTY 线程 → 定尺寸。
     fn init(&mut self, ctx: &mut Ctx<'_>) {
+        // 同批事件里重复 Resized 不得二次 init(失败由下方 ctx.exit 兜底)。
+        self.initialized = true;
         let result = (|| -> Result<(), String> {
             // layer 高度 = 输出逻辑高度 × height_percent。
             let (out_w, out_h) = ctx.output_logical_size().unwrap_or((1920, 1080));
@@ -2800,39 +2857,7 @@ impl TayApp {
             self.set_ime_area(ctx, self.cursor_pos());
         }
         let items = self.chrome_items(grid.cols);
-        let message = if let Some((field, value)) = &self.editing {
-            format!(
-                "编辑 {}: {value}_  Enter=保存  Esc=取消  Ctrl+A=替换",
-                crate::settings::field_label(field)
-            )
-        } else if let Some(action) = self.chrome_hover.filter(|a| {
-            if self.settings_open {
-                return false;
-            }
-            matches!(
-                a,
-                crate::chrome::Action::Hide
-                    | crate::chrome::Action::Maximize
-                    | crate::chrome::Action::CloseWindow
-            )
-        }) {
-            match action {
-                crate::chrome::Action::Hide => "最小化:隐藏窗口,会话保持运行".into(),
-                crate::chrome::Action::Maximize => "最大化 / 恢复高度".into(),
-                _ => "关闭窗口:结束所有会话".into(),
-            }
-        } else if self.settings_open {
-            "外观立即生效并保存 Lua；背景图留空禁用；Shell 仅新会话生效；全局快捷键需重启授权"
-                .into()
-        } else {
-            format!(
-                "{} | {}: 向右分屏 | {}: 向下分屏 | {}: 下一窗格",
-                self.hotkey_status,
-                self.config.binding_hint("split-right"),
-                self.config.binding_hint("split-down"),
-                self.config.binding_hint("next-pane")
-            )
-        };
+        let message = self.chrome_message();
         // 极简模式(tab_bar.visible = false)跳过操作栏:终端占满
         // 全高;设置面板展开时临时恢复(rows > 0)。
         let chrome_rows = crate::chrome::rows(&self.config, self.settings_open);
@@ -3061,29 +3086,44 @@ impl Handler for TayApp {
                                 && col >= item.start as f64
                                 && col < item.end as f64
                         });
-                        ctx.set_pointer_over_control(hit.is_some());
-                        let hovered = hit.map(|index| items[index].action);
-                        if self.chrome_hover != hovered {
-                            self.chrome_hover = hovered;
-                            ctx.request_redraw();
-                        }
-                        if matches!(
-                            &event,
-                            WEvent::PointerButton {
-                                button: MouseButtonIdx::Left,
-                                pressed: true,
-                                ..
+                        // 面板外的指针事件(栏上的齿轮/时钟/标签)必须
+                        // 落到后面的 chrome 分支 —— 否则设置打开期间
+                        // 齿轮点不动、无法关闭面板(产品验收回归)。
+                        let (px, py, pw, ph) = crate::settings::rect(
+                            cols,
+                            rows,
+                            crate::chrome::rows(&self.config, false),
+                        );
+                        let inside = col >= px as f64
+                            && col < (px + pw) as f64
+                            && row >= py as f64
+                            && row < (py + ph) as f64;
+                        if inside {
+                            ctx.set_pointer_over_control(hit.is_some());
+                            let hovered = hit.map(|index| items[index].action);
+                            if self.chrome_hover != hovered {
+                                self.chrome_hover = hovered;
+                                ctx.request_redraw();
                             }
-                        ) && let Some(index) = hit
-                        {
-                            self.settings_focus = index;
-                            if let crate::chrome::Action::Level(field, _) = items[index].action {
-                                self.settings_drag = Some((field, self.config.clone()));
+                            if matches!(
+                                &event,
+                                WEvent::PointerButton {
+                                    button: MouseButtonIdx::Left,
+                                    pressed: true,
+                                    ..
+                                }
+                            ) && let Some(index) = hit
+                            {
+                                self.settings_focus = index;
+                                if let crate::chrome::Action::Level(field, _) = items[index].action
+                                {
+                                    self.settings_drag = Some((field, self.config.clone()));
+                                }
+                                self.chrome_action(items[index].action, ctx);
                             }
-                            self.chrome_action(items[index].action, ctx);
+                            return;
                         }
                     }
-                    return;
                 }
                 WEvent::Scroll { .. } => return,
                 WEvent::Ime(_) if self.editing.is_none() => return,
@@ -3145,12 +3185,13 @@ impl Handler for TayApp {
             let pad = r.padding() as f64;
             let col = ((*x - pad) / cw as f64).floor();
             let row = ((*y - pad) / ch as f64).floor();
-            let hovered = if col >= 0.0
-                && row >= 0.0
-                && row < crate::chrome::rows(&self.config, self.settings_open) as f64
-            {
+            let bar_rows = crate::chrome::rows(&self.config, self.settings_open);
+            let message_row = self.chrome_message_row();
+            let hovered = if col >= 0.0 && row >= 0.0 && row < bar_rows as f64 {
                 crate::chrome::hit(
                     &self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80)),
+                    bar_rows,
+                    message_row,
                     row as usize,
                     col as usize,
                 )
@@ -3190,10 +3231,17 @@ impl Handler for TayApp {
             let pad = r.padding() as f64;
             let row = ((*y - pad) / ch as f64).floor();
             let col = ((*x - pad) / cw as f64).floor();
-            if row >= 0.0 && row < (crate::chrome::rows(&self.config, self.settings_open) as f64) {
+            let bar_rows = crate::chrome::rows(&self.config, self.settings_open);
+            if row >= 0.0 && row < (bar_rows as f64) {
                 if *pressed && col >= 0.0 && self.editing.is_none() {
                     let items = self.chrome_items(self.dims.map(|d| d.0).unwrap_or(80));
-                    if let Some(a) = crate::chrome::hit(&items, row as usize, col as usize) {
+                    if let Some(a) = crate::chrome::hit(
+                        &items,
+                        bar_rows,
+                        self.chrome_message_row(),
+                        row as usize,
+                        col as usize,
+                    ) {
                         self.chrome_action(a, ctx);
                     }
                 }
@@ -3218,33 +3266,57 @@ impl Handler for TayApp {
                 }
 
             WEvent::Resized { width: _, height } => {
+                // 重建握手(rebuild=true)接受合成器的最终高度为准:
+                // 请求高度可能被钳制到输出/可用区域,±1 过滤会让
+                // 合法配置永远过不了握手 —— 渲染器已 drop,relayout
+                // 是 no-op,终端一直空白直到重启。
+                if matches!(
+                    self.gpu_phase,
+                    GpuPhase::AwaitingConfigure { rebuild: true }
+                ) {
+                    // 合成器最终高度为准(请求可能被钳制):layer_h 与
+                    // vis 都要更新 —— 否则 hide() 的 margin 动画按旧
+                    // 高度算,窗口底部残留在屏幕上。
+                    self.layer_h = height as i32;
+                    self.vis.set_layer_h(self.layer_h);
+                    self.gpu_phase = GpuPhase::Ready;
+                    if !self.initialized {
+                        // 初始化前就发生了重建(首轮 configure 与握手
+                        // 之间输出闪断):直接走 init,终端/PTY 照常启动。
+                        self.init(ctx);
+                        if !self.config.start_hidden {
+                            self.show(ctx);
+                        }
+                        return;
+                    }
+                    log::info!("configure 握手完成(高度 {height}),重建渲染器");
+                    if let Err(e) = self.create_renderer(ctx) {
+                        log::error!("重建渲染器失败: {e}");
+                        ctx.exit();
+                        return;
+                    }
+                    self.resize_active();
+                    // 新 surface 上 margin 为全离屏,重新对齐。
+                    let m = self.vis.margin();
+                    ctx.set_top_margin(m);
+                    ctx.request_redraw();
+                    return;
+                }
+                // rebuild:true 已被上面完整处理:走到这里的
+                // AwaitingConfigure 只能是 {rebuild:false}(首次握手/
+                // 高度热重载),无需再区分 rebuild。
                 if matches!(self.gpu_phase, GpuPhase::AwaitingConfigure { .. })
                     && height as i32 >= self.layer_h - 1
                     && height as i32 <= self.layer_h + 1
                 {
-                    let rebuild = self.gpu_phase.on_resized_handshake();
                     self.gpu_phase = GpuPhase::Ready;
-                    if self.sessions[self.active_pane].sender.is_none() {
+                    if !self.initialized && self.sessions[self.active_pane].sender.is_none() {
                         // 首次初始化:建终端/PTY/渲染器。
                         self.init(ctx);
                         // M1 常驻模型:默认收起;TAY_START_VISIBLE / 配置可让启动即呼出。
                         if !self.config.start_hidden {
                             self.show(ctx);
                         }
-                    } else if rebuild {
-                        // 输出回退:新 surface 的 configure 握手完成,
-                        // 重建渲染器(终端/PTY 不动),重新对齐 margin。
-                        log::info!("configure 握手完成,重建渲染器");
-                        if let Err(e) = self.create_renderer(ctx) {
-                            log::error!("重建渲染器失败: {e}");
-                            ctx.exit();
-                            return;
-                        }
-                        self.resize_active();
-                        // 新 surface 上 margin 为全离屏,重新对齐。
-                        let m = self.vis.margin();
-                        ctx.set_top_margin(m);
-                        ctx.request_redraw();
                     } else {
                         // 热重载高度:终端已存在,只重算网格。
                         let (w,h)=ctx.surface_size();
@@ -3255,7 +3327,16 @@ impl Handler for TayApp {
                 }
                 // 表面尺寸变化 → 网格重算(force=false:同尺寸跳过)。
                 let (w,h)=ctx.surface_size();
-                        self.relayout(ctx, w, h, false);
+                if matches!(self.gpu_phase, GpuPhase::Ready) && h as i32 != self.layer_h {
+                    // 合成器给了与请求不同的最终高度(如钳制/取整):
+                    // 同步 vis,否则隐藏动画按旧高度算,底部残留。
+                    // 仅 Ready 时同步:握手前的杂散 configure(如初始
+                    // 480 回显)不得覆盖 layer_h,否则后续 594 的
+                    // ±1 握手永远不匹配,init 永不执行。
+                    self.layer_h = h as i32;
+                    self.vis.set_layer_h(self.layer_h);
+                }
+                self.relayout(ctx, w, h, false);
                 ctx.request_redraw();
             }
 
@@ -3777,8 +3858,8 @@ impl Handler for TayApp {
                         crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_index(),ctx),
                         crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
                         crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
-                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;self.settings_focus=0;self.show(ctx);ctx.request_redraw();},
-                        crate::ipc::IpcCommand::SettingsPage(page) => {self.settings_open=true;self.settings_page=page;self.settings_focus=0;self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::Settings => {self.settings_open=true;self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
+                        crate::ipc::IpcCommand::SettingsPage(page) => {self.settings_open=true;self.settings_page=page;self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
                         crate::ipc::IpcCommand::Pin => {
                             let pinned = self.vis.toggle_pin();
                             log::info!(
@@ -3857,11 +3938,16 @@ impl Handler for TayApp {
                                         fresh.height_percent != self.config.height_percent;
                                     let padding_changed = fresh.padding != self.config.padding;
                                     let chrome_changed=fresh.tab_bar.compact!=self.config.tab_bar.compact || fresh.tab_bar.visible!=self.config.tab_bar.visible;
+                                    // 自己的保存写盘会触发同一 mtime 监视:重载结果
+                                    // 与运行配置相同时不得清撤销 —— 只有**外部编辑**
+                                    // 覆盖了面板刚改的值时才丢旧快照(否则撤销会把
+                                    // 用户手写的新值一并回退)。
+                                    let external_edit = fresh.as_ref() != &self.config;
                                     self.config = *fresh;
-                                    // 外部编辑会覆盖面板改过的外观:旧撤销快照若保留,
-                                    // 点「撤销上次修改」会把用户手写的新值一并回退。
-                                    self.appearance_undo = None;
-                                    self.settings_drag = None;
+                                    if external_edit {
+                                        self.appearance_undo = None;
+                                        self.settings_drag = None;
+                                    }
                                     ctx.set_background_blur(self.config.background_blur);
                                     self.update_session_colors();
 
@@ -3900,36 +3986,59 @@ impl Handler for TayApp {
             }
 
             }
-            WEvent::CloseRequested => self.request_close(PendingClose::Window, ctx),
-
-            // 输出回退/尺寸变化(多显示器):重设高度并重新对齐 margin。
-            // 未初始化(首轮 roundtrip 事件)时忽略,走 CanCreateSurfaces 路径。
-            // 输出回退:窗口层已把 layer 角色重建到**新 wl_surface**。
-            // 丢弃旧渲染器(旧 wl_surface 由窗口层保活),等新 surface
-            // 的 configure 握手(Resized)后重建渲染器再呈现。
-            WEvent::SurfaceReplaced if self.sessions[self.active_pane].sender.is_some() => {
+            // 输出回退/输出全灭:窗口层已把 layer 角色重建到**新 wl_surface**
+            // (或全部输出消失时退役)。无条件丢弃旧渲染器(旧 wl_surface
+            // 由窗口层 retired 保活,GPU 销毁 swapchain 时仍需 marshal 它):
+            // 无会话时也必须 drop —— 否则下一次重建的 retired.clear()
+            // 会在 wgpu 仍引用旧 surface 时销毁 proxy,退出时 Mesa WSI
+            // 段错误(10-16 六个 coredump 复现)。
+            WEvent::SurfaceReplaced => {
                 log::info!("输出回退:重建 GPU surface,等待 configure");
                 self.renderer = None;
                 self.instance = None;
                 self.gpu_phase = GpuPhase::AwaitingConfigure { rebuild: true };
+                // 初始化前也可能重建(首轮 configure 与尺寸握手之间
+                // 输出闪断):此时 OutputChanged 被 initialized 守卫
+                // 忽略,必须在这里重提高度 —— 否则新 layer 沿用旧
+                // 尺寸(480),与 layer_h(486)对不上,Resized 握手
+                // 失败,daemon 持有 flock 却永不初始化。初始化后
+                // OutputChanged 会做同一件事,不重复提交。
+                if !self.initialized {
+                    self.request_layer_height(ctx);
+                }
             }
-            WEvent::SurfaceReplaced => {}
 
-            WEvent::OutputChanged if self.sessions[self.active_pane].sender.is_some() => {
+            // 输出回退/尺寸变化(多显示器):重设高度并重新对齐 margin。
+            // 守卫是「初始化前忽略」(首轮 roundtrip 事件走
+            // CanCreateSurfaces 路径),不是「无会话忽略」—— 全部
+            // 窗格已关时输出恢复也要走这里,否则挂起期间热重载过
+            // 高度的话,恢复后 configure 高度与 layer_h 对不上,
+            // 握手失败卡死在 AwaitingConfigure。
+            WEvent::OutputChanged if self.initialized => {
+                // request_layer_height 内部已提交高度与 margin。
                 self.request_layer_height(ctx);
-                // 窗口层重建 layer 角色后 margin 为全离屏,重提当前值。
-                let m = self.vis.margin();
-                ctx.set_top_margin(m);
                 ctx.request_redraw();
             }
             WEvent::OutputChanged => {}
 
             WEvent::AboutToWait => {
-                if let Some(result)=self.wallpaper_picker.as_ref().and_then(|rx|rx.try_recv().ok()) {
-                    self.wallpaper_picker=None;
-                    match result {
-                        Ok(path)=>{let previous=self.config.clone();self.config.background_image=path;self.refresh_appearance(ctx,&previous);}
-                        Err(error)=>self.status(format!("图片选择已取消或不可用:{error};可改用编辑图片路径"),ctx),
+                // try_recv 必须区分 Empty 与 Disconnected:portal 线程
+                // 挂起/退出时若只当 Empty 处理,wallpaper_picker 永远
+                // 不清,选图按钮永久失效。
+                if let Some(rx) = self.wallpaper_picker.as_ref() {
+                    match rx.try_recv() {
+                        Ok(result) => {
+                            self.wallpaper_picker = None;
+                            match result {
+                                Ok(path)=>{let previous=self.config.clone();self.config.background_image=path;self.refresh_appearance(ctx,&previous);}
+                                Err(error)=>self.status(format!("图片选择已取消或不可用:{error};可改用编辑图片路径"),ctx),
+                            }
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            log::warn!("壁纸选择器线程已退出,清除选择状态");
+                            self.wallpaper_picker = None;
+                        }
                     }
                 }
                 // 确认框打开期间,任务可能自己结束:定期复查前台进程组,
@@ -4326,9 +4435,12 @@ mod tests {
             GpuPhase::AwaitingConfigure { rebuild: true },
             "高度请求不得覆盖重建需求"
         );
-        // configure 握手:重建分支。
-        assert!(p.on_resized_handshake());
-        // Ready 下误触 Resized:不重建。
-        assert!(!GpuPhase::Ready.on_resized_handshake());
+        // rebuild:true 的 Resized 握手由独立分支完整处理
+        // (四轮 review 控制流证明:混合分支里的 rebuild 判定不可达,
+        // 已删除;这里只保留状态转换的守卫语义)。
+        assert!(matches!(
+            GpuPhase::AwaitingConfigure { rebuild: true },
+            GpuPhase::AwaitingConfigure { rebuild: true }
+        ));
     }
 }

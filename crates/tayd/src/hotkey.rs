@@ -26,24 +26,43 @@ fn notify(tx: &SyncSender<HotkeyTriggered>, wake: &UnixStream, event: HotkeyTrig
     }
 }
 
+/// 按下状态 + 时间戳。2s 内没有 Deactivated 视为信号丢失
+/// (实测案例:GNOME/mutter 修改键位中途不送 Deactivated,mutter
+/// issue #4846):陈旧时**触发一次**并重新计时 —— 真实合成器的
+/// 按住自动重复间隔 ~30ms(远小于 2s,被正常去重抑制),不会抖动;
+/// 丢失 release 时下一次真正的按下最多多等一次重复。
 #[derive(Default)]
 struct ActivationGate {
     pressed: bool,
+    pressed_at: Option<Instant>,
 }
+/// 按下后多久没有 release 视为陈旧(信号丢失)。
+const PRESS_STALE: Duration = Duration::from_secs(2);
+
 impl ActivationGate {
     fn activated(&mut self, own: &str, session: &str, id: &str) -> bool {
         self.activated_at(own, session, id, Instant::now())
     }
-    fn activated_at(&mut self, own: &str, session: &str, id: &str, _now: Instant) -> bool {
-        if own != session || id != "toggle" || self.pressed {
+    fn activated_at(&mut self, own: &str, session: &str, id: &str, now: Instant) -> bool {
+        if own != session || id != "toggle" {
             return false;
         }
+        if self.pressed
+            && self
+                .pressed_at
+                .is_none_or(|at| now.duration_since(at) < PRESS_STALE)
+        {
+            return false;
+        }
+        // 未按下,或上次按下已陈旧:触发并重新计时。
         self.pressed = true;
+        self.pressed_at = Some(now);
         true
     }
     fn deactivated(&mut self, own: &str, session: &str, id: &str) {
         if own == session && id == "toggle" {
             self.pressed = false;
+            self.pressed_at = None;
         }
     }
 }
@@ -203,12 +222,22 @@ pub fn spawn(tx: SyncSender<HotkeyTriggered>, wake: Arc<UnixStream>, trigger: St
 mod tests {
     use super::*;
     #[test]
-    fn holding_shortcut_does_not_repeat_after_two_seconds() {
+    fn holding_shortcut_does_not_repeat_until_stale_press_self_heals() {
         let mut gate = ActivationGate::default();
         let now = Instant::now();
         assert!(gate.activated_at("/ours", "/ours", "toggle", now));
         assert!(!gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_millis(100)));
-        assert!(!gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_secs(3)));
+        // 2s 内无 release:按下期间的快速重复(~30ms 级)全被去重抑制。
+        assert!(!gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_secs(1)));
+        assert!(!gate.activated_at(
+            "/ours",
+            "/ours",
+            "toggle",
+            now + Duration::from_millis(1100)
+        ));
+        // 2s 无 release = 信号丢失(GNOME/mutter #4846):触发一次并
+        // 重新计时,不永久锁死全局快捷键。
+        assert!(gate.activated_at("/ours", "/ours", "toggle", now + Duration::from_secs(3)));
         gate.deactivated("/ours", "/ours", "toggle");
         assert!(gate.activated_at(
             "/ours",

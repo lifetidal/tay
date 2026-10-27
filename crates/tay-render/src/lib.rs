@@ -950,10 +950,9 @@ impl Renderer {
             config.background_image_opacity,
             config.background_image_brightness,
         );
-        if self.wallpaper_config != background {
-            self.wallpaper = None;
-            self.img_cache.clear();
-        }
+        // 滑条每步都会换 key:保留旧壁纸作陈旧回退,worker 解码新 key
+        // 期间不闪屏(poll_background 的 loaded.or_else(wallpaper) 兜底);
+        // img_cache 是 kitty 内联图,与壁纸无关,清掉会让它们每步重传。
         self.wallpaper_config = background;
         self.background_checked = None;
         self.poll_background();
@@ -987,7 +986,8 @@ impl Renderer {
         };
         if changed {
             self.wallpaper = next;
-            self.img_cache.clear();
+            // img_cache(kitty 内联图,按图像 id 缓存)与壁纸无关:
+            // 不清 —— 滑条每步换壁纸时内联图不用重传。
         }
         changed
     }

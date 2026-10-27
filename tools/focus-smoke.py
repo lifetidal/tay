@@ -126,6 +126,9 @@ try:
             command('show')
             wait_for(lambda: events(probe_log, 'leave') > before_leave,
                      f'{duration}ms: Tay acquires focus')
+            # 键盘焦点在动画开头就切换:等滑入动画完成再截,
+            # 否则拍到的是滑入中的中间帧(成败取决于截图工具启动快慢)。
+            time.sleep(duration / 1000 + 0.2)
             visible = screenshot(f'{duration}-{action}-visible')
             assert len(visible) == len(baseline), 'screenshot dimensions changed'
             assert sum(abs(a-b) > 30 for a,b in zip(baseline, visible)) > 15000, 'focus changed but Tay is not visible'
@@ -133,6 +136,10 @@ try:
             command(action)
             wait_for(lambda: events(probe_log, 'enter') > before_enter,
                      f'{duration}ms: focus returns automatically after {action}')
+            # hide() 在动画开头就释放键盘(focus-enter 立刻触发),
+            # 而 margin 滑出还要 animation_ms:等动画完成再截,
+            # 否则会拍到窗口仍在屏幕上的帧,误报「隐藏后仍可见」。
+            time.sleep(duration / 1000 + 0.2)
             hidden = screenshot(f'{duration}-{action}-hidden')
             assert sum(abs(a-b) > 30 for a,b in zip(baseline, hidden)) < 15000, 'Tay remained visible after hiding'
             assert daemon.poll() is None, text(daemon_log)[-3000:]

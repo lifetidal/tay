@@ -215,8 +215,20 @@ pub fn layout(
     items
 }
 
-pub fn hit(items: &[Item], row: usize, col: usize) -> Option<Action> {
-    let row = if row == 1 { 0 } else { row };
+/// 命中测试:`bar_rows` 内的行都映射到条目所在行(0),消息行除外
+/// (消息占栏的最后一行,上面没有控件,点击不得触发行 0 的动作 ——
+/// 否则帮助文字下方的隐藏/关闭控件列会变成不可见的破坏性点击目标)。
+pub fn hit(
+    items: &[Item],
+    bar_rows: usize,
+    message_row: Option<usize>,
+    row: usize,
+    col: usize,
+) -> Option<Action> {
+    if Some(row) == message_row {
+        return None;
+    }
+    let row = if row < bar_rows { 0 } else { row };
     items
         .iter()
         .find(|i| i.row == row && col >= i.start && col < i.end)
@@ -273,8 +285,8 @@ pub fn decorate(
             _ => {}
         }
         if item.action == Action::Clock {
-            style_cell.bg = bg;
-            style_cell.fg = style.icon_foreground;
+            style_cell.bg = style.clock_background;
+            style_cell.fg = style.clock_foreground;
             style_cell.bold = true;
         }
         if hovered == Some(item.action) && item.action != Action::Clock {
@@ -316,8 +328,22 @@ pub fn decorate(
     }
     for item in items
         .iter()
-        .filter(|i| i.row == 0 && matches!(i.action, Action::Tab(_)))
+        .filter(|i| i.row == 0 && matches!(i.action, Action::Tab(_) | Action::Clock))
     {
+        // 时钟:独立高对比圆角色块(usability-review 验收设计),
+        // 四角全圆、无活动标记、不受 hover 影响。
+        if item.action == Action::Clock {
+            grid.chrome_panels.push(tay_render::ChromePanel {
+                row: 0,
+                rows: 0,
+                start: item.start,
+                end: item.end,
+                background: style.clock_background,
+                corners: tay_render::PanelCorners::All,
+                accent: None,
+            });
+            continue;
+        }
         let end = if let Action::Tab(index) = item.action {
             items
                 .iter()
@@ -344,9 +370,12 @@ pub fn decorate(
             },
         });
     }
-    // 帮助/编辑消息:整行弱化显示。
-    if !message.is_empty() && rows >= 4 {
-        for c in &mut header[(rows - 1) * grid.cols..] {
+    // 帮助/编辑消息:整行弱化显示(占用栏的最后一行;栏最多 3 行,
+    // 原 rows>=4 守卫永远不成立,消息从未画出)。
+    // then(惰性):rows==0(tab_bar.visible=false)时不得计算 rows-1。
+    let message_row = (!message.is_empty() && rows >= 2).then(|| rows - 1);
+    if let Some(mrow) = message_row {
+        for c in &mut header[mrow * grid.cols..(mrow + 1) * grid.cols] {
             *c = base.clone();
         }
         let mut col = 0;
@@ -355,21 +384,23 @@ pub fn decorate(
             if col + width > grid.cols {
                 break;
             }
-            header[(rows - 1) * grid.cols + col].c = c;
-            header[(rows - 1) * grid.cols + col].fg = dim;
+            header[mrow * grid.cols + col].c = c;
+            header[mrow * grid.cols + col].fg = dim;
             for offset in 1..width {
-                header[(rows - 1) * grid.cols + col + offset].wide_spacer = true;
+                header[mrow * grid.cols + col + offset].wide_spacer = true;
             }
             col += width;
         }
     }
     if rows >= 2 {
+        // 把首行样式复制到其余行(消息行除外,它已被整行弱化覆盖)。
+        let copy_until = message_row.unwrap_or(rows);
         for col in 0..grid.cols {
             let mut cell = header[col].clone();
             cell.c = ' ';
             cell.zerowidth = None;
             cell.wide_spacer = false;
-            for row in 1..rows {
+            for row in 1..copy_until {
                 header[row * grid.cols + col] = cell.clone();
             }
         }
@@ -454,9 +485,9 @@ mod tests {
             assert!(items.iter().all(|i| i.row == 0 && i.end <= cols));
             for item in &items {
                 for col in item.start..item.end {
-                    assert_eq!(hit(&items, 0, col), Some(item.action));
+                    assert_eq!(hit(&items, 2, None, 0, col), Some(item.action));
                     assert_eq!(
-                        hit(&items, 1, col),
+                        hit(&items, 2, None, 1, col),
                         Some(item.action),
                         "加高区域下半部分可点击"
                     );
@@ -477,6 +508,46 @@ mod tests {
     }
 
     #[test]
+    fn non_compact_bar_makes_all_three_rows_clickable() {
+        let mut config = Config::default();
+        config.tab_bar.compact = false;
+        assert_eq!(rows(&config, false), 3);
+        let items = layout(120, &["shell".into()], 0, false, &config, "18:42");
+        let tab = items.iter().find(|i| i.action == Action::Tab(0)).unwrap();
+        // 3 行都是同一组控件的点击延伸;栏外(第 3 行起)不得命中。
+        for row in 0..3 {
+            assert_eq!(hit(&items, 3, None, row, tab.start), Some(Action::Tab(0)));
+        }
+        assert_eq!(hit(&items, 3, None, 3, tab.start), None);
+    }
+
+    #[test]
+    fn message_row_is_not_a_click_target() {
+        // 消息占据栏的最后一行:该行任何列都不得触发行 0 的控件
+        // (否则帮助文字下方的隐藏/关闭列是不可见的破坏性点击目标)。
+        let items = layout(
+            120,
+            &["shell".into()],
+            0,
+            false,
+            &Config::default(),
+            "18:42",
+        );
+        let close = items
+            .iter()
+            .find(|i| i.action == Action::CloseWindow)
+            .unwrap();
+        let hide = items.iter().find(|i| i.action == Action::Hide).unwrap();
+        assert_eq!(
+            hit(&items, 2, Some(1), 0, close.start),
+            Some(Action::CloseWindow)
+        );
+        assert_eq!(hit(&items, 2, Some(1), 1, close.start), None);
+        assert_eq!(hit(&items, 2, Some(1), 1, hide.start), None);
+        assert_eq!(hit(&items, 2, Some(1), 0, hide.start), Some(Action::Hide));
+    }
+
+    #[test]
     fn standard_window_controls_have_separate_hit_targets() {
         for cols in [24, 80, 200] {
             let items = layout(cols, &["shell".into()], 0, false, &Config::default(), "");
@@ -487,8 +558,8 @@ mod tests {
                     .find(|i| i.row == 0 && i.action == action)
                     .unwrap();
                 assert!(item.start >= previous);
-                assert_eq!(hit(&items, 0, item.start), Some(action));
-                assert_eq!(hit(&items, 0, item.end - 1), Some(action));
+                assert_eq!(hit(&items, 2, None, 0, item.start), Some(action));
+                assert_eq!(hit(&items, 2, None, 0, item.end - 1), Some(action));
                 previous = item.end;
             }
             assert_eq!(previous, cols);
@@ -599,6 +670,118 @@ mod tests {
     }
 
     #[test]
+    fn help_message_occupies_the_last_bar_row() {
+        fn grid() -> Grid {
+            let cell = Cell {
+                c: 'z',
+                fg: Rgb(255, 255, 255),
+                bg: Rgb(0, 0, 0),
+                bold: false,
+                italic: false,
+                underline: false,
+                wide_spacer: false,
+                zerowidth: None,
+            };
+            Grid {
+                cols: 40,
+                rows: 1,
+                cells: vec![cell; 40],
+                cursor: (0, 0),
+                cursor_shape: tay_render::CursorShape::Beam,
+                selection: None,
+                preedit: None,
+                badges: vec![],
+                overlays: vec![],
+                images: vec![],
+                window_icons: vec![],
+                chrome_panels: vec![],
+                tab_bar_rows: 0,
+                opaque_background: false,
+                scrollbar: None,
+            }
+        }
+        let config = Config::default();
+        let items = layout(40, &["shell".into()], 0, false, &config, "");
+        let mut with_message = grid();
+        decorate(
+            &mut with_message,
+            &items,
+            "help",
+            &config,
+            None,
+            false,
+            false,
+        );
+        // compact 栏 2 行:消息占据最后一行,终端内容从其后开始。
+        assert_eq!(with_message.rows, 3);
+        assert_eq!(with_message.cells[40].c, 'h');
+        assert_eq!(with_message.cells[41].c, 'e');
+        assert_eq!(with_message.cells[42].c, 'l');
+        assert_eq!(with_message.cells[43].c, 'p');
+        assert_eq!(with_message.cells[80].c, 'z');
+        // 无消息时最后一行仍是首行样式的延伸(可点击高亮)。
+        let mut plain = grid();
+        decorate(&mut plain, &items, "", &config, None, false, false);
+        assert_eq!(plain.cells[40].c, ' ');
+        assert_eq!(plain.cells[80].c, 'z');
+    }
+
+    #[test]
+    fn clock_uses_its_own_colors_and_rounded_panel() {
+        let mut config = Config::default();
+        config.tab_bar.clock_background = Rgb(10, 20, 30);
+        config.tab_bar.clock_foreground = Rgb(200, 201, 202);
+        let cols = 120;
+        let items = layout(cols, &["shell".into()], 0, false, &config, "18:42");
+        let clock = items
+            .iter()
+            .find(|i| i.action == Action::Clock)
+            .expect("宽栏时钟可见");
+        let cell = Cell {
+            c: 'z',
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+            zerowidth: None,
+        };
+        let mut grid = Grid {
+            cols,
+            rows: 1,
+            cells: vec![cell; cols],
+            cursor: (0, 0),
+            cursor_shape: tay_render::CursorShape::Beam,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            opaque_background: false,
+            scrollbar: None,
+        };
+        decorate(&mut grid, &items, "", &config, None, false, false);
+        // 时钟格:独立高对比配色,而不是标签栏背景 + 图标前景。
+        for col in clock.start..clock.end {
+            assert_eq!(grid.cells[col].bg, config.tab_bar.clock_background);
+            assert_eq!(grid.cells[col].fg, config.tab_bar.clock_foreground);
+        }
+        // 时钟圆角色块面板:clock_background、四角全圆、无活动标记。
+        let panel = grid
+            .chrome_panels
+            .iter()
+            .find(|p| p.start == clock.start && p.end == clock.end)
+            .expect("时钟圆角面板");
+        assert_eq!(panel.background, config.tab_bar.clock_background);
+        assert_eq!(panel.corners, tay_render::PanelCorners::All);
+        assert!(panel.accent.is_none());
+    }
+
+    #[test]
     fn every_visible_control_hits_its_action() {
         for cols in [12, 40, 80, 160] {
             let items = layout(
@@ -612,7 +795,7 @@ mod tests {
             for i in &items {
                 assert!(i.end <= cols, "项不越界");
                 for col in i.start..i.end {
-                    assert_eq!(hit(&items, i.row, col), Some(i.action));
+                    assert_eq!(hit(&items, 2, None, i.row, col), Some(i.action));
                 }
             }
         }
