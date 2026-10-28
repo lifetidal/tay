@@ -1430,3 +1430,36 @@ desktop-services/focus-product 八套烟测)见本轮验收结论。
 - 修复:visible/hidden 截图前各 settle `duration/1000 + 0.2s`,
   等滑入/滑出动画完成再拍(动画结束后的截图延迟不再影响结果)。
 - 验证:focus-smoke 两个动画档(0/150ms)全部 PASS。
+
+## 设计轮验收结论(2026-10-28)
+
+覆盖提交 6fab1d7/91b9e69/f99d143/0aa40bf/227b441(消息行遮挡修复、
+设计 A 栏去消息行、快捷键页清单与按页提示、极简模式恢复栏、面板
+开合动画、+ 图标矢量化、toast 队列、标签芯片间隔、分隔条悬停)。
+
+自动化矩阵(八套烟测,全部 PASS):
+
+- panes:probe/restore/close_pane/saved_layout
+- lifecycle:systemd_stop/resurrect(3 标签)
+- desktop-services:20 次快捷键有序送达、托盘属性/圆角图标/菜单、
+  快捷键会话重连、焦点恢复
+- protocol:query/response 往返
+- fish / scrollbar:截图产物正常
+- usability:产品截图链路(2 标签会话保存)
+- focus:animation 0/150ms 两档
+
+单元测试 239 全绿、clippy/fmt 干净。
+
+手动验收项(自动化不可覆盖):
+
+1. 真实键盘触发全局快捷键 + KDE 授权弹窗(沿用模拟 Portal,不碰
+   用户桌面的老待验收项)
+2. 面板开合动画手感(90ms)、齿轮开关、Tab/Esc 键盘路径、按页提示
+3. 页 3 快捷键清单:改 keys 后实时更新、unbound 跳过
+4. 极简模式(tab_bar.visible=false)打开设置时临时恢复栏
+5. toast:首次呼出 4s 提示、授权异常提示、队列接续
+6. 分屏分隔条悬停高亮与拖动
+7. 多标签芯片间隔、+ 图标、时钟色块
+
+底角圆角明确不做:壁纸图像管线需单独圆角掩码,仅纯色背景可用则
+两态不一致,保持直角统一。
