@@ -303,7 +303,18 @@ pub fn decorate(
             header[item.row * grid.cols + col] = style_cell.clone();
         }
         let mut col = item.start;
-        for c in item.text.chars() {
+        // 设计审查:标签编号 "N:" 用弱化前景,标题保持项前景 —— 编号是
+        // Alt+n 的索引提示,不该与标题抢视线(非活动标签整体已是弱化色,
+        // 无可见变化;活动/悬停标签编号弱于标题)。
+        let number_end = matches!(item.action, Action::Tab(_))
+            .then(|| {
+                item.text
+                    .char_indices()
+                    .position(|(_, c)| c == ':')
+                    .map(|i| i + 1)
+            })
+            .flatten();
+        for (index, c) in item.text.chars().enumerate() {
             let w = c.width().unwrap_or(0);
             if w == 0 {
                 continue;
@@ -312,6 +323,11 @@ pub fn decorate(
                 break;
             }
             header[item.row * grid.cols + col].c = c;
+            if let Some(end) = number_end
+                && index < end
+            {
+                header[item.row * grid.cols + col].fg = dim;
+            }
             for offset in 1..w {
                 header[item.row * grid.cols + col + offset].wide_spacer = true;
             }
@@ -322,8 +338,8 @@ pub fn decorate(
         .iter()
         .filter(|i| i.row == 0 && matches!(i.action, Action::Tab(_) | Action::Clock))
     {
-        // 时钟:独立高对比圆角色块(usability-review 验收设计),
-        // 四角全圆、无活动标记、不受 hover 影响。
+        // 时钟:安静圆角色块(设计审查降级后非高对比),四角全圆、
+        // 无活动标记、不受 hover 影响。
         if item.action == Action::Clock {
             grid.chrome_panels.push(tay_render::ChromePanel {
                 row: 0,
@@ -768,6 +784,67 @@ mod tests {
         assert_eq!(panel.background, config.tab_bar.clock_background);
         assert_eq!(panel.corners, tay_render::PanelCorners::All);
         assert!(panel.accent.is_none());
+    }
+
+    /// 设计审查:活动标签的编号 "N:" 用弱化前景、标题保持前景色;
+    /// 非活动标签编号与标题同为弱化色(无可见变化)。
+    #[test]
+    fn active_tab_number_is_dimmed_while_title_stays_bright() {
+        let config = Config::default();
+        let cell = Cell {
+            c: 'z',
+            fg: Rgb(255, 255, 255),
+            bg: Rgb(0, 0, 0),
+            bold: false,
+            italic: false,
+            underline: false,
+            wide_spacer: false,
+            zerowidth: None,
+        };
+        let make_grid = || Grid {
+            cols: 120,
+            rows: 1,
+            cells: vec![cell.clone(); 120],
+            cursor: (0, 0),
+            cursor_shape: tay_render::CursorShape::Beam,
+            selection: None,
+            preedit: None,
+            badges: vec![],
+            overlays: vec![],
+            images: vec![],
+            window_icons: vec![],
+            chrome_panels: vec![],
+            tab_bar_rows: 0,
+            tab_panel_rows: 0,
+            opaque_background: false,
+            scrollbar: None,
+        };
+        // 活动标签:编号弱化、标题保持活动前景。
+        let items = layout(120, &["shell".into()], 0, false, &config, "");
+        let mut grid = make_grid();
+        decorate(&mut grid, &items, "", &config, None, false, false);
+        let tab = items.iter().find(|i| i.action == Action::Tab(0)).unwrap();
+        assert_eq!(grid.cells[tab.start + 1].c, '1');
+        assert_eq!(grid.cells[tab.start + 1].fg, config.tab_bar.inactive_foreground);
+        assert_eq!(grid.cells[tab.start + 2].c, ':');
+        assert_eq!(grid.cells[tab.start + 2].fg, config.tab_bar.inactive_foreground);
+        assert_eq!(grid.cells[tab.start + 3].c, 's');
+        assert_eq!(grid.cells[tab.start + 3].fg, config.tab_bar.active_foreground);
+        // 非活动标签:整体弱化,编号与标题无差异。
+        let items = layout(120, &["one".into(), "two".into()], 0, false, &config, "");
+        let mut grid = make_grid();
+        decorate(&mut grid, &items, "", &config, None, false, false);
+        let inactive = items.iter().find(|i| i.action == Action::Tab(1)).unwrap();
+        assert_eq!(grid.cells[inactive.start + 1].c, '2');
+        assert_eq!(grid.cells[inactive.start + 3].c, 't');
+        assert_eq!(
+            grid.cells[inactive.start + 1].fg,
+            grid.cells[inactive.start + 3].fg
+        );
+        assert_eq!(
+            grid.cells[inactive.start + 1].fg,
+            config.tab_bar.inactive_foreground
+        );
     }
 
     #[test]

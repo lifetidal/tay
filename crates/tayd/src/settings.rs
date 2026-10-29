@@ -500,7 +500,9 @@ pub(crate) fn paint(
         );
     }
     let footer = if let Some((field, value)) = editing {
-        format!("{}: {value}_  [Enter 应用 / Esc 取消]", field_label(field))
+        // 编辑态底栏只回显正在编辑的值;Enter/Esc/Ctrl+A 键位提示
+        // 归面板提示行(设计审查:去掉与提示行的重复,底栏=状态)。
+        format!("{}: {value}_", field_label(field))
     } else if page == 1
         && !c.background_image.is_empty()
         && let Some(error) = info.background_error
@@ -513,7 +515,8 @@ pub(crate) fn paint(
     } else if !info.feedback.is_empty() {
         info.feedback.into()
     } else {
-        "已自动保存到 Lua · Tab / 方向键导航 · Esc 关闭".into()
+        // 导航键位提示归面板提示行(y+1),底栏只留状态(设计审查去重)。
+        "已自动保存到 Lua".into()
     };
     if h > 1 {
         put(grid, y + h - 1, x + 1, x + w - 1, &footer, muted, bg, false);

@@ -50,7 +50,7 @@ return {
     hover_background = "#1d3044", accent = "#96d7e5",
     icon_foreground = "#93a8be", icon_hover_foreground = "#a4dce8",
     danger_foreground = "#ee9fa7",
-    clock_background = "#244155", clock_foreground = "#cae7ef",
+    clock_background = "#242f3d", clock_foreground = "#b8c7d6",
   },
   colors = { background = "#0b111b", foreground = "#d6e5f5",
              cursor = "#96d7e5", selection = "#244258",

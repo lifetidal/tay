@@ -336,8 +336,11 @@ impl TabBar {
             icon_foreground: blend(colors.foreground, bar, 0.22),
             icon_hover_foreground: colors.cursor,
             danger_foreground: colors.ansi[9],
-            clock_background: colors.cursor,
-            clock_foreground: bar,
+            // 时钟:安静的非交互色块(设计审查 2026-10-29 降级)。
+            // 旧推导用光标色做底 —— 栏里对比最高的元素不可点击,
+            // 视觉权重倒置;光标色留给活动标签强调线/图标悬停。
+            clock_background: blend(bar, colors.foreground, 0.10),
+            clock_foreground: blend(colors.foreground, bar, 0.15),
         }
     }
 }
