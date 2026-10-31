@@ -35,6 +35,7 @@ return {
   global_shortcut = "CTRL+grave", -- Ctrl+` 全局呼出/隐藏（不需要笔记本 Fn 键）
   keys = keys,
   theme = "midnight", -- 参考本地 WezTerm 自定义配色；也可选 default / midnight / light
+  scroll_on_input = true, -- 滚动到历史后打字自动跳回底部；false = 边看历史边打字
   opacity = 0.98,      -- 背景不透明度：1 完全不透明，0 完全透明；文字保持清晰
   font = { family = "JetBrainsMono Nerd Font", size = 12.0, weight = 700 },
   height_percent = 55,

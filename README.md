@@ -140,6 +140,8 @@ global_shortcut = "CTRL+grave",  -- 改完重启 tayd,按系统弹窗确认
 - **滚动历史搜索**(`Ctrl+Shift+S`):regex 搜索整个滚动历史,
   从视口顶开始,`Enter` / `Shift+Enter` 循环下一个/上一个,
   `Esc` 关闭(vi 模式里 `/` 搜索、`n` / `N` 跳转)。
+- **输入跳底**:滚动到历史后,打字/粘贴自动跳回底部显示输入
+  (VTE 同款);配置 `scroll_on_input = false` 可关,边看历史边打字。
 - **vi 复制模式**(`Ctrl+Shift+Space`):hjkl 移动、`/` 搜索、
   `y` 复制,不碰鼠标。
 - **会话恢复**:`tay quit` 会记下开了哪些标签,`tay resurrect`

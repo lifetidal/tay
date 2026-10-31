@@ -363,6 +363,10 @@ pub struct Config {
     pub colors: Colors,
     pub keys: Vec<KeyBinding>,
     pub disable_default_key_bindings: bool,
+    /// 视图停在滚动历史时,发往 shell 的输入先自动滚到底
+    /// (VTE scroll-on-keystroke 同款);false = 视口保持不动,
+    /// 适合边看历史边打字的场景。
+    pub scroll_on_input: bool,
     pub global_shortcut: String,
     pub theme: String,
     /// 启动的 shell;空串 = 取 `$SHELL`(再兜底 `/bin/sh`)。
@@ -396,6 +400,7 @@ impl Default for Config {
             colors: Colors::default(),
             keys: default_keys(),
             disable_default_key_bindings: false,
+            scroll_on_input: true,
             global_shortcut: "F12".into(),
             theme: "default".into(),
             shell: String::new(),
@@ -556,6 +561,9 @@ impl Config {
         }
         if let Some(disable) = get_bool(&t, "disable_default_key_bindings")? {
             cfg.disable_default_key_bindings = disable;
+        }
+        if let Some(scroll) = get_bool(&t, "scroll_on_input")? {
+            cfg.scroll_on_input = scroll;
         }
         if cfg.disable_default_key_bindings {
             cfg.keys.clear();
@@ -882,6 +890,8 @@ return {{
   theme = {theme:?},
   global_shortcut = {shortcut:?},
   disable_default_key_bindings = {disable},
+  -- 滚动历史中打字自动跳回底部(false = 边看历史边打字)
+  scroll_on_input = {soi},
   keys = {{ {keys} }},
   -- 启动的 shell;空字符串 = 取 $SHELL(需重启)
   shell = {shell:?},
@@ -987,6 +997,7 @@ return {{
             theme = self.theme,
             shortcut = self.global_shortcut,
             disable = self.disable_default_key_bindings,
+            soi = self.scroll_on_input,
             keys = self
                 .keys
                 .iter()
@@ -1600,6 +1611,11 @@ mod tests {
         assert!(empty.keys.is_empty());
         assert_eq!(Config::from_lua(&config.to_lua()).unwrap(), config);
         assert_eq!(Config::from_lua(&empty.to_lua()).unwrap(), empty);
+        // scroll_on_input:默认 true;显式 false 解析并 roundtrip。
+        assert!(Config::default().scroll_on_input);
+        let still = Config::from_lua("return {scroll_on_input=false}").unwrap();
+        assert!(!still.scroll_on_input);
+        assert!(!Config::from_lua(&still.to_lua()).unwrap().scroll_on_input);
     }
 
     #[test]

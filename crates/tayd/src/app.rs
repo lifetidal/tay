@@ -200,6 +200,10 @@ struct PaneView {
     /// 独立搜索的上一命中(锚点 + 来源世代):「下一个」从其
     /// 下一行继续;打开搜索时清空(从视口顶重来)。
     search_last: Option<(HistoryAnchor, AnchorEpoch)>,
+    /// 「未找到」反馈:画在搜索行内(不占 toast,避免与搜索栏
+    /// 同行重叠),1.2s 后随渲染惰性消失;查询编辑/再次命中时
+    /// 立即清除。
+    search_miss: Option<Instant>,
     view: crate::view::ViewMap,
     kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
     /// toast 队列(按各自时长依次呈现;容量 3,新入队挤掉最旧)。
@@ -541,9 +545,8 @@ impl TayApp {
             self.hint_shown = true;
             self.status_hint(
                 format!(
-                    "{} 呼出/收起 | Ctrl+Shift+T 新标签 | Ctrl+, 设置 | {} 向右分屏",
+                    "{} 呼出/收起 | Ctrl+, 设置 | Ctrl+Shift+S 搜索 | Ctrl+Shift+F 速选",
                     self.config.global_shortcut,
-                    self.config.binding_hint("split-right"),
                 ),
                 ctx,
             );
@@ -1986,10 +1989,19 @@ impl TayApp {
         if let Some(query) = &self.sessions[id].ui.search_query
             && rows > 0
         {
+            // 未找到反馈画在搜索行内(与 toast 同行会互相覆盖)。
+            let miss = self.sessions[id]
+                .ui
+                .search_miss
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(1200));
             overlays.push(tay_render::Overlay {
                 row: rows - 1,
                 col: 0,
-                text: format!(" 搜索: {query} "),
+                text: if miss {
+                    format!(" 搜索: {query} · 未找到 ")
+                } else {
+                    format!(" 搜索: {query} ")
+                },
             });
         }
         if self.pending_close.is_some() && rows > 0 {
@@ -2253,6 +2265,7 @@ impl TayApp {
             self.sessions[self.active_pane].ui.search_query = None;
             self.sessions[self.active_pane].ui.search_standalone = false;
             self.sessions[self.active_pane].ui.search_last = None;
+            self.sessions[self.active_pane].ui.search_miss = None;
             ctx.request_redraw();
         }
     }
@@ -2328,6 +2341,7 @@ impl TayApp {
             match key.key {
                 K::Named(N::Escape) => {
                     self.sessions[self.active_pane].ui.search_query = None;
+                    self.sessions[self.active_pane].ui.search_miss = None;
                     ctx.request_redraw();
                 }
                 K::Named(N::Enter) if self.sessions[self.active_pane].ui.search_query.is_some() => {
@@ -2336,12 +2350,14 @@ impl TayApp {
                 K::Named(N::Backspace) => {
                     if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut() {
                         q.pop();
+                        self.sessions[self.active_pane].ui.search_miss = None;
                     }
                     ctx.request_redraw();
                 }
                 K::Char(c) => {
                     if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut() {
                         q.push(c);
+                        self.sessions[self.active_pane].ui.search_miss = None;
                     }
                     ctx.request_redraw();
                 }
@@ -2389,6 +2405,7 @@ impl TayApp {
                 self.sessions[self.active_pane].ui.search_query = Some(String::new());
                 self.sessions[self.active_pane].ui.search_standalone = false;
                 self.sessions[self.active_pane].ui.search_last = None;
+                self.sessions[self.active_pane].ui.search_miss = None;
                 ctx.request_redraw();
             }
             K::Char('n') => self.search_next(1, ctx),
@@ -2451,6 +2468,7 @@ impl TayApp {
         pane.ui.search_query = Some(String::new());
         pane.ui.search_standalone = true;
         pane.ui.search_last = None;
+        pane.ui.search_miss = None;
         ctx.request_redraw();
     }
 
@@ -2553,7 +2571,10 @@ impl TayApp {
         let Some(snap) = self.sessions[self.active_pane].snapshot.as_ref() else {
             return;
         };
-        if snap.mode.contains(TermMode::ALT_SCREEN) || snap.display_offset == 0 {
+        if !self.config.scroll_on_input
+            || snap.mode.contains(TermMode::ALT_SCREEN)
+            || snap.display_offset == 0
+        {
             return;
         }
         if let Some(sender) = &self.sessions[self.active_pane].sender {
@@ -3560,6 +3581,7 @@ impl Handler for TayApp {
                             self.sessions[self.active_pane].ui.search_query = None;
                             self.sessions[self.active_pane].ui.search_standalone = false;
                             self.sessions[self.active_pane].ui.search_last = None;
+                            self.sessions[self.active_pane].ui.search_miss = None;
                         }
                         KeyKind::Named(NamedKey::Enter) if !key.repeat => {
                             self.search_next(if mods.shift { -1 } else { 1 }, ctx);
@@ -3568,12 +3590,14 @@ impl Handler for TayApp {
                             if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut()
                             {
                                 q.pop();
+                                self.sessions[self.active_pane].ui.search_miss = None;
                             }
                         }
                         KeyKind::Char(c) if !mods.ctrl && !mods.alt && !mods.meta => {
                             if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut()
                             {
                                 q.push(c);
+                                self.sessions[self.active_pane].ui.search_miss = None;
                             }
                         }
                         _ => {}
@@ -3985,11 +4009,16 @@ impl Handler for TayApp {
                                         self.sessions[self.active_pane].ui.search_last =
                                             Some((anchor, epoch));
                                     }
+                                    self.sessions[self.active_pane].ui.search_miss = None;
                                 } else {
-                                    // 明确未命中:轻量反馈(含世代过期/
-                                    // 锚点淘汰与 regex 无效)。
-                                    self.status("未找到匹配", ctx);
+                                    // 明确未命中:反馈画在搜索行内
+                                    // (含世代过期/锚点淘汰与 regex 无效);
+                                    // 1.2s 后醒来重绘一帧清除。
+                                    self.sessions[self.active_pane].ui.search_miss =
+                                        Some(Instant::now());
+                                    ctx.request_wake_at(Instant::now() + Duration::from_millis(1200));
                                 }
+                                ctx.request_redraw();
                             }
                         }
                     }
@@ -4645,6 +4674,23 @@ mod tests {
         wait_offset(0, Instant::now() + Duration::from_secs(5));
         // 已在底部:快照仍为 0,再次调用不发送(门控不 panic)。
         app.jump_to_bottom_for_input();
+        // scroll_on_input = false:停在历史里打字不跳(逃生口)。
+        app.config.scroll_on_input = false;
+        assert!(sender.send(SessionCommand::ScrollToOffset { offset: 10, epoch }));
+        wait_offset(10, Instant::now() + Duration::from_secs(5));
+        app.sessions[id].snapshot = Some(slot.lock().unwrap().as_ref().unwrap().snapshot.clone());
+        app.jump_to_bottom_for_input();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            slot.lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .display_offset,
+            10,
+            "scroll_on_input=false 时输入不应跳底"
+        );
         app.finish_shutdown();
         drop(app);
     }

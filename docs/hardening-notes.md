@@ -1498,3 +1498,22 @@ desktop-services/focus-product 八套烟测)见本轮验收结论。
 - 验证:新单测 `scrollback_search_anchors_wrap_and_epoch_guard`
   (真实 PTY:锚点起点、命中锚点回传、回绕再命中、世代过期、
   无匹配);全工作区测试 197+29+14 全绿,clippy/fmt 干净。
+
+## 搜索/跳底复核修复(P0+P1,2026-10-31)
+
+架构师 + 产品经理双重审核后落地的修复:
+
+- **P0 未找到反馈不再走 toast**:与搜索栏同画在 `rows-1` 会互相
+  覆盖 —— 改为搜索行内反馈(`搜索: {query} · 未找到`,1.2s 后
+  醒来重绘清除);查询编辑/再次命中/关闭时立即清除。
+- **P1a `scroll_on_input` 配置口**:默认 true(跳底);false =
+  停在历史里打字保持视口不动,覆盖「边看历史边打字」场景。
+  解析/get_bool 与 `disable_default_key_bindings` 同模式,
+  to_lua 带出、desktop.lua 模板注释。
+- **P1b 首次呼出提示补本地动作**:toast 改为「呼出/收起 |
+  Ctrl+, 设置 | Ctrl+Shift+S 搜索 | Ctrl+Shift+F 速选」
+  (搜索/速选是本地动作,不在快捷键页清单里,toast 是唯一
+  入口;标签/分屏保留在设置页 3)。
+- 验证:跳底单测扩展 `scroll_on_input=false` 不跳的断言;
+  tay-config 解析/roundtrip 断言;全工作区 197+29+14 全绿,
+  clippy/fmt 干净。
