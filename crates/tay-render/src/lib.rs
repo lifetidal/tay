@@ -203,6 +203,8 @@ pub struct Grid {
     pub opaque_background: bool,
     pub scrollbar: Option<Scrollbar>,
     pub selection: Option<SelectionRange>,
+    /// 搜索命中行高亮(显示坐标;与选区色分开,见 Renderer)。
+    pub search_hit: Option<SelectionRange>,
     pub preedit: Option<Preedit>,
     /// 行尾徽章(行号 = 显示行)。
     pub badges: Vec<Badge>,
@@ -332,6 +334,7 @@ pub struct Renderer {
     /// 颜色不生效,2026-10-19 修复)。
     cursor_color: Rgb,
     selection_color: Rgb,
+    search_hit_color: Rgb,
     /// surface 为 sRGB 格式时,自绘颜色需先转 linear(硬件写入时自动编码)。
     srgb: bool,
 
@@ -382,6 +385,16 @@ fn srgb_to_linear(c: f32) -> f32 {
 }
 
 /// 终端颜色 → 写入帧缓冲的颜色(sRGB surface 需转 linear)。
+/// 通道线性插值(0..1,钳制);搜索命中色等派生色用。
+fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
+    let lerp = |x: u8, y: u8| {
+        ((x as f32 + (y as f32 - x as f32) * t)
+            .round()
+            .clamp(0.0, 255.0)) as u8
+    };
+    Rgb::new(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+}
+
 fn to_linear(rgb: Rgb, srgb: bool) -> [f32; 4] {
     let (r, g, b) = (
         rgb.0 as f32 / 255.0,
@@ -912,6 +925,7 @@ impl Renderer {
             background_checked: None,
             cursor_color: config.colors.cursor,
             selection_color: config.colors.selection,
+            search_hit_color: mix(config.colors.cursor, config.colors.background, 0.55),
             srgb: format.is_srgb(),
             bg_pipeline,
             img_pipeline,
@@ -964,6 +978,7 @@ impl Renderer {
         self.poll_background();
         self.cursor_color = config.colors.cursor;
         self.selection_color = config.colors.selection;
+        self.search_hit_color = mix(config.colors.cursor, config.colors.background, 0.55);
     }
 
     pub fn poll_background(&mut self) -> bool {
@@ -1432,6 +1447,33 @@ impl Renderer {
                         ch,
                     ],
                     color: to_linear(self.selection_color, self.srgb),
+                });
+            }
+        }
+
+        // 搜索命中高亮:与选区同构的色块,颜色独立(光标色
+        // 淡染) —— 与鼠标/vi 选区同时出现时不混淆。
+        if let Some(hit) = grid.search_hit {
+            let (sx, sy) = hit.start;
+            let (ex, ey) = hit.end;
+            for row in sy..=ey {
+                let (x0, x1) = if row == sy && row == ey {
+                    (sx, ex + 1)
+                } else if row == sy {
+                    (sx, grid.cols)
+                } else if row == ey {
+                    (0, ex + 1)
+                } else {
+                    (0, grid.cols)
+                };
+                self.quads.push(Quad {
+                    rect: [
+                        x0 as f32 * cw + pad,
+                        row as f32 * ch + pad,
+                        (x1 - x0) as f32 * cw,
+                        ch,
+                    ],
+                    color: to_linear(self.search_hit_color, self.srgb),
                 });
             }
         }
@@ -1999,6 +2041,7 @@ mod tests {
             cursor: (3, 0),
             cursor_shape: CursorShape::Hidden,
             selection: None,
+            search_hit: None,
             preedit: None,
             badges: vec![],
             overlays: vec![],
@@ -2053,6 +2096,7 @@ mod tests {
             cursor: (4, 0),
             cursor_shape: CursorShape::Block,
             selection: None,
+            search_hit: None,
             preedit: None,
             badges: vec![],
             overlays: vec![],

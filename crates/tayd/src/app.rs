@@ -197,6 +197,11 @@ struct PaneView {
     /// (Enter / Shift+Enter 循环),Esc 关闭。
     search_query: Option<String>,
     search_standalone: bool,
+    /// 上次查询(Esc 关闭时记住;独立搜索重开预填 + 立即重搜,
+    /// vi 模式查询关闭后 n/N 也回退用它)。
+    search_prev: Option<String>,
+    /// 预填的查询尚未编辑:首次按键整体替换(打字即新查询)。
+    search_fresh: bool,
     /// 独立搜索的上一命中(锚点 + 来源世代):「下一个」从其
     /// 下一行继续;打开搜索时清空(从视口顶重来)。
     search_last: Option<(HistoryAnchor, AnchorEpoch)>,
@@ -1942,6 +1947,19 @@ impl TayApp {
             &view,
             cols,
         );
+        // 搜索命中高亮:会话快照携带命中范围(grid 坐标),UI 侧
+        // 折叠感知投影到显示行;仅搜索栏打开时渲染。
+        let search_hit = if self.sessions[id].ui.search_query.is_some() {
+            snap.as_ref().and_then(|s| s.hit).and_then(|hit| {
+                let row = view.grid_to_row(hit.line)?;
+                Some(tay_render::SelectionRange {
+                    start: ((hit.start_col as usize).min(cols - 1), row),
+                    end: ((hit.end_col as usize).min(cols - 1), row),
+                })
+            })
+        } else {
+            None
+        };
         // OSC 133 徽章:非零退出码显示在对应提示符行尾(块状态
         // 来自快照的 COW 共享引用,与网格同版本;投影在 view.rs)。
         let badges = snap
@@ -2035,6 +2053,7 @@ impl TayApp {
             cursor: cursor_position.map(|p| (p.col, p.row)).unwrap_or((0, 0)),
             cursor_shape,
             selection,
+            search_hit,
             preedit: self.sessions[id].ui.preedit.clone(),
             badges,
             overlays,
@@ -2340,7 +2359,8 @@ impl TayApp {
         if self.sessions[self.active_pane].ui.search_query.is_some() {
             match key.key {
                 K::Named(N::Escape) => {
-                    self.sessions[self.active_pane].ui.search_query = None;
+                    self.sessions[self.active_pane].ui.search_prev =
+                        self.sessions[self.active_pane].ui.search_query.take();
                     self.sessions[self.active_pane].ui.search_miss = None;
                     ctx.request_redraw();
                 }
@@ -2406,6 +2426,7 @@ impl TayApp {
                 self.sessions[self.active_pane].ui.search_standalone = false;
                 self.sessions[self.active_pane].ui.search_last = None;
                 self.sessions[self.active_pane].ui.search_miss = None;
+                self.sessions[self.active_pane].ui.search_fresh = false;
                 ctx.request_redraw();
             }
             K::Char('n') => self.search_next(1, ctx),
@@ -2422,29 +2443,49 @@ impl TayApp {
     }
 
     /// 下一个/上一个搜索命中(dir = 1/-1;搜索在会话侧执行)。
-    /// vi 语义:从 vi 光标起步;独立搜索:首次从视口顶(含顶行),
-    /// 之后从上一命中的下一行 —— 回绕由会话侧 wrapscan 兜底。
     fn search_next(&mut self, dir: i32, ctx: &mut Ctx<'_>) {
+        self.search_run(dir, false, ctx);
+    }
+
+    /// 实时重搜(独立搜索):查询编辑/IME 提交后立即从视口顶
+    /// 重搜,视图随输入跳到首个命中(alacritty 同款)。
+    fn search_live(&mut self, ctx: &mut Ctx<'_>) {
+        self.search_run(1, true, ctx);
+    }
+
+    /// vi 语义:从 vi 光标起步;独立搜索:Enter / Shift+Enter 从
+    /// 上一命中之后继续,`fresh`(实时重搜/首次)从视口顶(含顶
+    /// 行)起步 —— 回绕由会话侧 wrapscan 兜底。查询栏已关闭时
+    /// (vi 模式 Esc 后 n/N)回退用上次查询。
+    fn search_run(&mut self, dir: i32, fresh: bool, ctx: &mut Ctx<'_>) {
         let pane = &mut self.sessions[self.active_pane];
-        let Some(query) = pane.ui.search_query.clone() else {
+        let Some(query) = pane
+            .ui
+            .search_query
+            .clone()
+            .or_else(|| pane.ui.search_prev.clone())
+        else {
             return;
         };
+        if query.is_empty() {
+            return;
+        }
         let start = if pane.ui.search_standalone {
             let snap = pane.snapshot.clone();
             match (pane.ui.search_last, snap) {
                 // 上一命中之后继续(锚点行本身不含,回绕可找更早的)。
-                (Some((anchor, epoch)), _) => SearchStart::Anchor {
+                (Some((anchor, epoch)), _) if !fresh => SearchStart::Anchor {
                     anchor,
                     epoch,
                     inclusive: false,
                 },
-                // 首次:视口顶(含顶行)。
-                (None, Some(snap)) => SearchStart::Anchor {
+                // 实时重搜/首次:视口顶(含顶行)。
+                (_, Some(snap)) => SearchStart::Anchor {
                     anchor: HistoryAnchor(-(snap.display_offset as i32) + snap.meta.cum_scroll),
                     epoch: snap.meta.invalidate_epoch,
                     inclusive: true,
                 },
-                (None, None) => return,
+                (_, None) => return,
             }
         } else {
             SearchStart::Cursor
@@ -2464,12 +2505,21 @@ impl TayApp {
     /// 搜索,起点 = 视口顶;Enter / Shift+Enter 循环下一个/上一个,
     /// Esc 关闭。输入期间按键全部由搜索栏消费。
     fn open_search(&mut self, ctx: &mut Ctx<'_>) {
-        let pane = &mut self.sessions[self.active_pane];
-        pane.ui.search_query = Some(String::new());
-        pane.ui.search_standalone = true;
-        pane.ui.search_last = None;
-        pane.ui.search_miss = None;
+        let prefilled;
+        {
+            let pane = &mut self.sessions[self.active_pane];
+            pane.ui.search_query = pane.ui.search_prev.clone();
+            pane.ui.search_standalone = true;
+            pane.ui.search_last = None;
+            pane.ui.search_miss = None;
+            pane.ui.search_fresh = pane.ui.search_query.is_some();
+            prefilled = pane.ui.search_query.is_some();
+        }
         ctx.request_redraw();
+        if prefilled {
+            // 预填上次查询并立即重搜(重开即回到上次命中场景)。
+            self.search_live(ctx);
+        }
     }
 
     /// 跳转到上一条/下一条提示符(DESIGN §8.4「跳转到上一条提示符」)。
@@ -3575,35 +3625,86 @@ impl Handler for TayApp {
                 if self.sessions[self.active_pane].ui.search_standalone
                     && self.sessions[self.active_pane].ui.search_query.is_some()
                 {
-                    use tay_window::NamedKey;
-                    match key.key {
-                        KeyKind::Named(NamedKey::Escape) => {
-                            self.sessions[self.active_pane].ui.search_query = None;
-                            self.sessions[self.active_pane].ui.search_standalone = false;
-                            self.sessions[self.active_pane].ui.search_last = None;
-                            self.sessions[self.active_pane].ui.search_miss = None;
-                        }
-                        KeyKind::Named(NamedKey::Enter) if !key.repeat => {
-                            self.search_next(if mods.shift { -1 } else { 1 }, ctx);
-                        }
-                        KeyKind::Named(NamedKey::Backspace) => {
-                            if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut()
-                            {
-                                q.pop();
+                    // 放行窗格/标签导航与分屏(配置键位):搜索栏
+                    // 打开时也能切窗格/开标签,不必先 Esc。
+                    let passthrough = crate::input::configured_key_action(
+                        &self.config,
+                        &key,
+                        true,
+                        mods,
+                    )
+                    .is_some_and(|action| {
+                        [
+                            "next-pane",
+                            "split-right",
+                            "split-down",
+                            "close-pane",
+                            "zoom-pane",
+                            "new-tab",
+                            "close-tab",
+                            "next-tab",
+                            "previous-tab",
+                            "hide",
+                            "maximize",
+                        ]
+                        .contains(&action)
+                    });
+                    if !passthrough {
+                        use tay_window::NamedKey;
+                        match key.key {
+                            KeyKind::Named(NamedKey::Escape) => {
+                                self.sessions[self.active_pane].ui.search_prev =
+                                    self.sessions[self.active_pane].ui.search_query.take();
+                                self.sessions[self.active_pane].ui.search_standalone = false;
+                                self.sessions[self.active_pane].ui.search_last = None;
                                 self.sessions[self.active_pane].ui.search_miss = None;
+                                self.sessions[self.active_pane].ui.search_fresh = false;
                             }
-                        }
-                        KeyKind::Char(c) if !mods.ctrl && !mods.alt && !mods.meta => {
-                            if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut()
-                            {
-                                q.push(c);
-                                self.sessions[self.active_pane].ui.search_miss = None;
+                            KeyKind::Named(NamedKey::Enter) if !key.repeat => {
+                                self.search_next(if mods.shift { -1 } else { 1 }, ctx);
                             }
+                            KeyKind::Named(NamedKey::Backspace) => {
+                                let mut edited = false;
+                                {
+                                    let pane = &mut self.sessions[self.active_pane];
+                                    if let Some(q) = pane.ui.search_query.as_mut() {
+                                        if pane.ui.search_fresh {
+                                            q.clear();
+                                            pane.ui.search_fresh = false;
+                                        } else {
+                                            q.pop();
+                                        }
+                                        pane.ui.search_miss = None;
+                                        edited = true;
+                                    }
+                                }
+                                if edited {
+                                    self.search_live(ctx);
+                                }
+                            }
+                            KeyKind::Char(c) if !mods.ctrl && !mods.alt && !mods.meta => {
+                                let mut edited = false;
+                                {
+                                    let pane = &mut self.sessions[self.active_pane];
+                                    if let Some(q) = pane.ui.search_query.as_mut() {
+                                        if pane.ui.search_fresh {
+                                            q.clear();
+                                            pane.ui.search_fresh = false;
+                                        }
+                                        q.push(c);
+                                        pane.ui.search_miss = None;
+                                        edited = true;
+                                    }
+                                }
+                                if edited {
+                                    self.search_live(ctx);
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                        ctx.request_redraw();
+                        return;
                     }
-                    ctx.request_redraw();
-                    return;
                 }
                 if self.settings_open {
                     use tay_window::NamedKey;
@@ -3811,9 +3912,41 @@ impl Handler for TayApp {
             }
 
             WEvent::Ime(ime) => match ime {
-                ImeEvent::Commit(text) => {if let Some((_,value))=&mut self.editing{value.push_str(&text);ctx.request_redraw();}else{self.ime_commit(text,ctx);}},
+                ImeEvent::Commit(text) => {
+                    if let Some((_, value)) = &mut self.editing {
+                        value.push_str(&text);
+                        ctx.request_redraw();
+                    } else if self.sessions[self.active_pane].ui.search_query.is_some() {
+                        // 搜索输入中:IME 提交进查询,不发给 shell
+                        // (独立搜索实时重搜;vi 查询保持 Enter 驱动)。
+                        let mut standalone = false;
+                        {
+                            let pane = &mut self.sessions[self.active_pane];
+                            if let Some(q) = pane.ui.search_query.as_mut() {
+                                if pane.ui.search_fresh {
+                                    q.clear();
+                                    pane.ui.search_fresh = false;
+                                }
+                                q.push_str(&text);
+                                pane.ui.search_miss = None;
+                                standalone = pane.ui.search_standalone;
+                            }
+                        }
+                        self.sessions[self.active_pane].ui.preedit = None;
+                        ctx.request_redraw();
+                        if standalone {
+                            self.search_live(ctx);
+                        }
+                    } else {
+                        self.ime_commit(text, ctx);
+                    }
+                },
                 ImeEvent::Preedit { text, cursor } => {
-                    if text.is_empty() {
+                    if self.sessions[self.active_pane].ui.search_query.is_some() {
+                        // 搜索输入中:预编辑不画在终端光标处(提交
+                        // 仍进查询,候选框由输入法自行定位)。
+                        self.sessions[self.active_pane].ui.preedit = None;
+                    } else if text.is_empty() {
                         self.sessions[self.active_pane].ui.preedit = None;
                     } else {
                         let (col, row) = self.cursor_pos();
@@ -4821,6 +4954,9 @@ mod tests {
             }
             other => panic!("预期搜索应答,得到 {other:?}"),
         }
+        // 无匹配时快照清空命中范围(高亮消失)。
+        let after_miss = slot.lock().unwrap().as_ref().unwrap().snapshot.clone();
+        assert!(after_miss.hit.is_none(), "未命中应清空高亮范围");
         app.finish_shutdown();
         drop(app);
     }

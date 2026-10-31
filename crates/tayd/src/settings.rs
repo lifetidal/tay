@@ -525,6 +525,7 @@ pub(crate) fn paint(
     grid.cursor_shape = tay_render::CursorShape::Hidden;
     grid.preedit = None;
     grid.selection = None;
+    grid.search_hit = None;
     grid.overlays.clear();
     grid.images.clear();
     grid.window_icons.clear();
@@ -629,6 +630,7 @@ mod tests {
             cursor: (0, 0),
             cursor_shape: tay_render::CursorShape::Beam,
             selection: None,
+            search_hit: None,
             preedit: None,
             badges: vec![],
             overlays: vec![],
@@ -707,6 +709,7 @@ mod tests {
             cursor: (0, 0),
             cursor_shape: tay_render::CursorShape::Beam,
             selection: None,
+            search_hit: None,
             preedit: None,
             badges: vec![],
             overlays: vec![],
@@ -770,6 +773,7 @@ mod tests {
             cursor: (0, 0),
             cursor_shape: tay_render::CursorShape::Beam,
             selection: None,
+            search_hit: None,
             preedit: None,
             badges: vec![],
             overlays: vec![],

@@ -84,6 +84,15 @@ impl SessionMeta {
     }
 }
 
+/// 搜索命中范围(grid 坐标:行号 + 列区间)。快照携带,UI 侧
+/// 折叠感知投影到显示行,渲染独立高亮(与选区色分开)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HitRange {
+    pub line: i32,
+    pub start_col: u32,
+    pub end_col: u32,
+}
+
 /// 快照单元(可见区一格;颜色在 UI 侧按配置解析)。
 #[derive(Debug, Clone)]
 pub struct SnapshotCell {
@@ -113,6 +122,8 @@ pub struct SessionSnapshot {
     pub cells: Vec<SnapshotCell>,
     /// vi 模式选区(渲染高亮;鼠标选区在 UI 侧)。
     pub selection: Option<alacritty_terminal::selection::SelectionRange>,
+    /// 搜索命中范围(grid 坐标;UI 投影到显示行渲染高亮)。
+    pub hit: Option<HitRange>,
     /// term 颜色表(OSC 可改,快照携带;UI 按配置解析)。
     pub colors: Colors,
     /// 终端模式位(输入路由/按键翻译用)。
@@ -320,6 +331,8 @@ pub struct SessionState<U: EventListener> {
     pub meta: SessionMeta,
     pub blocks: Arc<crate::blocks::CommandBlockStore>,
     pub images: Arc<Vec<KittyImageEntry>>,
+    /// 最近一次搜索的命中范围(search() 维护;未命中清空)。
+    pub hit: Option<HitRange>,
 }
 
 impl<U: EventListener> SessionState<U> {
@@ -330,6 +343,7 @@ impl<U: EventListener> SessionState<U> {
             meta: SessionMeta::default(),
             blocks: Arc::new(crate::blocks::CommandBlockStore::default()),
             images: Arc::new(Vec::new()),
+            hit: None,
         }
     }
 
@@ -474,6 +488,7 @@ impl<U: EventListener> SessionState<U> {
             },
             cells,
             selection: content.selection,
+            hit: self.hit,
             colors: *content.colors,
             mode: *self.term.mode(),
             cursor_shape: content.cursor.shape,

@@ -894,8 +894,17 @@ fn search<U: EventListener>(
             .regex_search_left(&mut regex, start, first)
             .or_else(|| state.term.regex_search_left(&mut regex, last, start))
     };
-    let m = hit?;
+    let Some(m) = hit else {
+        // 未命中:清高亮(UI 搜索栏里同时给出「未找到」反馈)。
+        state.hit = None;
+        return None;
+    };
     state.term.scroll_to_point(*m.start());
+    state.hit = Some(crate::session::HitRange {
+        line: m.start().line.0,
+        start_col: m.start().column.0 as u32,
+        end_col: m.end().column.0.saturating_sub(1) as u32,
+    });
     Some(HistoryAnchor(m.start().line.0 + state.meta.cum_scroll))
 }
 

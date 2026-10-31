@@ -75,6 +75,7 @@ pub(crate) fn compose(
         opaque_background: false,
         scrollbar: None,
         selection: None,
+        search_hit: None,
         preedit: None,
         badges: vec![],
         overlays: vec![],

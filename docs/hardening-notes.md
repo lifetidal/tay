@@ -1517,3 +1517,27 @@ desktop-services/focus-product 八套烟测)见本轮验收结论。
 - 验证:跳底单测扩展 `scroll_on_input=false` 不跳的断言;
   tay-config 解析/roundtrip 断言;全工作区 197+29+14 全绿,
   clippy/fmt 干净。
+
+## 搜索体验补全(P2,2026-10-31)
+
+架构师/产品复核 backlog 一次性落地:
+
+- **实时搜索 + 命中高亮**:独立搜索边输边跳(alacritty 同款)——
+  查询每次编辑/IME 提交后立即从视口顶重搜;命中范围由会话侧
+  `search()` 写入 `SessionState.hit`(grid 行 + 列区间),随快照
+  发布,UI 折叠感知投影到显示行,渲染器新增独立色块(光标色
+  55% 淡染,与鼠标/vi 选区蓝分开;`tay-render::Grid.search_hit`
+  + `Renderer.search_hit_color`,热重载跟随)。未命中清空高亮。
+- **记住上次查询**:Esc 关闭时存入 `search_prev`;独立搜索重开
+  预填 + 立即重搜(`search_fresh` 标记:首次按键整体替换,打字
+  即新查询);vi 模式查询关闭后 n/N 也回退用上次查询。
+- **IME 进查询框**:搜索栏打开时 IME Commit 写入查询(不发往
+  shell),预编辑不在终端光标处显示;独立搜索实时重搜,vi 查询
+  保持 Enter 驱动。
+- **搜索栏放行窗格/标签快捷键**:配置键位命中白名单(next-pane /
+  split / close-pane / zoom / new-tab / close-tab / 切标签 / hide /
+  maximize)时不再被搜索栏吞掉,照常执行、搜索栏保持打开;
+  切换窗格后搜索状态跟随窗格。
+- 验证:搜索单测扩展快照命中范围断言(锚点/grid 行/列区间
+  指向匹配词,未命中清空);全工作区 197+29+14 全绿,clippy/
+  fmt 干净。

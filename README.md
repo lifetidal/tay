@@ -138,8 +138,10 @@ global_shortcut = "CTRL+grave",  -- 改完重启 tayd,按系统弹窗确认
 - **QuickSelect**(`Ctrl+Shift+F`):屏幕上的网址/路径/git 哈希
   会被打上标签,按一下字母键就复制,Shift+字母顺便用浏览器打开。
 - **滚动历史搜索**(`Ctrl+Shift+S`):regex 搜索整个滚动历史,
-  从视口顶开始,`Enter` / `Shift+Enter` 循环下一个/上一个,
-  `Esc` 关闭(vi 模式里 `/` 搜索、`n` / `N` 跳转)。
+  **边输边跳**到首个命中并高亮当前命中行,`Enter` / `Shift+Enter`
+  循环下一个/上一个,`Esc` 关闭后**重开记住上次查询**(vi 模式里
+  `/` 搜索、`n` / `N` 跳转);搜索栏打开时窗格/标签快捷键照常可用,
+  IME 输入直接进查询框。
 - **输入跳底**:滚动到历史后,打字/粘贴自动跳回底部显示输入
   (VTE 同款);配置 `scroll_on_input = false` 可关,边看历史边打字。
 - **vi 复制模式**(`Ctrl+Shift+Space`):hjkl 移动、`/` 搜索、
