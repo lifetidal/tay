@@ -137,6 +137,9 @@ global_shortcut = "CTRL+grave",  -- 改完重启 tayd,按系统弹窗确认
   几行的钩子(见 [docs/shell-integration.md](docs/shell-integration.md))。
 - **QuickSelect**(`Ctrl+Shift+F`):屏幕上的网址/路径/git 哈希
   会被打上标签,按一下字母键就复制,Shift+字母顺便用浏览器打开。
+- **滚动历史搜索**(`Ctrl+Shift+S`):regex 搜索整个滚动历史,
+  从视口顶开始,`Enter` / `Shift+Enter` 循环下一个/上一个,
+  `Esc` 关闭(vi 模式里 `/` 搜索、`n` / `N` 跳转)。
 - **vi 复制模式**(`Ctrl+Shift+Space`):hjkl 移动、`/` 搜索、
   `y` 复制,不碰鼠标。
 - **会话恢复**:`tay quit` 会记下开了哪些标签,`tay resurrect`

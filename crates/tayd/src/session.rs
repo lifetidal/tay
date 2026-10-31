@@ -192,8 +192,14 @@ pub enum SessionCommand {
     ToggleVi,
     /// vi 动作(光标移动/词边界等)。
     ViMotion(ViMotion),
-    /// vi 增量搜索(query, dir ±1)。
+    /// 滚动历史搜索(query = regex,dir ±1)。起点两种:
+    /// - `Cursor`:vi 模式语义,从 vi 光标处向 dir 方向找;
+    /// - `Anchor`:独立搜索,从历史锚点所在行开始(`inclusive`
+    ///   决定是否包含锚点行本身 —— 首次搜索含视口顶行,后续
+    ///   「下一个」从上一命中行之后)。锚点携带来源世代,会话
+    ///   执行前校验(与 CopyAnchors/ScrollToAnchor 同一规则)。
     Search {
+        start: SearchStart,
         query: String,
         dir: i32,
         reply: Replies,
@@ -217,6 +223,19 @@ pub enum SessionCommand {
     Shutdown,
 }
 
+/// 搜索起点(见 `SessionCommand::Search`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStart {
+    /// vi 光标(vi 模式语义)。
+    Cursor,
+    /// 历史锚点行;`inclusive = true` 从该行开始,否则从下一行。
+    Anchor {
+        anchor: HistoryAnchor,
+        epoch: AnchorEpoch,
+        inclusive: bool,
+    },
+}
+
 /// 会话应答(命令的回执;携带版本信息,过期结果由调用方按
 /// revision 丢弃 —— 本轮复制/搜索应答即带快照版本)。
 #[derive(Debug)]
@@ -231,8 +250,13 @@ pub enum SessionReply {
         revision: SessionRevision,
         stale: bool,
     },
+    /// 搜索命中:`anchor` = 命中行的历史锚点(供「下一个」从其后
+    /// 继续;`found = false` 时恒为 None);`epoch` = 命中所在
+    /// 状态的失效世代,后续请求携带它做校验。
     Search {
         found: bool,
+        anchor: Option<HistoryAnchor>,
+        epoch: AnchorEpoch,
         revision: SessionRevision,
     },
     Selection {
@@ -584,6 +608,8 @@ mod tests {
             });
             replies.send(super::SessionReply::Search {
                 found: true,
+                anchor: Some(super::HistoryAnchor(i as i32)),
+                epoch: super::AnchorEpoch(0),
                 revision: super::SessionRevision(i),
             });
         }

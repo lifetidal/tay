@@ -1480,3 +1480,21 @@ desktop-services/focus-product 八套烟测)见本轮验收结论。
   (真实 PTY:20 行输出 → 上滚 10 行 → 钩子 → 会话侧
   display_offset 归零);全工作区测试 196+29+14 全绿,clippy/
   fmt 干净。
+
+## 滚动历史搜索(Ctrl+Shift+S,2026-10-31)
+
+- 背景:搜索此前只在 vi 模式可用(`/` + n/N),起点是 vi 光标、
+  无回绕、失败无反馈 —— 生态标准件缺失(Ghostty 1.3 也刚补)。
+- 会话侧:`SessionCommand::Search` 增加 `SearchStart`(Cursor /
+  Anchor+世代),regex 搜索未命中时回绕到另一端再找一次(vi 的
+  wrapscan 语义);命中返回行锚点 + 状态世代,供「下一个」从其后
+  继续;锚点世代/淘汰校验失败 → 明确未命中(与 CopyAnchors /
+  ScrollToAnchor 同一规则,不猜坐标)。
+- UI 侧:独立搜索栏(Ctrl+Shift+S)复用 vi 搜索输入与底部覆盖行;
+  首次从视口顶(含顶行)向下,Enter / Shift+Enter 循环,未命中
+  toast「未找到匹配」;输入期间按键全部由搜索栏消费(拦截在配置
+  键位与 QuickSelect 之前,查询里的 c/f 不会触发复制/QuickSelect);
+  Esc 关闭。vi 模式 `/` 语义不变(n/N 走 vi 光标)。
+- 验证:新单测 `scrollback_search_anchors_wrap_and_epoch_guard`
+  (真实 PTY:锚点起点、命中锚点回传、回绕再命中、世代过期、
+  无匹配);全工作区测试 197+29+14 全绿,clippy/fmt 干净。

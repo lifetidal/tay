@@ -12,7 +12,9 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::session::{BlockEvent, SessionCommand, SessionReply, SessionState, SessionUpdate};
+use crate::session::{
+    BlockEvent, HistoryAnchor, SessionCommand, SessionReply, SessionState, SessionUpdate,
+};
 use alacritty_terminal::event::{Event, EventListener, OnResize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
@@ -864,29 +866,37 @@ fn drain_pty(
     true
 }
 
-/// vi 增量搜索(会话侧):regex 命中后滚动定位;返回是否命中。
-fn search<U: EventListener>(state: &mut SessionState<U>, query: &str, dir: i32) -> bool {
+/// 滚动历史搜索(会话侧):regex 从 `start` 起向 dir 方向找,
+/// 未命中时回绕到另一端再找一次(vi 的 wrapscan 语义;独立
+/// 搜索的「下一个」同样循环)。命中后滚动定位,返回命中行锚点
+/// (绝对行 = grid 行 + cum_scroll)。
+fn search<U: EventListener>(
+    state: &mut SessionState<U>,
+    query: &str,
+    dir: i32,
+    start: Point,
+) -> Option<HistoryAnchor> {
     use alacritty_terminal::term::search::RegexSearch;
 
-    let Some(mut regex) = RegexSearch::new(query).ok() else {
-        return false;
-    };
-    let cursor = state.term.renderable_content().cursor.point;
+    let mut regex = RegexSearch::new(query).ok()?;
     let grid = state.term.grid();
     let history = (Dimensions::total_lines(grid) - Dimensions::screen_lines(grid)) as i32;
     let first = Point::new(Line(-history), Column(0));
     let last = Point::new(Line(Dimensions::screen_lines(grid) as i32 - 1), Column(0));
     let hit = if dir > 0 {
-        state.term.regex_search_right(&mut regex, cursor, last)
+        state
+            .term
+            .regex_search_right(&mut regex, start, last)
+            .or_else(|| state.term.regex_search_right(&mut regex, first, start))
     } else {
-        state.term.regex_search_left(&mut regex, cursor, first)
+        state
+            .term
+            .regex_search_left(&mut regex, start, first)
+            .or_else(|| state.term.regex_search_left(&mut regex, last, start))
     };
-    if let Some(m) = hit {
-        state.term.scroll_to_point(*m.start());
-        true
-    } else {
-        false
-    }
+    let m = hit?;
+    state.term.scroll_to_point(*m.start());
+    Some(HistoryAnchor(m.start().line.0 + state.meta.cum_scroll))
 }
 
 /// 应用一次 resize(PTY + 内核 + 快照,与 Resize 命令臂同一实现)。
@@ -1395,12 +1405,63 @@ fn run<U>(
                             state.bump();
                             publish(&snapshot_slot, &state, &listener);
                         }
-                        SessionCommand::Search { query, dir, reply } => {
-                            let found = search(&mut state, &query, dir);
+                        SessionCommand::Search {
+                            start,
+                            query,
+                            dir,
+                            reply,
+                        } => {
+                            // 锚点起点:世代/淘汰校验失败 → 明确未命中
+                            // (与 CopyAnchors/ScrollToAnchor 同一规则,
+                            // 不猜坐标);vi 光标起点无需校验。
+                            let start_point = match start {
+                                crate::session::SearchStart::Cursor => {
+                                    state.term.renderable_content().cursor.point
+                                }
+                                crate::session::SearchStart::Anchor {
+                                    anchor,
+                                    epoch,
+                                    inclusive,
+                                } => {
+                                    if !state.epoch_current(epoch) {
+                                        reply.send(SessionReply::Search {
+                                            found: false,
+                                            anchor: None,
+                                            epoch: state.meta.invalidate_epoch,
+                                            revision: state.meta.revision,
+                                        });
+                                        continue;
+                                    }
+                                    let grid = state.term.grid();
+                                    let Some(line) = state.meta.resolve(
+                                        anchor,
+                                        Dimensions::total_lines(grid),
+                                        Dimensions::screen_lines(grid),
+                                    ) else {
+                                        // 锚点已滚出历史:明确未命中。
+                                        reply.send(SessionReply::Search {
+                                            found: false,
+                                            anchor: None,
+                                            epoch: state.meta.invalidate_epoch,
+                                            revision: state.meta.revision,
+                                        });
+                                        continue;
+                                    };
+                                    Point::new(Line(line + i32::from(!inclusive)), Column(0))
+                                }
+                            };
+                            let anchor = search(&mut state, &query, dir, start_point);
+                            let found = anchor.is_some();
+                            let epoch = state.meta.invalidate_epoch;
                             let revision = state.meta.revision;
                             state.bump();
                             publish(&snapshot_slot, &state, &listener);
-                            reply.send(SessionReply::Search { found, revision });
+                            reply.send(SessionReply::Search {
+                                found,
+                                anchor,
+                                epoch,
+                                revision,
+                            });
                             listener.send_event(Event::Wakeup);
                         }
                         SessionCommand::CopyAnchors {

@@ -19,7 +19,7 @@ use alacritty_terminal::vte::ansi::{CursorShape as ACursorShape, CursorStyle};
 
 use crate::ptyloop::TermSender;
 use crate::session::{
-    AnchorEpoch, DisplayPoint, GridPoint, HistoryAnchor, SessionCommand, SessionReply,
+    AnchorEpoch, DisplayPoint, GridPoint, HistoryAnchor, SearchStart, SessionCommand, SessionReply,
     SessionSnapshot, SessionState, SessionUpdate,
 };
 use tay_config::{Config, Rgb};
@@ -191,7 +191,15 @@ struct PaneView {
     scrollbar_drag: Option<(f32, AnchorEpoch)>,
     scroll_px: f32,
     quick: Option<QuickState>,
-    vi_search_query: Option<String>,
+    /// 滚动历史搜索输入:vi 模式 `/` 或独立搜索(Ctrl+Shift+S)
+    /// 打开,底部行显示。`search_standalone` 区分两种语义:
+    /// vi 搜索从 vi 光标起步(n/N),独立搜索从视口顶起步
+    /// (Enter / Shift+Enter 循环),Esc 关闭。
+    search_query: Option<String>,
+    search_standalone: bool,
+    /// 独立搜索的上一命中(锚点 + 来源世代):「下一个」从其
+    /// 下一行继续;打开搜索时清空(从视口顶重来)。
+    search_last: Option<(HistoryAnchor, AnchorEpoch)>,
     view: crate::view::ViewMap,
     kitty_down: std::collections::BTreeMap<u32, tay_window::KeyPress>,
     /// toast 队列(按各自时长依次呈现;容量 3,新入队挤掉最旧)。
@@ -1975,7 +1983,7 @@ impl TayApp {
                     .collect()
             })
             .unwrap_or_default();
-        if let Some(query) = &self.sessions[id].ui.vi_search_query
+        if let Some(query) = &self.sessions[id].ui.search_query
             && rows > 0
         {
             overlays.push(tay_render::Overlay {
@@ -2242,7 +2250,9 @@ impl TayApp {
     fn toggle_vi(&mut self, ctx: &mut Ctx<'_>) {
         if let Some(sender) = &self.sessions[self.active_pane].sender {
             let _ = sender.send(SessionCommand::ToggleVi);
-            self.sessions[self.active_pane].ui.vi_search_query = None;
+            self.sessions[self.active_pane].ui.search_query = None;
+            self.sessions[self.active_pane].ui.search_standalone = false;
+            self.sessions[self.active_pane].ui.search_last = None;
             ctx.request_redraw();
         }
     }
@@ -2314,25 +2324,23 @@ impl TayApp {
         use tay_window::NamedKey as N;
 
         // 搜索输入中:字符入查询,Enter 执行,Esc 取消。
-        if self.sessions[self.active_pane].ui.vi_search_query.is_some() {
+        if self.sessions[self.active_pane].ui.search_query.is_some() {
             match key.key {
                 K::Named(N::Escape) => {
-                    self.sessions[self.active_pane].ui.vi_search_query = None;
+                    self.sessions[self.active_pane].ui.search_query = None;
                     ctx.request_redraw();
                 }
-                K::Named(N::Enter)
-                    if self.sessions[self.active_pane].ui.vi_search_query.is_some() =>
-                {
-                    self.vi_search_next(1, ctx);
+                K::Named(N::Enter) if self.sessions[self.active_pane].ui.search_query.is_some() => {
+                    self.search_next(1, ctx);
                 }
                 K::Named(N::Backspace) => {
-                    if let Some(q) = self.sessions[self.active_pane].ui.vi_search_query.as_mut() {
+                    if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut() {
                         q.pop();
                     }
                     ctx.request_redraw();
                 }
                 K::Char(c) => {
-                    if let Some(q) = self.sessions[self.active_pane].ui.vi_search_query.as_mut() {
+                    if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut() {
                         q.push(c);
                     }
                     ctx.request_redraw();
@@ -2378,11 +2386,13 @@ impl TayApp {
             }
             // 搜索。
             K::Char('/') => {
-                self.sessions[self.active_pane].ui.vi_search_query = Some(String::new());
+                self.sessions[self.active_pane].ui.search_query = Some(String::new());
+                self.sessions[self.active_pane].ui.search_standalone = false;
+                self.sessions[self.active_pane].ui.search_last = None;
                 ctx.request_redraw();
             }
-            K::Char('n') => self.vi_search_next(1, ctx),
-            K::Char('N') => self.vi_search_next(-1, ctx),
+            K::Char('n') => self.search_next(1, ctx),
+            K::Char('N') => self.search_next(-1, ctx),
             // 退出。
             K::Named(N::Escape) | K::Char('q') => {
                 if let Some(sender) = &self.sessions[self.active_pane].sender {
@@ -2395,16 +2405,52 @@ impl TayApp {
     }
 
     /// 下一个/上一个搜索命中(dir = 1/-1;搜索在会话侧执行)。
-    fn vi_search_next(&mut self, dir: i32, ctx: &mut Ctx<'_>) {
-        let Some(query) = self.sessions[self.active_pane].ui.vi_search_query.clone() else {
+    /// vi 语义:从 vi 光标起步;独立搜索:首次从视口顶(含顶行),
+    /// 之后从上一命中的下一行 —— 回绕由会话侧 wrapscan 兜底。
+    fn search_next(&mut self, dir: i32, ctx: &mut Ctx<'_>) {
+        let pane = &mut self.sessions[self.active_pane];
+        let Some(query) = pane.ui.search_query.clone() else {
             return;
         };
-        if let (Some(sender), Some(reply)) = (
-            &self.sessions[self.active_pane].sender,
-            self.sessions[self.active_pane].reply_tx.clone(),
-        ) {
-            let _ = sender.send(SessionCommand::Search { query, dir, reply });
+        let start = if pane.ui.search_standalone {
+            let snap = pane.snapshot.clone();
+            match (pane.ui.search_last, snap) {
+                // 上一命中之后继续(锚点行本身不含,回绕可找更早的)。
+                (Some((anchor, epoch)), _) => SearchStart::Anchor {
+                    anchor,
+                    epoch,
+                    inclusive: false,
+                },
+                // 首次:视口顶(含顶行)。
+                (None, Some(snap)) => SearchStart::Anchor {
+                    anchor: HistoryAnchor(-(snap.display_offset as i32) + snap.meta.cum_scroll),
+                    epoch: snap.meta.invalidate_epoch,
+                    inclusive: true,
+                },
+                (None, None) => return,
+            }
+        } else {
+            SearchStart::Cursor
+        };
+        if let (Some(sender), Some(reply)) = (&pane.sender, pane.reply_tx.clone()) {
+            let _ = sender.send(SessionCommand::Search {
+                start,
+                query,
+                dir,
+                reply,
+            });
         }
+        ctx.request_redraw();
+    }
+
+    /// 打开独立搜索(Ctrl+Shift+S):非 vi 模式可用的滚动历史
+    /// 搜索,起点 = 视口顶;Enter / Shift+Enter 循环下一个/上一个,
+    /// Esc 关闭。输入期间按键全部由搜索栏消费。
+    fn open_search(&mut self, ctx: &mut Ctx<'_>) {
+        let pane = &mut self.sessions[self.active_pane];
+        pane.ui.search_query = Some(String::new());
+        pane.ui.search_standalone = true;
+        pane.ui.search_last = None;
         ctx.request_redraw();
     }
 
@@ -3501,6 +3547,40 @@ impl Handler for TayApp {
                 if !pressed {
                     return;
                 }
+                // 独立搜索输入中:按键全部由搜索栏消费(Esc 关闭,
+                // Enter / Shift+Enter 下一个/上一个,其余入查询)。
+                // 必须在配置键位与 QuickSelect 之前拦截 —— 否则
+                // 查询里的 'c' 会触发复制、'f' 会开 QuickSelect。
+                if self.sessions[self.active_pane].ui.search_standalone
+                    && self.sessions[self.active_pane].ui.search_query.is_some()
+                {
+                    use tay_window::NamedKey;
+                    match key.key {
+                        KeyKind::Named(NamedKey::Escape) => {
+                            self.sessions[self.active_pane].ui.search_query = None;
+                            self.sessions[self.active_pane].ui.search_standalone = false;
+                            self.sessions[self.active_pane].ui.search_last = None;
+                        }
+                        KeyKind::Named(NamedKey::Enter) if !key.repeat => {
+                            self.search_next(if mods.shift { -1 } else { 1 }, ctx);
+                        }
+                        KeyKind::Named(NamedKey::Backspace) => {
+                            if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut()
+                            {
+                                q.pop();
+                            }
+                        }
+                        KeyKind::Char(c) if !mods.ctrl && !mods.alt && !mods.meta => {
+                            if let Some(q) = self.sessions[self.active_pane].ui.search_query.as_mut()
+                            {
+                                q.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    ctx.request_redraw();
+                    return;
+                }
                 if self.settings_open {
                     use tay_window::NamedKey;
                     let (cols,rows)=self.dims.unwrap_or((80,24));
@@ -3658,6 +3738,11 @@ impl Handler for TayApp {
                         });
                     }
                     ctx.request_redraw();
+                    return;
+                }
+                // 独立搜索:Ctrl+Shift+S(第二档,非 vi 模式)。
+                if crate::input::is_local(key.key, mods, "search") {
+                    self.open_search(ctx);
                     return;
                 }
                 // 剪贴板/命令块快捷键(第二档;表单一来源 input.rs)。
@@ -3886,8 +3971,25 @@ impl Handler for TayApp {
                                     log::info!("yank {len} 字节(会话版本 {})", revision.0);
                                 }
                             }
-                            SessionReply::Search { found, revision } => {
+                            SessionReply::Search {
+                                found,
+                                anchor,
+                                epoch,
+                                revision,
+                            } => {
                                 log::debug!("搜索命中: {found}(会话版本 {})", revision.0);
+                                if found {
+                                    // 记录命中锚点:「下一个」从其后继续
+                                    // (vi 模式 n/N 走光标,不用此记录)。
+                                    if let Some(anchor) = anchor {
+                                        self.sessions[self.active_pane].ui.search_last =
+                                            Some((anchor, epoch));
+                                    }
+                                } else {
+                                    // 明确未命中:轻量反馈(含世代过期/
+                                    // 锚点淘汰与 regex 无效)。
+                                    self.status("未找到匹配", ctx);
+                                }
                             }
                         }
                     }
@@ -4543,6 +4645,136 @@ mod tests {
         wait_offset(0, Instant::now() + Duration::from_secs(5));
         // 已在底部:快照仍为 0,再次调用不发送(门控不 panic)。
         app.jump_to_bottom_for_input();
+        app.finish_shutdown();
+        drop(app);
+    }
+
+    /// 独立搜索:视口顶起步 + 命中锚点回传 + 「下一个」回绕 +
+    /// 世代/淘汰校验。真实 PTY:20 行输出,仅第 5 行含唯一词
+    /// UNIQ;命中后视口把命中行滚进可见区。
+    #[test]
+    fn scrollback_search_anchors_wrap_and_epoch_guard() {
+        use crate::session::{HistoryAnchor, SearchStart, SessionCommand};
+        use std::time::{Duration, Instant};
+        let mut app = headless_app();
+        let tab = app
+            .start_session_with(40, 6, "/bin/sh".into(), None)
+            .unwrap();
+        app.install_session(tab);
+        let id = app.active_pane;
+        let sender = app.sessions[id].sender.as_ref().unwrap().clone();
+        let slot = app.sessions[id].slot.clone().unwrap();
+        let replies = app.sessions[id].reply_rx.clone().unwrap();
+        assert!(sender.send(SessionCommand::Input(
+            // 注意:命令行本身会被 shell 回显,若源码里出现连续
+            // "UNIQ",回显行也会命中 —— 用 printf 拼接构造该词。
+            b"W=$(printf 'U%s' 'NIQ'); i=1; while [ $i -le 20 ]; do if [ $i -eq 5 ]; then echo \"row $i $W\"; else echo \"row $i\"; fi; i=$((i+1)); done\n"
+                .to_vec()
+        )));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|update| update.snapshot.total_lines >= 21);
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "等待输出超时");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let snap = slot.lock().unwrap().as_ref().unwrap().snapshot.clone();
+        let top = HistoryAnchor(-(snap.display_offset as i32) + snap.meta.cum_scroll);
+        let epoch = snap.meta.invalidate_epoch;
+        let recv = |timeout: Duration| -> crate::session::SessionReply {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match replies.try_recv() {
+                    Ok(reply) => return reply,
+                    Err(_) => {
+                        assert!(Instant::now() < deadline, "等待搜索应答超时");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        };
+        // 首次:含视口顶行,向下 → 命中唯一词。
+        assert!(sender.send(SessionCommand::Search {
+            start: SearchStart::Anchor {
+                anchor: top,
+                epoch,
+                inclusive: true,
+            },
+            query: "UNIQ".into(),
+            dir: 1,
+            reply: replies.clone(),
+        }));
+        let hit = match recv(Duration::from_secs(5)) {
+            crate::session::SessionReply::Search { found, anchor, .. } => {
+                assert!(found);
+                anchor.unwrap()
+            }
+            other => panic!("预期搜索应答,得到 {other:?}"),
+        };
+        // 命中行进入可见区(视口顶 ≤ 锚点 < 顶 + 6 行)。
+        let after = slot.lock().unwrap().as_ref().unwrap().snapshot.clone();
+        let view_top = HistoryAnchor(-(after.display_offset as i32) + after.meta.cum_scroll);
+        assert!(view_top <= hit && hit.0 < view_top.0 + 6, "命中未滚进视口");
+        // 「下一个」(锚点行不含):唯一词之后无匹配 → 回绕再命中。
+        assert!(sender.send(SessionCommand::Search {
+            start: SearchStart::Anchor {
+                anchor: hit,
+                epoch,
+                inclusive: false,
+            },
+            query: "UNIQ".into(),
+            dir: 1,
+            reply: replies.clone(),
+        }));
+        match recv(Duration::from_secs(5)) {
+            crate::session::SessionReply::Search { found, anchor, .. } => {
+                assert!(found);
+                assert_eq!(anchor, Some(hit), "回绕应再次命中同一行");
+            }
+            other => panic!("预期搜索应答,得到 {other:?}"),
+        }
+        // 世代过期:明确未命中,不猜坐标。
+        assert!(sender.send(SessionCommand::Search {
+            start: SearchStart::Anchor {
+                anchor: top,
+                epoch: crate::session::AnchorEpoch(epoch.0 + 1),
+                inclusive: true,
+            },
+            query: "UNIQ".into(),
+            dir: 1,
+            reply: replies.clone(),
+        }));
+        match recv(Duration::from_secs(5)) {
+            crate::session::SessionReply::Search { found, anchor, .. } => {
+                assert!(!found);
+                assert!(anchor.is_none());
+            }
+            other => panic!("预期搜索应答,得到 {other:?}"),
+        }
+        // 无匹配:明确未命中。
+        assert!(sender.send(SessionCommand::Search {
+            start: SearchStart::Anchor {
+                anchor: top,
+                epoch,
+                inclusive: true,
+            },
+            query: "ZZZNOPE".into(),
+            dir: 1,
+            reply: replies.clone(),
+        }));
+        match recv(Duration::from_secs(5)) {
+            crate::session::SessionReply::Search { found, anchor, .. } => {
+                assert!(!found);
+                assert!(anchor.is_none());
+            }
+            other => panic!("预期搜索应答,得到 {other:?}"),
+        }
         app.finish_shutdown();
         drop(app);
     }
