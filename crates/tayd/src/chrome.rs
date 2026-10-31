@@ -825,11 +825,20 @@ mod tests {
         decorate(&mut grid, &items, "", &config, None, false, false);
         let tab = items.iter().find(|i| i.action == Action::Tab(0)).unwrap();
         assert_eq!(grid.cells[tab.start + 1].c, '1');
-        assert_eq!(grid.cells[tab.start + 1].fg, config.tab_bar.inactive_foreground);
+        assert_eq!(
+            grid.cells[tab.start + 1].fg,
+            config.tab_bar.inactive_foreground
+        );
         assert_eq!(grid.cells[tab.start + 2].c, ':');
-        assert_eq!(grid.cells[tab.start + 2].fg, config.tab_bar.inactive_foreground);
+        assert_eq!(
+            grid.cells[tab.start + 2].fg,
+            config.tab_bar.inactive_foreground
+        );
         assert_eq!(grid.cells[tab.start + 3].c, 's');
-        assert_eq!(grid.cells[tab.start + 3].fg, config.tab_bar.active_foreground);
+        assert_eq!(
+            grid.cells[tab.start + 3].fg,
+            config.tab_bar.active_foreground
+        );
         // 非活动标签:整体弱化,编号与标题无差异。
         let items = layout(120, &["one".into(), "two".into()], 0, false, &config, "");
         let mut grid = make_grid();

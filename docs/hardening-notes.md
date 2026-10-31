@@ -1463,3 +1463,20 @@ desktop-services/focus-product 八套烟测)见本轮验收结论。
 
 底角圆角明确不做:壁纸图像管线需单独圆角掩码,仅纯色背景可用则
 两态不一致,保持直角统一。
+
+## 输入前自动滚到底(2026-10-31)
+
+- 问题:视图停在滚动历史里时打字,输入照发但回显与光标都在
+  视口外(盲打);主流终端(VTE scroll-on-keystroke 默认开、
+  Windows Terminal、iTerm2)均为「打字即跳到底」。
+- 修复:`jump_to_bottom_for_input` —— 凡发往 shell 的输入
+  (按键/粘贴/IME/kitty 编码键)前,快照 display_offset > 0
+  且非 alt 屏幕时,先发 `ScrollDisplay(Scroll::Bottom)` 再发
+  输入(同一通道 FIFO,先滚再回显)。alt 屏幕无滚动历史,跳过。
+- 边界:vi 浏览、QuickSelect、折叠等本地动作走独立路径,不经过
+  该钩子 —— 回看历史不受打字打断;已在底部时门控跳过,不产生
+  空命令。
+- 验证:新单测 `shell_input_while_scrolled_jumps_to_bottom`
+  (真实 PTY:20 行输出 → 上滚 10 行 → 钩子 → 会话侧
+  display_offset 归零);全工作区测试 196+29+14 全绿,clippy/
+  fmt 干净。

@@ -2227,6 +2227,7 @@ impl TayApp {
     /// TAY_IME 验收钩子复用)。
     fn ime_commit(&mut self, text: String, ctx: &mut Ctx<'_>) {
         log::info!("IME 提交 {} 字节", text.len());
+        self.jump_to_bottom_for_input();
         if let Some(sender) = &self.sessions[self.active_pane].sender
             && !sender.send(SessionCommand::Input(text.into_bytes()))
         {
@@ -2253,6 +2254,7 @@ impl TayApp {
                 .as_ref()
                 .is_some_and(|s| s.mode.contains(TermMode::BRACKETED_PASTE));
             let bytes = crate::input::paste_bytes(&text, bracketed);
+            self.jump_to_bottom_for_input();
             if let Some(sender) = &self.sessions[self.active_pane].sender
                 && !sender.send(SessionCommand::Input(bytes))
             {
@@ -2287,6 +2289,7 @@ impl TayApp {
         } else {
             crate::keys::KeyEventType::Press
         };
+        self.jump_to_bottom_for_input();
         if (pressed || kitty_flags.report_events)
             && let Some(bytes) = crate::keys::translate_kitty(key, mods, &kitty_flags, event)
             && let Some(sender) = &self.sessions[self.active_pane].sender
@@ -2490,6 +2493,25 @@ impl TayApp {
             && let Some(sender) = &self.sessions[self.active_pane].sender
         {
             let _ = sender.send(SessionCommand::ScrollDisplay(Scroll::Delta(delta)));
+        }
+    }
+
+    /// 发往 shell 的输入(按键/粘贴/IME)前调用:视图停在滚动
+    /// 历史里时先滚到底 —— 输入的回显与光标都在底部,停在
+    /// 历史里打字等于盲打(VTE/Windows Terminal/iTerm2 同款
+    /// 行为)。只挂钩 shell 输入路径:vi 浏览、QuickSelect、
+    /// 折叠等本地动作不经过这里,回看历史不受打字打断。
+    /// alt 屏幕无滚动历史(display_offset 恒为 0),同样跳过。
+    /// 与输入走同一通道且先发送,FIFO 保证先滚再回显。
+    fn jump_to_bottom_for_input(&mut self) {
+        let Some(snap) = self.sessions[self.active_pane].snapshot.as_ref() else {
+            return;
+        };
+        if snap.mode.contains(TermMode::ALT_SCREEN) || snap.display_offset == 0 {
+            return;
+        }
+        if let Some(sender) = &self.sessions[self.active_pane].sender {
+            let _ = sender.send(SessionCommand::ScrollDisplay(Scroll::Bottom));
         }
     }
 
@@ -3667,6 +3689,7 @@ impl Handler for TayApp {
                 let app_cursor = self.sessions[self.active_pane].snapshot
                     .as_ref()
                     .is_some_and(|s| s.mode.contains(TermMode::APP_CURSOR));
+                self.jump_to_bottom_for_input();
                 if let Some(bytes) = crate::keys::translate(&key, mods, app_cursor)
                     && let Some(sender) = &self.sessions[self.active_pane].sender
                     && !sender.send(SessionCommand::Input(bytes))
@@ -4452,6 +4475,76 @@ mod tests {
         assert_eq!(app.layouts[0].root.ids().len(), 2);
         assert_eq!(app.sessions[app.active_pane].title, "first");
         app.finish_shutdown();
+    }
+
+    /// 视图停在滚动历史里时,发往 shell 的输入前先滚到底
+    /// (VTE/Windows Terminal 同款):40×6 视口输出 20 行 →
+    /// 上滚 10 行 → jump_to_bottom_for_input → 会话侧
+    /// display_offset 归零;已在底部时再调用为无害 no-op。
+    #[test]
+    fn shell_input_while_scrolled_jumps_to_bottom() {
+        use crate::session::SessionCommand;
+        use std::time::{Duration, Instant};
+        let mut app = headless_app();
+        let tab = app
+            .start_session_with(40, 6, "/bin/sh".into(), None)
+            .unwrap();
+        app.install_session(tab);
+        let id = app.active_pane;
+        let sender = app.sessions[id].sender.as_ref().unwrap().clone();
+        let slot = app.sessions[id].slot.clone().unwrap();
+        let wait_offset = |target: usize, deadline: Instant| loop {
+            if slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|update| update.snapshot.display_offset == target)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "等待 display_offset={target} 超时"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(sender.send(SessionCommand::Input(b"seq 1 20\n".to_vec())));
+        // 先等输出到场(滚动历史出现),再取世代、上滚。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|update| update.snapshot.total_lines >= 20);
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline, "等待输出超时");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let epoch = slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .meta
+            .invalidate_epoch;
+        assert!(sender.send(SessionCommand::ScrollToOffset { offset: 10, epoch }));
+        wait_offset(10, Instant::now() + Duration::from_secs(5));
+        // 回填 UI 侧快照(真实应用由 Wakeup 更新)。
+        app.sessions[id].snapshot = Some(slot.lock().unwrap().as_ref().unwrap().snapshot.clone());
+        assert_eq!(
+            app.sessions[id].snapshot.as_ref().unwrap().display_offset,
+            10
+        );
+        app.jump_to_bottom_for_input();
+        wait_offset(0, Instant::now() + Duration::from_secs(5));
+        // 已在底部:快照仍为 0,再次调用不发送(门控不 panic)。
+        app.jump_to_bottom_for_input();
+        app.finish_shutdown();
+        drop(app);
     }
 
     #[test]
