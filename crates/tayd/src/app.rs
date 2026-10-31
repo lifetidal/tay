@@ -2359,8 +2359,12 @@ impl TayApp {
         if self.sessions[self.active_pane].ui.search_query.is_some() {
             match key.key {
                 K::Named(N::Escape) => {
-                    self.sessions[self.active_pane].ui.search_prev =
-                        self.sessions[self.active_pane].ui.search_query.take();
+                    self.sessions[self.active_pane].ui.search_prev = self.sessions
+                        [self.active_pane]
+                        .ui
+                        .search_query
+                        .take()
+                        .filter(|q| !q.is_empty());
                     self.sessions[self.active_pane].ui.search_miss = None;
                     ctx.request_redraw();
                 }
@@ -2470,6 +2474,8 @@ impl TayApp {
         if query.is_empty() {
             return;
         }
+        // Enter 视为采纳预填查询:之后的编辑按追加语义。
+        pane.ui.search_fresh = false;
         let start = if pane.ui.search_standalone {
             let snap = pane.snapshot.clone();
             match (pane.ui.search_last, snap) {
@@ -2505,21 +2511,17 @@ impl TayApp {
     /// 搜索,起点 = 视口顶;Enter / Shift+Enter 循环下一个/上一个,
     /// Esc 关闭。输入期间按键全部由搜索栏消费。
     fn open_search(&mut self, ctx: &mut Ctx<'_>) {
-        let prefilled;
-        {
-            let pane = &mut self.sessions[self.active_pane];
-            pane.ui.search_query = pane.ui.search_prev.clone();
-            pane.ui.search_standalone = true;
-            pane.ui.search_last = None;
-            pane.ui.search_miss = None;
-            pane.ui.search_fresh = pane.ui.search_query.is_some();
-            prefilled = pane.ui.search_query.is_some();
-        }
+        let pane = &mut self.sessions[self.active_pane];
+        // 预填上次查询但**不立即重搜**:重开本身不移动视口
+        // (alacritty 同款 —— 高亮随下一次编辑/Enter 出现,
+        // 滚动只由搜索动作触发)。旧命中高亮若恰在视口内会
+        // 自然显示,与预填查询语义一致。
+        pane.ui.search_query = pane.ui.search_prev.clone();
+        pane.ui.search_standalone = true;
+        pane.ui.search_last = None;
+        pane.ui.search_miss = None;
+        pane.ui.search_fresh = pane.ui.search_query.is_some();
         ctx.request_redraw();
-        if prefilled {
-            // 预填上次查询并立即重搜(重开即回到上次命中场景)。
-            self.search_live(ctx);
-        }
     }
 
     /// 跳转到上一条/下一条提示符(DESIGN §8.4「跳转到上一条提示符」)。
@@ -3653,8 +3655,12 @@ impl Handler for TayApp {
                         use tay_window::NamedKey;
                         match key.key {
                             KeyKind::Named(NamedKey::Escape) => {
-                                self.sessions[self.active_pane].ui.search_prev =
-                                    self.sessions[self.active_pane].ui.search_query.take();
+                                self.sessions[self.active_pane].ui.search_prev = self
+                                    .sessions[self.active_pane]
+                                    .ui
+                                    .search_query
+                                    .take()
+                                    .filter(|q| !q.is_empty());
                                 self.sessions[self.active_pane].ui.search_standalone = false;
                                 self.sessions[self.active_pane].ui.search_last = None;
                                 self.sessions[self.active_pane].ui.search_miss = None;

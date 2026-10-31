@@ -1528,9 +1528,11 @@ desktop-services/focus-product 八套烟测)见本轮验收结论。
   发布,UI 折叠感知投影到显示行,渲染器新增独立色块(光标色
   55% 淡染,与鼠标/vi 选区蓝分开;`tay-render::Grid.search_hit`
   + `Renderer.search_hit_color`,热重载跟随)。未命中清空高亮。
-- **记住上次查询**:Esc 关闭时存入 `search_prev`;独立搜索重开
-  预填 + 立即重搜(`search_fresh` 标记:首次按键整体替换,打字
-  即新查询);vi 模式查询关闭后 n/N 也回退用上次查询。
+- **记住上次查询**:Esc 关闭时存入 `search_prev`(空查询不记);
+  独立搜索重开预填但**不立即重搜** —— 重开本身不移动视口,
+  高亮/滚动留给 Enter 或首次编辑(alacritty 同款);`search_fresh`
+  标记:首次按键整体替换(打字即新查询),Enter 采纳预填后改按
+  追加语义;vi 模式查询关闭后 n/N 也回退用上次查询。
 - **IME 进查询框**:搜索栏打开时 IME Commit 写入查询(不发往
   shell),预编辑不在终端光标处显示;独立搜索实时重搜,vi 查询
   保持 Enter 驱动。
