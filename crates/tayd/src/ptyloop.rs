@@ -27,71 +27,12 @@ use alacritty_terminal::vte::ansi::{
 };
 use polling::{Event as PollEvent, Poller};
 
-/// UI → 会话在途输入字节上限(**统一预算**,架构 §6):一个共享
-/// 计数器同时覆盖「跨线程消息」与「PTY 待写队列」—— 预留直到
-/// 字节实际写入 PTY、明确拒绝或会话结束才释放;已接受的输入不因
-/// 内部第二次预算检查丢失(会话端不再单独设更小的队列预算)。
-/// 超限**显式拒绝整块**(不静默截断、不破坏粘贴边界);
-/// 控制命令(Resize/Shutdown 等)不受预算影响。
-pub const MAX_INFLIGHT_INPUT_BYTES: usize = 512 * 1024;
-
-/// 发送端预算判定(纯函数):在途 + 本次 ≤ 上限。
-pub fn input_budget_ok(inflight: usize, incoming: usize) -> bool {
-    inflight
-        .checked_add(incoming)
-        .is_some_and(|n| n <= MAX_INFLIGHT_INPUT_BYTES)
-}
-
-/// 协议应答(终端 → PTY)的额外余量:应答必须送达,不计入用户
-/// 输入上限但计入在途 —— 在途总量超过「用户上限 + 余量」说明
-/// 应用在输入积压期间高频查询终端。高水位暂停读取;硬上限或
-/// 长期无进展时明确结束会话,不静默截断应答。
-pub const MAX_RESPONSE_SLACK_BYTES: usize = 256 * 1024;
-
-/// 在途总量(用户输入 + 协议应答)的健康上限(纯函数)。
-pub fn response_budget_ok(total_inflight: usize) -> bool {
-    total_inflight <= MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES
-}
-
-const RESPONSE_HIGH_WATER: usize = MAX_INFLIGHT_INPUT_BYTES + MAX_RESPONSE_SLACK_BYTES / 2;
-const RESPONSE_LOW_WATER: usize = MAX_INFLIGHT_INPUT_BYTES / 2;
-const RESPONSE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
-
-fn reserve_response(inflight: &std::sync::atomic::AtomicUsize, len: usize) -> bool {
-    inflight
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |cur| cur.checked_add(len).filter(|&n| response_budget_ok(n)),
-        )
-        .is_ok()
-}
-
-#[derive(Default)]
-struct Backpressure {
-    paused: bool,
-    last: usize,
-    progress_at: Option<Instant>,
-}
-impl Backpressure {
-    fn update(&mut self, bytes: usize, now: Instant) -> bool {
-        if !self.paused && bytes >= RESPONSE_HIGH_WATER {
-            self.paused = true;
-            self.progress_at = Some(now);
-        }
-        if self.paused {
-            if bytes <= RESPONSE_LOW_WATER {
-                self.paused = false;
-                self.progress_at = None;
-            } else if bytes < self.last {
-                self.progress_at = Some(now);
-            }
-        }
-        self.last = bytes;
-        self.progress_at
-            .is_some_and(|at| now.duration_since(at) >= RESPONSE_STALL_TIMEOUT)
-    }
-}
+mod flow;
+use flow::{
+    Backpressure, MAX_INFLIGHT_INPUT_BYTES, release_input, reserve_input, reserve_response,
+};
+#[cfg(test)]
+use flow::{MAX_RESPONSE_SLACK_BYTES, RESPONSE_HIGH_WATER, RESPONSE_LOW_WATER, response_budget_ok};
 
 /// Owns the worker, separately from cloneable input handles.
 pub(crate) struct SessionWorker {
@@ -162,28 +103,6 @@ impl Drop for SessionWorker {
     fn drop(&mut self) {
         self.request_stop();
     }
-}
-
-/// 原子预留:检查 + 预留一步完成(`fetch_update` 保证多发送者
-/// 并发时总预留不突破上限 —— 检查与预留之间无窗口)。
-fn reserve_input(inflight: &std::sync::atomic::AtomicUsize, len: usize) -> bool {
-    inflight
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |cur| input_budget_ok(cur, len).then_some(cur + len),
-        )
-        .is_ok()
-}
-
-/// 释放预留额度:饱和减 —— 会话退出统一清零后,并发的发送端
-/// 释放不会下溢。
-fn release_input(inflight: &std::sync::atomic::AtomicUsize, len: usize) {
-    let _ = inflight.fetch_update(
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-        |cur| Some(cur.saturating_sub(len)),
-    );
 }
 
 /// 消息的输入字节数(预算仅约束输入,控制命令不受影响)。

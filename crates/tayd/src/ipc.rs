@@ -1,6 +1,7 @@
 //! daemon 侧 IPC:单实例互斥 + Unix socket 监听线程。
 //!
-//! 协议:换行分隔文本命令,应答 `ok`(命令已入队)/ `error <msg>`。
+//! 协议:换行分隔文本命令,应答 `ok`(命令已由 UI 线程处理)、
+//! `pending <request-id>`(等待超时但仍可查询)或 `error <msg>`。
 //! 命令:`toggle` / `show` / `hide` / `quit` / `pin`。
 //!
 //! 单实例(DESIGN §4.1):flock 锁文件为权威互斥,socket 为其载体。
@@ -10,16 +11,99 @@
 //!
 //! 限制:单行 ≤ 4096 字节;并发处理线程 ≤ 16;读超时 5s。
 
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 const MAX_LINE: usize = 4096;
 const MAX_HANDLERS: usize = 16;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(4);
+const MAX_RETAINED_REQUESTS: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestState {
+    Queued,
+    Running,
+    Completed,
+}
+
+impl RequestState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Default)]
+struct RequestRegistry {
+    states: HashMap<String, RequestState>,
+    order: VecDeque<String>,
+}
+
+impl RequestRegistry {
+    fn insert(&mut self, id: String, state: RequestState) {
+        self.order.push_back(id.clone());
+        self.states.insert(id, state);
+        while self.order.len() > MAX_RETAINED_REQUESTS {
+            let Some(index) = self
+                .order
+                .iter()
+                .position(|oldest| self.states.get(oldest) == Some(&RequestState::Completed))
+            else {
+                break;
+            };
+            if let Some(oldest) = self.order.remove(index) {
+                self.states.remove(&oldest);
+            }
+        }
+    }
+
+    fn set(&mut self, id: &str, state: RequestState) {
+        if let Some(current) = self.states.get_mut(id) {
+            *current = state;
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        self.states.remove(id);
+        self.order.retain(|queued| queued != id);
+    }
+}
+
+static NEXT_REQUEST_ID: AtomicUsize = AtomicUsize::new(1);
+static REQUESTS: OnceLock<Mutex<RequestRegistry>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<RequestRegistry> {
+    REQUESTS.get_or_init(|| Mutex::new(RequestRegistry::default()))
+}
+
+fn request_status(id: &str) -> &'static str {
+    registry()
+        .lock()
+        .ok()
+        .and_then(|r| r.states.get(id).copied())
+        .map(RequestState::as_str)
+        .unwrap_or("unknown")
+}
+
+fn valid_request_id(id: &str) -> bool {
+    let Some((pid, sequence)) = id.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 /// socket 路径:$XDG_RUNTIME_DIR/tay.sock(回退 /tmp/tay-{uid}.sock)。
 pub fn socket_path() -> PathBuf {
@@ -100,14 +184,57 @@ fn bind_at(path: &std::path::Path) -> std::io::Result<UnixListener> {
 }
 
 /// 命令通道。
-pub fn channel() -> (SyncSender<IpcCommand>, Receiver<IpcCommand>) {
-    std::sync::mpsc::sync_channel::<IpcCommand>(128)
+pub struct IpcRequest {
+    pub command: IpcCommand,
+    request_id: Option<String>,
+    completion: Option<SyncSender<()>>,
+}
+
+impl IpcRequest {
+    pub fn fire_and_forget(command: IpcCommand) -> Self {
+        Self {
+            command,
+            request_id: None,
+            completion: None,
+        }
+    }
+
+    fn acknowledged(command: IpcCommand, request_id: String, completion: SyncSender<()>) -> Self {
+        Self {
+            command,
+            request_id: Some(request_id),
+            completion: Some(completion),
+        }
+    }
+
+    pub fn mark_started(&self) {
+        if let Some(id) = &self.request_id
+            && let Ok(mut requests) = registry().lock()
+        {
+            requests.set(id, RequestState::Running);
+        }
+    }
+
+    pub fn complete(self) {
+        if let Some(id) = &self.request_id
+            && let Ok(mut requests) = registry().lock()
+        {
+            requests.set(id, RequestState::Completed);
+        }
+        if let Some(completion) = self.completion {
+            let _ = completion.send(());
+        }
+    }
+}
+
+pub fn channel() -> (SyncSender<IpcRequest>, Receiver<IpcRequest>) {
+    std::sync::mpsc::sync_channel::<IpcRequest>(128)
 }
 
 /// 启动进程级 accept 服务;初始会话就绪后调用。新标签仍会创建 PTY。
 /// `wake`:命令入队后向事件循环写 1 字节唤醒(非阻塞,失败可忽略——
 /// 唤醒会被合并,下一轮事件自然处理)。
-pub fn accept_loop(listener: UnixListener, tx: SyncSender<IpcCommand>, wake: Arc<UnixStream>) {
+pub fn accept_loop(listener: UnixListener, tx: SyncSender<IpcRequest>, wake: Arc<UnixStream>) {
     let handlers = Arc::new(AtomicUsize::new(0));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -154,7 +281,16 @@ pub enum IpcCommand {
     Restore,
 }
 
-fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixStream>) {
+fn handle_client(stream: UnixStream, tx: SyncSender<IpcRequest>, wake: Arc<UnixStream>) {
+    handle_client_with_timeout(stream, tx, wake, COMPLETION_TIMEOUT);
+}
+
+fn handle_client_with_timeout(
+    stream: UnixStream,
+    tx: SyncSender<IpcRequest>,
+    wake: Arc<UnixStream>,
+    completion_timeout: Duration,
+) {
     let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let mut reader = BufReader::new(stream.try_clone().unwrap_or(stream));
     let mut line = String::new();
@@ -173,6 +309,15 @@ fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixS
         let cmd = line.trim();
         if cmd == "status" {
             let _ = writeln!(reader.get_mut(), "{}", crate::health::snapshot());
+            continue;
+        }
+        if let Some(id) = cmd.strip_prefix("request-status ") {
+            let state = if valid_request_id(id) {
+                request_status(id)
+            } else {
+                "unknown"
+            };
+            let _ = writeln!(reader.get_mut(), "request-status {state}");
             continue;
         }
         let parsed = match cmd {
@@ -205,11 +350,37 @@ fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixS
             }
         };
         if let Some(c) = parsed {
-            // 语义:ok = 命令已入队(接收确认);操作完成状态见 daemon 日志。
-            if tx.try_send(c).is_ok() {
+            // 应答延后到 UI 线程处理命令后发送;它不等于动画或退出流程完成。
+            let request_id = format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            if let Ok(mut requests) = registry().lock() {
+                requests.insert(request_id.clone(), RequestState::Queued);
+            }
+            let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+            if tx
+                .try_send(IpcRequest::acknowledged(
+                    c,
+                    request_id.clone(),
+                    completion_tx,
+                ))
+                .is_ok()
+            {
                 let _ = (&*wake).write(&[0]);
-                let _ = writeln!(reader.get_mut(), "ok");
+                match completion_rx.recv_timeout(completion_timeout) {
+                    Ok(()) => {
+                        let _ = writeln!(reader.get_mut(), "ok");
+                    }
+                    Err(_) => {
+                        let _ = writeln!(reader.get_mut(), "pending {request_id}");
+                    }
+                }
             } else {
+                if let Ok(mut requests) = registry().lock() {
+                    requests.remove(&request_id);
+                }
                 let _ = writeln!(reader.get_mut(), "error daemon 忙碌或正在退出");
                 break;
             }
@@ -223,6 +394,81 @@ fn handle_client(stream: UnixStream, tx: SyncSender<IpcCommand>, wake: Arc<UnixS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_completion_is_signaled_only_after_dispatch() {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let request = IpcRequest::acknowledged(IpcCommand::Show, "0-0".into(), done_tx);
+        assert!(done_rx.try_recv().is_err());
+        assert_eq!(request.command, IpcCommand::Show);
+        request.complete();
+        assert_eq!(done_rx.recv_timeout(Duration::from_millis(20)), Ok(()));
+    }
+
+    fn query_request_status(id: &str, tx: SyncSender<IpcRequest>, wake: Arc<UnixStream>) -> String {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            handle_client_with_timeout(server, tx, wake, Duration::from_millis(20));
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        writeln!(client, "request-status {id}").unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        drop(reader);
+        drop(client);
+        server_thread.join().unwrap();
+        response.trim().to_string()
+    }
+
+    #[test]
+    fn socket_timeout_returns_queryable_id_and_quit_dispatch_completes() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let (wake, _wake_reader) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let wake = Arc::new(wake);
+        let (tx, rx) = std::sync::mpsc::sync_channel(4);
+        let server_tx = tx.clone();
+        let server_wake = wake.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_client_with_timeout(server, server_tx, server_wake, Duration::from_millis(20));
+        });
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+
+        writeln!(client, "quit").unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        let id = response
+            .trim()
+            .strip_prefix("pending ")
+            .unwrap()
+            .to_string();
+        assert!(valid_request_id(&id));
+
+        assert_eq!(
+            query_request_status(&id, tx.clone(), wake.clone()),
+            "request-status queued"
+        );
+        drop(reader);
+        drop(client);
+        server_thread.join().unwrap();
+
+        let request = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request.command, IpcCommand::Quit);
+        request.mark_started();
+        assert_eq!(
+            query_request_status(&id, tx.clone(), wake.clone()),
+            "request-status running"
+        );
+
+        request.complete();
+        assert_eq!(
+            query_request_status(&id, tx, wake),
+            "request-status completed"
+        );
+    }
 
     /// 临时目录(每测试独立子目录,避免并行测试互相删除;
     /// 绝不碰真实 XDG_RUNTIME_DIR / 运行中 socket)。

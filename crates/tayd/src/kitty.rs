@@ -103,7 +103,15 @@ pub fn decode_payload(
     let rgba = match f {
         // PNG:尺寸从数据读取。
         100 => {
-            let img = image::load_from_memory(&decoded).ok()?;
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(&decoded))
+                .with_guessed_format()
+                .ok()?;
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(4096);
+            limits.max_image_height = Some(4096);
+            limits.max_alloc = Some(MAX_RGBA_BYTES as u64);
+            reader.limits(limits);
+            let img = reader.decode().ok()?;
             let rgba_img = img.to_rgba8();
             let (iw, ih) = rgba_img.dimensions();
             let pixels = iw as u64 * ih as u64;

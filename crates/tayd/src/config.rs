@@ -11,9 +11,21 @@
 //! - **需重启**:shell(已启动)、
 //!   output(已绑定)、start_hidden(启动时消费)。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use tay_config::Config;
+
+static FILE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Called by the filesystem watcher for each observed config-directory event.
+pub(crate) fn config_file_changed() -> u64 {
+    FILE_GENERATION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+pub(crate) fn config_file_generation() -> u64 {
+    FILE_GENERATION.load(Ordering::Relaxed)
+}
 
 /// 热重载尝试的结果。
 #[derive(Debug, Clone, PartialEq)]

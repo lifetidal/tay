@@ -93,6 +93,9 @@ pub(crate) fn run() {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let mut watcher = match RecommendedWatcher::new(
                 move |event: notify::Result<notify::Event>| {
+                    if event.is_ok() {
+                        crate::config::config_file_changed();
+                    }
                     let _ = tx.try_send(event);
                 },
                 notify::Config::default(),

@@ -1,5 +1,5 @@
 //! StatusNotifierItem remains available while the Wayland surface is unmapped.
-use crate::ipc::IpcCommand;
+use crate::ipc::{IpcCommand, IpcRequest};
 use ksni::blocking::TrayMethods;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -9,14 +9,18 @@ use std::sync::{
 };
 
 struct Tray {
-    tx: SyncSender<IpcCommand>,
+    tx: SyncSender<IpcRequest>,
     wake: Arc<UnixStream>,
     shortcut_status: String,
     icon: Vec<ksni::Icon>,
 }
 impl Tray {
     fn send(&self, action: IpcCommand) {
-        if self.tx.try_send(action).is_ok() {
+        if self
+            .tx
+            .try_send(IpcRequest::fire_and_forget(action))
+            .is_ok()
+        {
             let _ = (&*self.wake).write(&[0]);
         }
     }
@@ -94,7 +98,7 @@ fn icon() -> Vec<ksni::Icon> {
 }
 
 pub fn spawn(
-    tx: SyncSender<IpcCommand>,
+    tx: SyncSender<IpcRequest>,
     wake: Arc<UnixStream>,
     status: String,
 ) -> SyncSender<String> {
@@ -148,11 +152,11 @@ mod tests {
             icon: vec![],
         };
         tray.activate(0, 0);
-        assert!(matches!(rx.recv().unwrap(), IpcCommand::Toggle));
+        assert_eq!(rx.recv().unwrap().command, IpcCommand::Toggle);
         use std::io::Read;
         reader.read_exact(&mut [0]).unwrap();
         tray.secondary_activate(0, 0);
-        assert!(matches!(rx.recv().unwrap(), IpcCommand::Settings));
+        assert_eq!(rx.recv().unwrap().command, IpcCommand::Settings);
         assert!(tray.tool_tip().description.contains("未分配"));
     }
     #[test]

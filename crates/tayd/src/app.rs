@@ -24,7 +24,9 @@ use crate::session::{
 };
 use tay_config::{Config, Rgb};
 use tay_render::wgpu;
-use tay_window::{Ctx, Event as WEvent, Handler, ImeEvent, KeyKind, MouseButtonIdx};
+use tay_window::{Ctx, Event as WEvent, Handler, ImeEvent, KeyKind, Mods, MouseButtonIdx};
+
+mod ipc_dispatch;
 
 /// 栏内时钟(HH:MM,本地时区;libc localtime,无第三方依赖)。
 /// 每分钟随一次唤醒重绘更新(见 render 的 request_wake_at)。
@@ -315,8 +317,8 @@ pub struct TayApp {
     shown_once: bool,
     show_at: Option<Instant>,
     ipc_listener: Option<std::os::unix::net::UnixListener>,
-    ipc_tx: mpsc::SyncSender<crate::ipc::IpcCommand>,
-    ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
+    ipc_tx: mpsc::SyncSender<crate::ipc::IpcRequest>,
+    ipc_rx: mpsc::Receiver<crate::ipc::IpcRequest>,
     hotkey_tx: mpsc::SyncSender<crate::hotkey::HotkeyTriggered>,
     hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
     wake: Arc<UnixStream>,
@@ -352,10 +354,26 @@ pub struct TayApp {
     /// 不触发 stalled 看门狗)。
     slowui_at_start: bool,
     config_mtime: Option<std::time::SystemTime>,
-    config_reload: Option<mpsc::Receiver<Result<Config, String>>>,
+    config_reload: Option<mpsc::Receiver<(u64, Result<Config, String>)>>,
+    config_generation: u64,
     /// Ctrl 键当前是否按住(键盘事件携带 mods;Ctrl+点击打开
     /// OSC 8 超链接时用 —— 指针事件不带修饰键状态)。
     ctrl_held: bool,
+    /// 指针交互用当前修饰键(ModifiersChanged/键盘事件维护;鼠标
+    /// 上报的修饰位来源,失焦清空)。
+    pointer_mods: Mods,
+    /// 鼠标上报按下追踪:按下的窗格与按键(松开/拖动路由回它,
+    /// 不受指针越过栏、分隔条或窗口外影响)。
+    mouse_pane: Option<PaneId>,
+    mouse_button: Option<MouseButtonIdx>,
+    /// 最近指针位置(滚轮事件无坐标,用它补)。
+    last_pointer: Option<(f64, f64)>,
+    /// 高分辨率滚轮像素余数(折算行数,鼠标上报用)。
+    mouse_scroll_px: f32,
+    /// TAY_MOUSE 验收状态机(0 等模式就绪注入,1 等回执比对)。
+    mouse_smoke: Option<u8>,
+    /// TAY_MOUSE 注入阶段的期望字节(注入时定格,比对用)。
+    mouse_smoke_expected: Option<Vec<u8>>,
     /// 最近一次热重载失败的配置 mtime(同一版本只告警一次,修复后自动恢复)。
     config_error_at: Option<std::time::SystemTime>,
     /// 持久剪贴板(Wayland 上数据归属存活连接:每用新建即弃可能丢数据,
@@ -433,8 +451,8 @@ impl TayApp {
         paste_at_start: bool,
         slowui_at_start: bool,
         ipc_listener: Option<std::os::unix::net::UnixListener>,
-        ipc_tx: mpsc::SyncSender<crate::ipc::IpcCommand>,
-        ipc_rx: mpsc::Receiver<crate::ipc::IpcCommand>,
+        ipc_tx: mpsc::SyncSender<crate::ipc::IpcRequest>,
+        ipc_rx: mpsc::Receiver<crate::ipc::IpcRequest>,
         hotkey_tx: mpsc::SyncSender<crate::hotkey::HotkeyTriggered>,
         hotkey_rx: mpsc::Receiver<crate::hotkey::HotkeyTriggered>,
         wake: Arc<UnixStream>,
@@ -514,7 +532,15 @@ impl TayApp {
             slowui_at_start,
             config_mtime: None,
             config_reload: None,
+            config_generation: u64::MAX,
             ctrl_held: false,
+            pointer_mods: Mods::default(),
+            mouse_pane: None,
+            mouse_button: None,
+            last_pointer: None,
+            mouse_scroll_px: 0.0,
+            mouse_smoke: std::env::var_os("TAY_MOUSE").map(|_| 0),
+            mouse_smoke_expected: None,
             config_error_at: None,
             clipboard: arboard::Clipboard::new().ok(),
         }
@@ -4189,45 +4215,9 @@ impl Handler for TayApp {
                         _ => {}
                     }
                 }
-                // IPC 命令(`tay toggle` 等)。
-                while let Ok(cmd) = self.ipc_rx.try_recv() {
-                    match cmd {
-                        crate::ipc::IpcCommand::Toggle => self.toggle(ctx),
-                        crate::ipc::IpcCommand::Show => self.show(ctx),
-                        crate::ipc::IpcCommand::Hide => self.hide(ctx),
-                        crate::ipc::IpcCommand::ForceQuit => { self.shutdown(ctx); return; }
-                        crate::ipc::IpcCommand::ConfirmClose => {
-                            if let Some(target) = self.pending_close.take() { self.execute_close(target,ctx); }
-                        }
-                        crate::ipc::IpcCommand::CancelClose => { self.pending_close=None;ctx.request_redraw(); }
-                        crate::ipc::IpcCommand::Quit => {
-                            log::info!("收到 quit");
-                            self.request_close(PendingClose::Window, ctx);
-                        }
-                        crate::ipc::IpcCommand::SplitRight => self.split_pane(Axis::Columns,ctx),
-                        crate::ipc::IpcCommand::SplitDown => self.split_pane(Axis::Rows,ctx),
-                        crate::ipc::IpcCommand::NextPane => self.next_pane(ctx),
-                        crate::ipc::IpcCommand::ClosePane => self.request_close(PendingClose::Panes(vec![self.active_pane]),ctx),
-                        crate::ipc::IpcCommand::ZoomPane => self.zoom_pane(ctx),
-                        crate::ipc::IpcCommand::NewTab => {self.new_tab(ctx);self.show(ctx);},
-                        crate::ipc::IpcCommand::NextTab => self.switch_tab((self.active_index()+1)%self.layouts.len(),ctx),
-                        crate::ipc::IpcCommand::CloseTab => self.close_tab(self.active_index(),ctx),
-                        crate::ipc::IpcCommand::Maximize => {if !self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
-                        crate::ipc::IpcCommand::Restore => {if self.maximized {self.chrome_action(crate::chrome::Action::Maximize,ctx);}self.show(ctx);},
-                        crate::ipc::IpcCommand::Settings => {self.animate_settings(true);self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
-                        crate::ipc::IpcCommand::SettingsPage(page) => {self.animate_settings(true);self.settings_page=page;self.settings_focus=0;self.editing=None;self.settings_drag=None;self.settings_feedback.clear();self.show(ctx);ctx.request_redraw();},
-                        crate::ipc::IpcCommand::Pin => {
-                            let pinned = self.vis.toggle_pin();
-                            log::info!(
-                                "固定显示: {}",
-                                if pinned {
-                                    "开(失焦不再自动隐藏)"
-                                } else {
-                                    "关"
-                                }
-                            );
-                        }
-                    }
+                // IPC 命令分发独立于事件循环的其他职责。
+                if self.dispatch_ipc_commands(ctx) {
+                    return;
                 }
                 // portal 热键。
                 while let Ok(event)=self.hotkey_rx.try_recv(){match event{crate::hotkey::HotkeyTriggered::Toggle=>self.toggle(ctx),crate::hotkey::HotkeyTriggered::Status(s)=>{
@@ -4246,33 +4236,44 @@ impl Handler for TayApp {
                 let path = tay_config::Config::config_path();
                 let mtime = std::fs::metadata(path).ok().and_then(|m|m.modified().ok());
                 if let Some(mtime) = mtime {
-                    if self.config_mtime != Some(mtime) && self.config_reload.is_none() {
+                    let generation = crate::config::config_file_generation();
+                    if (self.config_mtime != Some(mtime) || self.config_generation != generation)
+                        && self.config_reload.is_none() {
                         self.config_mtime = Some(mtime);
+                        self.config_generation = generation;
                         let (tx, rx) = mpsc::channel();
                         self.config_reload = Some(rx);
                         let wake = self.wake.clone();
                         std::thread::spawn(move || {
-                            let _ = tx.send(tay_config::Config::try_load());
+                            let _ = tx.send((generation, tay_config::Config::try_load()));
                             let _ = (&*wake).write(&[0]);
                         });
                     }
-                    let loaded = self.config_reload.as_ref().and_then(|rx| match rx.try_recv() {
-                        Ok(r) => Some(r),
-                        Err(mpsc::TryRecvError::Disconnected) => Some(Err("配置加载线程已退出".into())),
-                        Err(mpsc::TryRecvError::Empty) => None,
-                    });
-                    if let Some(loaded) = loaded {
+                    let loaded = self
+                        .config_reload
+                        .as_ref()
+                        .and_then(|rx| match rx.try_recv() {
+                            Ok(r) => Some(r),
+                            Err(mpsc::TryRecvError::Disconnected) => Some((
+                                self.config_generation,
+                                Err("配置加载线程已退出".into()),
+                            )),
+                            Err(mpsc::TryRecvError::Empty) => None,
+                        });
+                    if let Some((loaded_generation, loaded)) = loaded {
                         self.config_reload = None;
-                        // Discard results for an older file version and schedule the latest.
-                        if self.config_mtime != Some(mtime) {
+                        // Discard results if any filesystem event arrived during loading,
+                        // even when the filesystem timestamp has not advanced.
+                        if loaded_generation != crate::config::config_file_generation()
+                            || self.config_mtime != Some(mtime) {
                             let _ = (&*self.wake).write(&[0]);
                             return;
                         }
-                            let decision = crate::config::reload_decision(
-                                mtime,
-                                &mut self.config_error_at,
-                                loaded,
-                            );
+                        let decision = crate::config::reload_decision(
+                            mtime,
+                            &mut self.config_error_at,
+                            loaded,
+                        );
                             match decision {
                             // 失败时保留上次有效配置:半成品文件不能把界面打回默认值。
                                 crate::config::Reload::Ok(fresh) => {

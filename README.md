@@ -22,6 +22,7 @@ sudo pacman -U ./dist/arch/tay-0.1.0-43-$(uname -m).pkg.tar.zst
 
 ```bash
 cargo build --release
+mkdir -p ~/.local/bin
 install -Dm755 target/release/{tay,tayd} ~/.local/bin/
 ```
 
@@ -82,7 +83,7 @@ tay toggle      # 呼出 / 收起
 每个标签最多 8 个窗格，全部标签合计最多 24 个会话。窗口过小时暂时只显示
 焦点窗格，放大后恢复布局。布局和工作目录每秒采样，由后台线程合并保存；正常退出会保存最终状态。
 异常退出后下次启动自动恢复，正常退出后可用 `tay resurrect` 恢复。
-只恢复 Shell、目录和布局，不恢复运行中的命令与滚动历史。
+恢复会重新启动 Shell，并还原目录和布局；不会恢复当时运行中的进程、命令状态或滚动历史。
 
 快捷键可在 Lua `keys` 中覆盖，action 名称与上表命令相同。
 
@@ -208,6 +209,8 @@ opacity = 0.85, -- 终端纯色背景不透明度
 
 `tay status` 查询运行中的 daemon，显示实际快捷键绑定反馈、窗口及 GPU 阶段、
 模糊请求与应用状态、配置路径、会话数量和最近反馈；不会启动新 daemon。
+IPC 命令等待 UI 分发最多 4 秒；超时会返回请求 ID，而不会报告失败，命令仍可能继续执行。用
+`tay request-status <请求 ID>` 查询 `queued`、`running` 或 `completed`；`completed` 表示 UI 已处理请求，不表示动画结束或 `tay quit` 的关闭确认已完成。daemon 保留最近 256 个请求状态，重启后旧 ID 不再可查。
 `tay doctor` 同时显示环境能力与运行状态。Portal 接口可用不等于快捷键已获授权。
 托盘显示实际快捷键、窗口状态与标签数量。安装升级后需保存工作并重启 daemon。
 
@@ -219,6 +222,7 @@ Tay 当前要求 Wayland、wlr-layer-shell，以及可用的 GPU 渲染后端。
 不提供 layer-shell 的桌面当前无法启动 Tay，没有普通窗口回退。
 模糊是可选增强，依赖桌面提供 KDE 模糊协议；物理快捷键、输入法、多屏及分数缩放
 仍应在目标桌面人工验收，自动化通过不代表这些环境全部通过。
+逐项状态见[合成器实测矩阵](docs/compositor-matrix.md)。
 
 设置面板支持 Tab / Shift+Tab 或方向键导航、Enter 操作、Esc 关闭；
 `tay settings appearance`、`tay settings background`、`tay settings shortcuts` 可直达页面。

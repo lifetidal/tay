@@ -36,7 +36,7 @@ fn session_file() -> PathBuf {
 fn send(cmd: &str) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket_path()).map_err(|_| "daemon 未运行".to_string())?;
     stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
+        .set_read_timeout(Some(Duration::from_secs(6)))
         .map_err(|e| e.to_string())?;
     writeln!(stream, "{cmd}").map_err(|e| e.to_string())?;
     let mut line = String::new();
@@ -44,6 +44,29 @@ fn send(cmd: &str) -> Result<String, String> {
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
     Ok(line.trim().to_string())
+}
+
+fn report_response(response: &str) -> bool {
+    if response == "ok" {
+        return true;
+    }
+    if let Some(id) = response.strip_prefix("pending ") {
+        println!(
+            "命令仍在处理中；使用 `tay request-status {id}` 查询状态。daemon 最多保留最近 256 个请求状态。"
+        );
+        return true;
+    }
+    false
+}
+
+fn valid_request_id(id: &str) -> bool {
+    let Some((pid, sequence)) = id.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !sequence.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && sequence.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// 拉起 daemon(tayd 需在 PATH 或与 tay 同目录)。
@@ -125,7 +148,7 @@ fn cmd_doctor() {
         if daemon {
             "✓ 运行中"
         } else {
-            "未运行(tay toggle 会自动拉起)"
+            "未运行(呼出/操作命令会自动拉起；退出类命令直接结束)"
         }
     );
     if daemon {
@@ -214,7 +237,28 @@ fn cmd_keys() -> std::io::Result<()> {
 // it is reparented to the system's process reaper. Waiting would hang `tay`.
 #[allow(clippy::zombie_processes)]
 fn main() {
-    let cmd = std::env::args().nth(1).unwrap_or_else(|| "toggle".into());
+    let mut cmd = std::env::args().nth(1).unwrap_or_else(|| "toggle".into());
+    if cmd == "request-status" {
+        let Some(id) = std::env::args().nth(2) else {
+            eprintln!("用法: tay request-status <请求 ID>");
+            std::process::exit(2);
+        };
+        if !valid_request_id(&id) {
+            eprintln!("tay: 无效的请求 ID");
+            std::process::exit(2);
+        }
+        cmd = format!("request-status {id}");
+    }
+    if cmd.starts_with("request-status ") {
+        match send(&cmd) {
+            Ok(response) => println!("{response}"),
+            Err(error) => {
+                eprintln!("tay request-status: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let cmd = if cmd == "quit" && std::env::args().nth(2).as_deref() == Some("--force") {
         "quit-force".into()
     } else {
@@ -308,7 +352,7 @@ fn main() {
             loop {
                 std::thread::sleep(Duration::from_millis(50));
                 if let Ok(resp) = send("show") {
-                    if resp != "ok" {
+                    if !report_response(&resp) {
                         eprintln!("tay: {resp}");
                         std::process::exit(1);
                     }
@@ -335,7 +379,7 @@ fn main() {
         "--daemon" => return, // 被 CLI 拉起时:正常初始化 daemon
         _ => {
             eprintln!(
-                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|split-right|split-down|next-pane|close-pane|zoom-pane|settings|maximize|restore|resurrect|config|keys|status|doctor|confirm-close|cancel-close](默认 toggle；quit --force 跳过保护)"
+                "用法: tay [toggle|show|hide|quit|pin|new-tab|next-tab|close-tab|split-right|split-down|next-pane|close-pane|zoom-pane|settings|maximize|restore|resurrect|config|keys|status|request-status <ID>|doctor|confirm-close|cancel-close](默认 toggle；quit --force 跳过保护)"
             );
             std::process::exit(2);
         }
@@ -343,7 +387,7 @@ fn main() {
 
     match send(&cmd) {
         Ok(resp) => {
-            if resp != "ok" {
+            if !report_response(&resp) {
                 eprintln!("tay: {resp}");
                 std::process::exit(1);
             }
@@ -366,7 +410,7 @@ fn main() {
             loop {
                 std::thread::sleep(Duration::from_millis(50));
                 if let Ok(resp) = send(startup_cmd) {
-                    if resp != "ok" {
+                    if !report_response(&resp) {
                         eprintln!("tay: {resp}");
                         std::process::exit(1);
                     }
