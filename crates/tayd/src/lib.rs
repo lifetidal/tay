@@ -11,6 +11,7 @@ mod input;
 mod ipc;
 mod keys;
 mod kitty;
+mod mouse;
 mod persist;
 mod ptyloop;
 mod quickselect;

@@ -53,11 +53,12 @@ const BELL_FLASH: Duration = Duration::from_millis(140);
 /// 可视铃最大混色强度(背景 → 闪光色的线性插值系数)。
 const BELL_FLASH_MAX: f32 = 0.30;
 
-/// 修饰键事件可能没有对应的普通按键事件;失焦后也不能保留 Ctrl。
-fn pointer_ctrl_state(event: &WEvent) -> Option<bool> {
+/// 修饰键事件可能没有对应的普通按键事件;失焦后清空(指针交互
+/// 用:鼠标上报的修饰位与 Ctrl+点击链接判断共用)。
+fn pointer_mods_state(event: &WEvent) -> Option<Mods> {
     match event {
-        WEvent::ModifiersChanged(mods) | WEvent::Keyboard { mods, .. } => Some(mods.ctrl),
-        WEvent::Focused(false) => Some(false),
+        WEvent::ModifiersChanged(mods) | WEvent::Keyboard { mods, .. } => Some(*mods),
+        WEvent::Focused(false) => Some(Mods::default()),
         _ => None,
     }
 }
@@ -586,6 +587,7 @@ impl TayApp {
 
     /// 收起。
     fn hide(&mut self, ctx: &mut Ctx<'_>) {
+        self.cancel_mouse_press();
         self.sessions[self.active_pane].ui.scrollbar_drag = None;
         self.sessions[self.active_pane].ui.dragging = false;
         self.divider_hover = None;
@@ -821,6 +823,7 @@ impl TayApp {
         if id == self.active_pane {
             return;
         }
+        self.cancel_mouse_press();
         self.sessions[self.active_pane].ui.kitty_down.clear();
         self.sessions[self.active_pane].ui.dragging = false;
         self.sessions[self.active_pane].ui.quick = None;
@@ -1175,6 +1178,7 @@ impl TayApp {
         ctx.request_redraw();
     }
     fn request_close(&mut self, target: PendingClose, ctx: &mut Ctx<'_>) {
+        self.cancel_mouse_press();
         let ids = match &target {
             PendingClose::Window => self.sessions.iter().map(|(id, _)| id).collect(),
             PendingClose::Panes(ids) => ids.clone(),
@@ -1209,6 +1213,11 @@ impl TayApp {
         ctx.request_redraw();
     }
     fn remove_session(&mut self, id: PaneId) {
+        // 按住期间窗格被移除(shell 自行退出):清追踪,后续移动/
+        // 松开不再索引已删除的会话。
+        if self.mouse_pane == Some(id) {
+            self.cancel_mouse_press();
+        }
         self.divider_drag = None;
         if let Some(mut worker) = self.sessions[id].worker.take() {
             worker.request_stop();
@@ -1404,6 +1413,7 @@ impl TayApp {
                 }
             }
             Action::Settings => {
+                self.cancel_mouse_press();
                 self.animate_settings(!self.settings_open);
                 self.editing = None;
                 self.settings_focus = 0;
@@ -2267,6 +2277,205 @@ impl TayApp {
         ))
     }
 
+    /// 指针下的窗格与该窗格内 1 起始单元坐标(窗格矩形内)。
+    fn pane_cell_at(&self, x: f64, y: f64) -> Option<(PaneId, u32, u32)> {
+        let (c, r) = self.window_cell(x, y)?;
+        for (id, rect) in self.pane_geometry().0 {
+            if rect.contains(c, r) {
+                return Some((
+                    id,
+                    c.saturating_sub(rect.x) as u32 + 1,
+                    r.saturating_sub(rect.y) as u32 + 1,
+                ));
+            }
+        }
+        None
+    }
+
+    /// 相对指定窗格、钳制进其网格的单元坐标(拖出网格/窗口时钳到
+    /// 边缘 —— Wayland 隐式抓取下松开可能落在窗口外)。
+    fn pane_cell_clamped(&self, id: PaneId, x: f64, y: f64) -> Option<(u32, u32)> {
+        let (c, r) = self.window_cell(x, y)?;
+        let rect = self
+            .pane_geometry()
+            .0
+            .into_iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, rect)| rect)?;
+        Some((
+            (c as i64 - rect.x as i64).clamp(0, rect.w.max(1) as i64 - 1) as u32 + 1,
+            (r as i64 - rect.y as i64).clamp(0, rect.h.max(1) as i64 - 1) as u32 + 1,
+        ))
+    }
+
+    /// 窗格当前的鼠标上报编码:未启用任何鼠标模式 → None。
+    fn pane_mouse_encoding(&self, id: PaneId) -> Option<crate::mouse::MouseEncoding> {
+        let snap = self.sessions[id].snapshot.as_ref()?;
+        snap.mode.intersects(TermMode::MOUSE_MODE).then_some(if snap.mode.contains(TermMode::SGR_MOUSE) {
+            crate::mouse::MouseEncoding::Sgr
+        } else {
+            crate::mouse::MouseEncoding::X10
+        })
+    }
+
+    /// 清鼠标按下追踪(松开被本地消费/模态打开/隐藏/切换时)。
+    fn cancel_mouse_press(&mut self) {
+        self.mouse_pane = None;
+        self.mouse_button = None;
+    }
+
+    /// 鼠标序列进 PTY(与按键同一通道与预算);失败给可见反馈。
+    fn send_input(&mut self, id: PaneId, bytes: Vec<u8>, ctx: &mut Ctx<'_>) {
+        if let Some(sender) = &self.sessions[id].sender
+            && !sender.send(SessionCommand::Input(bytes))
+        {
+            self.status("输入被拒绝:终端积压,请稍后再试", ctx);
+        }
+    }
+
+    /// 鼠标上报路由:窗格启用鼠标模式时,指针事件编码为鼠标序列
+    /// 写进 PTY,本地拖选让位。消费返回 true。
+    fn mouse_report(&mut self, event: &WEvent, ctx: &mut Ctx<'_>) -> bool {
+        match event {
+            WEvent::PointerButton { button, pressed, x, y } => {
+                self.last_pointer = Some((*x, *y));
+                let Some(code) = crate::mouse::button_code(*button) else {
+                    return false;
+                };
+                if *pressed {
+                    let Some((id, col, row)) = self.pane_cell_at(*x, *y) else {
+                        return false;
+                    };
+                    let Some(enc) = self.pane_mouse_encoding(id) else {
+                        return false;
+                    };
+                    let bytes = crate::mouse::press(enc, code, &self.pointer_mods, col, row);
+                    if let Some(sender) = &self.sessions[id].sender {
+                        if sender.send(SessionCommand::Input(bytes)) {
+                            self.mouse_pane = Some(id);
+                            self.mouse_button = Some(*button);
+                            return true;
+                        }
+                        self.status("输入被拒绝:终端积压,请稍后再试", ctx);
+                    }
+                    false
+                } else {
+                    let Some(id) = self.mouse_pane else {
+                        return false;
+                    };
+                    // 应用中途关闭鼠标模式:不再发松开(避免把序列
+                    // 当文本写进 PTY),只清状态。
+                    let Some(enc) = self.pane_mouse_encoding(id) else {
+                        self.cancel_mouse_press();
+                        return true;
+                    };
+                    let (col, row) = self.pane_cell_clamped(id, *x, *y).unwrap_or((1, 1));
+                    let bytes = crate::mouse::release(
+                        enc,
+                        self.mouse_button
+                            .and_then(crate::mouse::button_code)
+                            .unwrap_or(0),
+                        &self.pointer_mods,
+                        col,
+                        row,
+                    );
+                    if let Some(sender) = &self.sessions[id].sender {
+                        let _ = sender.send(SessionCommand::Input(bytes));
+                    }
+                    self.cancel_mouse_press();
+                    true
+                }
+            }
+            WEvent::PointerMoved { x, y } => {
+                self.last_pointer = Some((*x, *y));
+                if let Some(id) = self.mouse_pane {
+                    // 按住拖动:仅 1002(button-event)上报移动。
+                    let drag = self.sessions[id]
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|s| s.mode.contains(TermMode::MOUSE_DRAG));
+                    if !drag {
+                        return false;
+                    }
+                    let enc = self
+                        .pane_mouse_encoding(id)
+                        .unwrap_or(crate::mouse::MouseEncoding::Sgr);
+                    let (col, row) = self.pane_cell_clamped(id, *x, *y).unwrap_or((1, 1));
+                    let bytes = crate::mouse::motion(
+                        enc,
+                        self.mouse_button.and_then(crate::mouse::button_code),
+                        &self.pointer_mods,
+                        col,
+                        row,
+                    );
+                    self.send_input(id, bytes, ctx);
+                    return true;
+                }
+                // 无按键移动:仅 1003(any-event)上报。
+                let Some((id, col, row)) = self.pane_cell_at(*x, *y) else {
+                    return false;
+                };
+                let Some(enc) = self.pane_mouse_encoding(id) else {
+                    return false;
+                };
+                let any = self.sessions[id]
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.mode.contains(TermMode::MOUSE_MOTION));
+                if !any {
+                    return false;
+                }
+                let bytes = crate::mouse::motion(enc, None, &self.pointer_mods, col, row);
+                self.send_input(id, bytes, ctx);
+                true
+            }
+            WEvent::Scroll { lines_y, lines_x, pixel_y, .. } => {
+                let (x, y) = self.last_pointer.unwrap_or_default();
+                let Some((id, col, row)) = self.pane_cell_at(x, y) else {
+                    return false;
+                };
+                let Some(enc) = self.pane_mouse_encoding(id) else {
+                    return false;
+                };
+                let mut lines = *lines_y as i32;
+                let mut horizontal = false;
+                if lines == 0 && *lines_x != 0.0 {
+                    lines = *lines_x as i32;
+                    horizontal = true;
+                }
+                if lines == 0 && *pixel_y != 0.0 {
+                    self.mouse_scroll_px += pixel_y;
+                    let ch = self
+                        .renderer
+                        .as_ref()
+                        .map(|r| r.cell_size().1)
+                        .unwrap_or(20.0);
+                    lines = (self.mouse_scroll_px / ch) as i32;
+                    self.mouse_scroll_px -= lines as f32 * ch;
+                }
+                if lines == 0 {
+                    return true;
+                }
+                let n = lines.unsigned_abs().min(64) as usize;
+                let up = lines > 0;
+                let mut bytes = Vec::with_capacity(n * 20);
+                for _ in 0..n {
+                    bytes.extend(crate::mouse::wheel(
+                        enc,
+                        up,
+                        horizontal,
+                        &self.pointer_mods,
+                        col,
+                        row,
+                    ));
+                }
+                self.send_input(id, bytes, ctx);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 点击是否落在退出码徽章上(显示点 → 网格点,坐标映射的
     /// 反向转换;命中返回该块的提示符所在网格点)。
     fn badge_line_at(&self, p: DisplayPoint) -> Option<GridPoint> {
@@ -2994,6 +3203,84 @@ impl TayApp {
             }
         }
 
+        // TAY_MOUSE:验收鼠标上报全链路(合成指针事件 → on_event
+        // → 模式判定 → SGR 编码 → SessionCommand::Input → PTY →
+        // shell stdin)。TAY_EXEC 需先开启 1000/1006 并用 dd 按
+        // 固定字节数收走 PTY 输入写进 TAY_MOUSE_OUT;等模式在
+        // 快照中就绪后注入,再比对文件内容。
+        if self.mouse_smoke == Some(0) && (21..=60).contains(&self.frames) {
+            let Some(renderer) = &self.renderer else { return };
+            if self.pane_mouse_encoding(self.active_pane).is_none() {
+                return;
+            }
+            let (cw, ch) = renderer.cell_size();
+            let pad = renderer.padding() as f64;
+            let bar = crate::chrome::rows(&self.config, self.settings_visible()) as f64 * ch as f64;
+            // 网格单元 (1,4) 与 (9,4) → 上报 (2,5) 与 (10,5)。
+            let at = |col: f64, row: f64| (pad + (col + 0.5) * cw as f64, bar + (row + 0.5) * ch as f64);
+            let (x0, y0) = at(1.0, 4.0);
+            let (x1, y1) = at(9.0, 4.0);
+            let mods = Mods::default();
+            let expected: Vec<u8> = [
+                crate::mouse::press(crate::mouse::MouseEncoding::Sgr, 0, &mods, 2, 5),
+                crate::mouse::release(crate::mouse::MouseEncoding::Sgr, 0, &mods, 10, 5),
+                crate::mouse::wheel(crate::mouse::MouseEncoding::Sgr, true, false, &mods, 10, 5),
+            ]
+            .concat();
+            log::info!("TAY_MOUSE:注入合成指针事件(期望 {} 字节)", expected.len());
+            log::info!(
+                "TAY_MOUSE:坐标映射 pane_cell_at(x0,y0)={:?} 模式={:?}",
+                self.pane_cell_at(x0, y0),
+                self.pane_mouse_encoding(self.active_pane)
+            );
+            self.on_event(ctx, WEvent::PointerMoved { x: x0, y: y0 });
+            self.on_event(
+                ctx,
+                WEvent::PointerButton {
+                    button: MouseButtonIdx::Left,
+                    pressed: true,
+                    x: x0,
+                    y: y0,
+                },
+            );
+            self.on_event(
+                ctx,
+                WEvent::PointerButton {
+                    button: MouseButtonIdx::Left,
+                    pressed: false,
+                    x: x1,
+                    y: y1,
+                },
+            );
+            self.on_event(ctx, WEvent::Scroll {
+                lines_x: 0.0,
+                lines_y: 1.0,
+                pixel_x: 0.0,
+                pixel_y: 0.0,
+            });
+            self.mouse_smoke_expected = Some(expected);
+            self.mouse_smoke = Some(1);
+        }
+        if self.mouse_smoke == Some(0) && self.frames == 61 {
+            log::warn!("TAY_MOUSE:FAIL 模式未就绪(快照里没有 1000/1002/1003)");
+            self.mouse_smoke = Some(2);
+        }
+        if self.mouse_smoke == Some(1) && self.frames == 40 {
+            let expected = self.mouse_smoke_expected.take().unwrap_or_default();
+            let got = std::env::var_os("TAY_MOUSE_OUT")
+                .and_then(|path| std::fs::read(path).ok())
+                .unwrap_or_default();
+            if got == expected {
+                log::info!(
+                    "TAY_MOUSE:鼠标上报链路通过(模式判定 → SGR 编码 → PTY → shell stdin,{} 字节)",
+                    expected.len()
+                );
+            } else {
+                log::warn!("TAY_MOUSE:FAIL 期望 {expected:?} 实际 {got:?}");
+            }
+            self.mouse_smoke = Some(2);
+        }
+
         // TAY_FOLD:第 14 帧自动折叠第一条命令输出(验证用)。
         if self.fold_at_start && self.frames == 14 {
             self.fold_at_start = false;
@@ -3366,6 +3653,15 @@ impl Handler for TayApp {
                 _ => {}
             }
         }
+        // 鼠标上报的松开先于本地指针消费:Wayland 隐式抓取下,
+        // 松开可能落在栏、分隔条甚至窗口外 —— 必须路由回按下
+        // 窗格,应用才能收尾拖选/拖拽。
+        if matches!(&event, WEvent::PointerButton { pressed: false, .. })
+            && self.mouse_pane.is_some()
+            && self.mouse_report(&event, ctx)
+        {
+            return;
+        }
         if self.pane_pointer(ctx, &event) {
             return;
         }
@@ -3478,8 +3774,16 @@ impl Handler for TayApp {
                 return;
             }
         }
-        if let Some(ctrl) = pointer_ctrl_state(&event) {
-            self.ctrl_held = ctrl;
+        if let Some(mods) = pointer_mods_state(&event) {
+            self.ctrl_held = mods.ctrl;
+            self.pointer_mods = mods;
+        }
+        // 鼠标上报(应用启用 1000/1002/1003):网格区指针事件编码
+        // 进 PTY,本地拖选让位(kitty 同款语义)。tay 自己的 UI
+        // (栏、滚动条、分隔条、面板)已在上方消费,到这里只剩
+        // 网格区;松开由入口处的先发路由保证归位。
+        if self.mouse_report(&event, ctx) {
+            return;
         }
         match event {
             WEvent::CanCreateSurfaces
@@ -4511,7 +4815,7 @@ impl Handler for TayApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuPhase, pointer_ctrl_state, restored_active_index};
+    use super::{GpuPhase, pointer_mods_state, restored_active_index};
 
     fn headless_app() -> super::TayApp {
         let (wake, _reader) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -4971,29 +5275,23 @@ mod tests {
     #[test]
     fn pointer_ctrl_tracks_modifier_only_changes_and_focus_loss() {
         use tay_window::{Event, Mods};
-        let mut held = false;
+        let mut held = Mods::default();
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
         for (event, expected) in [
-            (
-                Event::ModifiersChanged(Mods {
-                    ctrl: true,
-                    ..Mods::default()
-                }),
-                true,
-            ),
-            (Event::PointerMoved { x: 1.0, y: 1.0 }, true),
-            (Event::ModifiersChanged(Mods::default()), false),
-            (
-                Event::ModifiersChanged(Mods {
-                    ctrl: true,
-                    ..Mods::default()
-                }),
-                true,
-            ),
-            (Event::Focused(false), false),
-            (Event::Focused(true), false),
+            (Event::ModifiersChanged(ctrl), ctrl),
+            // 指针事件不携带修饰键:状态保持不变。
+            (Event::PointerMoved { x: 1.0, y: 1.0 }, ctrl),
+            (Event::ModifiersChanged(Mods::default()), Mods::default()),
+            (Event::ModifiersChanged(ctrl), ctrl),
+            // 失焦清空:松开/抬起可能在窗口外发生。
+            (Event::Focused(false), Mods::default()),
+            (Event::Focused(true), Mods::default()),
         ] {
-            if let Some(ctrl) = pointer_ctrl_state(&event) {
-                held = ctrl;
+            if let Some(mods) = pointer_mods_state(&event) {
+                held = mods;
             }
             assert_eq!(held, expected);
         }
