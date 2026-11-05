@@ -34,7 +34,7 @@ package() {
     install -Dm644 packaging/tay.desktop "$pkgdir/usr/share/applications/tay.desktop"
     printf '\nNoDisplay=true\n' >> "$pkgdir/usr/share/applications/tay.desktop"
     install -Dm644 packaging/icons/tay.png "$pkgdir/usr/share/pixmaps/tay.png"
-    install -Dm644 packaging/icons/tay.png "$pkgdir/usr/share/pixmaps/tay-owl-rounded-v1.png"
+    install -Dm644 packaging/icons/tay.png "$pkgdir/usr/share/pixmaps/tay-owl-squircle-v1.png"
     install -Dm644 packaging/tayd.service "$pkgdir/usr/lib/systemd/user/tayd.service"
     install -Dm644 README.md "$pkgdir/usr/share/doc/tay/README.md"
     install -Dm644 config/desktop.lua "$pkgdir/usr/share/doc/tay/examples/config.lua"

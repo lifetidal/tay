@@ -146,13 +146,13 @@ class Watcher(dbus.service.Object):
                 obj = bus.get_object(name, path)
                 props = dbus.Interface(obj, 'org.freedesktop.DBus.Properties')
                 assert str(props.Get('org.kde.StatusNotifierItem', 'Id')) == 'org.tay.Tay'
-                assert str(props.Get('org.kde.StatusNotifierItem', 'IconName')) == 'tay-owl-rounded-v1'
+                assert str(props.Get('org.kde.StatusNotifierItem', 'IconName')) == 'tay-owl-squircle-v1'
                 menu_path = props.Get('org.kde.StatusNotifierItem', 'Menu')
                 menu = dbus.Interface(bus.get_object(name, menu_path), 'com.canonical.dbusmenu')
                 layout = menu.GetLayout(0, -1, dbus.Array([], signature='s'))
                 assert '显示 Tay' in str(layout) and '退出 Tay' in str(layout), layout
                 verified_trays.append(str(name))
-                print('PASS: actual tray properties, rounded icon and menu exported', flush=True)
+                print('PASS: actual tray properties, squircle icon and menu exported', flush=True)
                 return False
             except Exception as error:
                 # A short-lived recovery-test daemon can exit before this delayed

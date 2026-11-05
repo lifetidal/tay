@@ -33,7 +33,7 @@ impl ksni::Tray for Tray {
         "Tay".into()
     }
     fn icon_name(&self) -> String {
-        "tay-owl-rounded-v1".into()
+        "tay-owl-squircle-v1".into()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         self.icon.clone()
