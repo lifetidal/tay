@@ -22,6 +22,7 @@ mod visibility;
 
 mod retired_slot;
 mod runtime;
+mod shift_select;
 mod shutdown;
 mod summon_timing;
 

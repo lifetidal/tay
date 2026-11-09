@@ -378,6 +378,8 @@ pub struct TayApp {
     /// 不受指针越过栏、分隔条或窗口外影响)。
     mouse_pane: Option<PaneId>,
     mouse_button: Option<MouseButtonIdx>,
+    /// WezTerm 式兜底:Shift+左键拖选期间为真(事件不进应用)。
+    shift_select: crate::shift_select::ShiftSelect,
     /// 最近指针位置(滚轮事件无坐标,用它补)。
     last_pointer: Option<(f64, f64)>,
     /// 高分辨率滚轮像素余数(折算行数,鼠标上报用)。
@@ -553,6 +555,7 @@ impl TayApp {
             pointer_mods: Mods::default(),
             mouse_pane: None,
             mouse_button: None,
+            shift_select: crate::shift_select::ShiftSelect::new(),
             last_pointer: None,
             mouse_scroll_px: 0.0,
             mouse_smoke: std::env::var_os("TAY_MOUSE").map(|_| 0),
@@ -606,6 +609,7 @@ impl TayApp {
         self.cancel_mouse_press();
         self.sessions[self.active_pane].ui.scrollbar_drag = None;
         self.sessions[self.active_pane].ui.dragging = false;
+        self.shift_select.cancel();
         self.divider_hover = None;
         ctx.request_keyboard(false, false);
         match self.vis.hide(self.config.animation_ms) {
@@ -650,6 +654,7 @@ impl TayApp {
         if !self.vis.wants_keyboard() {
             self.sessions[self.active_pane].ui.scrollbar_drag = None;
             self.sessions[self.active_pane].ui.dragging = false;
+            self.shift_select.cancel();
             ctx.request_keyboard(false, false);
         }
     }
@@ -830,6 +835,7 @@ impl TayApp {
         self.take_snapshot(self.active_pane);
         let pane = &mut self.sessions[self.active_pane];
         pane.ui.dragging = false;
+        self.shift_select.cancel();
         pane.ui.scrollbar_drag = None;
         pane.ui.preedit = None;
         pane.ui.quick = None;
@@ -849,6 +855,7 @@ impl TayApp {
         self.cancel_mouse_press();
         self.sessions[self.active_pane].ui.kitty_down.clear();
         self.sessions[self.active_pane].ui.dragging = false;
+        self.shift_select.cancel();
         self.sessions[self.active_pane].ui.quick = None;
         self.sessions[self.active_pane].ui.preedit = None;
         self.active_pane = id;
@@ -1165,6 +1172,7 @@ impl TayApp {
                 if let Some(divider) = dividers.into_iter().find(|d| d.rect.contains(col, row)) {
                     self.divider_drag = Some(divider);
                     self.sessions[self.active_pane].ui.dragging = false;
+                    self.shift_select.cancel();
                     return true;
                 }
                 if let Some((id, _)) = leaves.into_iter().find(|(_, r)| r.contains(col, row)) {
@@ -2369,6 +2377,11 @@ impl TayApp {
                 y,
             } => {
                 self.last_pointer = Some((*x, *y));
+                // WezTerm 式兜底:Shift+左键不进应用,落回本地选区。
+                if crate::shift_select::bypass_report(&self.pointer_mods, *button) {
+                    self.shift_select.begin(true);
+                    return false;
+                }
                 let Some(code) = crate::mouse::button_code(*button) else {
                     return false;
                 };
@@ -2418,6 +2431,10 @@ impl TayApp {
             }
             WEvent::PointerMoved { x, y } => {
                 self.last_pointer = Some((*x, *y));
+                // Shift 拖选期间:移动事件同样不进应用(含 1003)。
+                if self.shift_select.active() {
+                    return false;
+                }
                 if let Some(id) = self.mouse_pane {
                     // 按住拖动:仅 1002(button-event)上报移动。
                     let drag = self.sessions[id]
@@ -3734,6 +3751,7 @@ impl Handler for TayApp {
             } if self.sessions[self.active_pane].ui.scrollbar_drag.is_some() => {
                 self.sessions[self.active_pane].ui.scrollbar_drag = None;
                 self.sessions[self.active_pane].ui.dragging = false;
+                self.shift_select.cancel();
                 ctx.set_pointer_over_control(false);
                 return;
             }
@@ -3758,6 +3776,7 @@ impl Handler for TayApp {
                     let epoch = snapshot.meta.invalidate_epoch;
                     self.sessions[self.active_pane].ui.scrollbar_drag = Some((grab, epoch));
                     self.sessions[self.active_pane].ui.dragging = false;
+                    self.shift_select.cancel();
                     self.drag_scrollbar(*y as f32, grab, epoch);
                     return;
                 }
@@ -4410,6 +4429,7 @@ impl Handler for TayApp {
                                 return;
                             }
                         self.sessions[self.active_pane].ui.dragging = true;
+                        self.shift_select.begin(self.pointer_mods.shift);
                         if let Some(cell) = self.cell_at(x, y)
                             && let Some(a) = self.anchor_at(cell)
                         {
@@ -4420,10 +4440,18 @@ impl Handler for TayApp {
                         }
                     } else {
                         self.sessions[self.active_pane].ui.dragging = false;
+                        let has_sel = matches!(
+                            self.sessions[self.active_pane].ui.sel,
+                            Some((s, e)) if s != e
+                        );
                         if let Some((s, e)) = self.sessions[self.active_pane].ui.sel
                             && s == e {
                                 self.sessions[self.active_pane].ui.sel = None;
                             }
+                        // WezTerm 语义:Shift 拖选松开即复制。
+                        if self.shift_select.end(has_sel) {
+                            self.copy_selection();
+                        }
                     }
                     ctx.request_redraw();
                 }
