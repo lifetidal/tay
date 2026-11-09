@@ -1681,7 +1681,7 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&core.img_pipeline());
+            pass.set_pipeline(core.img_pipeline());
             pass.set_bind_group(0, &cached.bind, &[]);
             pass.set_vertex_buffer(0, core.uv_quad.slice(..));
             pass.set_vertex_buffer(1, cached.inst.slice(..));
