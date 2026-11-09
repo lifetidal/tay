@@ -4,6 +4,7 @@
 *.jpg
 Cargo.lock.orig
 /dist/
+.superpowers/
 
 !packaging/icons/tay.png
 !packaging/icons/tay-terminal.png
