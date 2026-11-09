@@ -20,8 +20,8 @@ mod terminal;
 mod view;
 mod visibility;
 
-mod runtime;
 mod retired_slot;
+mod runtime;
 mod shutdown;
 mod summon_timing;
 

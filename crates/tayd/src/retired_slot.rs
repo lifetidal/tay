@@ -22,7 +22,6 @@ impl<T> RetiredSlot<T> {
     pub fn take_and_drop(&mut self) {
         self.slot = None;
     }
-
 }
 
 #[cfg(test)]
