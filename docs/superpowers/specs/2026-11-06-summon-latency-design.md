@@ -1,7 +1,23 @@
 # Tay 呼出时延优化:GPU 资源跨 remap 复用 + 缓存帧即时上屏(设计)
 
 日期:2026-11-06
-状态:设计待用户批准(方案 1+2 已确认;builder 审查已消化)
+状态:**已实施**(2026-11-09;方案 1+2 全部落地,52 包已打)
+
+## 最终结果(隔离实例,31 次 toggle / 15 呼出周期)
+
+| 口径 | 基线 | 最终 | 验收线 |
+|---|---|---|---|
+| 缓存首帧已提交 p50 | —(无此路径) | **6ms**(min 5/max 7) | ≤ ~120ms ✅ |
+| 内容帧已提交 p50 | 209ms | **50ms**(min 50/max 97) | 上报观察 ✅ |
+
+- GpuCore 复用:remap 不再新建 Instance/Adapter/Device;字体栈每 daemon 仅建 1 次。
+- 旧渲染器 drop 移出关键路径(RetiredSlot,on_event 空闲点释放)。
+- 缓存帧:收起动画帧捕获(稳态零带宽),remap 后 configure 一完成同步 blit 上屏。
+- TAY_REBIND ×10 零崩溃;三套烟测(panes/focus/desktop-services)全绿;
+  271 测试、clippy 0、fmt 干净。
+- 实施中发现并修复 3 个真机 bug:跨 Instance 建 surface/device(SurfaceId panic)、
+  混合 GPU 重建未同步重建缓冲(跨 device 校验 panic)、连续 SurfaceReplaced
+  非幂等取走渲染器(portal 缓冲投递复现,desktop-services-smoke 捕获)。
 
 ## 意图与为什么
 

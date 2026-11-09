@@ -120,6 +120,8 @@ pub struct GpuCore {
 }
 
 /// 请求 adapter/device/queue(ensure_device 与首次构建共用)。
+/// 错误处理器在此统一注册:device 无论哪条路径创建,都必须有
+/// uncaptured error 兜底(wgpu 30 默认把未捕获错误升级为 panic)。
 pub fn request_adapter_device(
     instance: &wgpu::Instance,
     surface: &wgpu::Surface,
@@ -140,6 +142,9 @@ pub fn request_adapter_device(
         trace: wgpu::Trace::Off,
     }))
     .map_err(|e| format!("请求 GPU 设备失败: {e}"))?;
+    device.on_uncaptured_error(std::sync::Arc::new(|e| {
+        log::error!("wgpu 校验错误: {e:?}");
+    }));
     Ok((adapter, device, queue))
 }
 
@@ -155,14 +160,20 @@ impl GpuCore {
         surface: &wgpu::Surface,
     ) -> Result<bool, String> {
         if let Some(adapter) = &self.adapter {
-            let caps = surface.get_capabilities(adapter);
-            log::info!(
-                "适配器能力检查: formats={} alpha_modes={}",
-                caps.formats.len(),
-                caps.alpha_modes.len()
-            );
-            if !caps.formats.is_empty() {
-                return Ok(false);
+            // TAY_FORCE_DEVICE_REBUILD=1:真机验收钩子 —— 强制走混合
+            // GPU 重建路径(本机单 GPU 无法自然触发,借此验证
+            // 「重建后资源一致性」这一整条分支)。
+            let force = std::env::var("TAY_FORCE_DEVICE_REBUILD").is_ok_and(|v| v == "1");
+            if !force {
+                let caps = surface.get_capabilities(adapter);
+                log::info!(
+                    "适配器能力检查: formats={} alpha_modes={}",
+                    caps.formats.len(),
+                    caps.alpha_modes.len()
+                );
+                if !caps.formats.is_empty() {
+                    return Ok(false);
+                }
             }
             log::warn!("适配器与新 surface 不兼容,重建 device(混合 GPU 路径)");
         }

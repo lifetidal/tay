@@ -2,6 +2,16 @@
 
 use std::time::Instant;
 
+/// 首帧计时锚点:内容帧计时优先用 content_at(缓存 blit 时刻或
+/// 沿用 show_at 的旧口径);两者都没有时回退 show_at(首次启动
+/// 握手路径不设 content_at,但 show_at 仍有效)。
+pub fn first_frame_anchor(
+    content_at: &mut Option<Instant>,
+    show_at: &mut Option<Instant>,
+) -> Option<Instant> {
+    content_at.take().or_else(|| show_at.take())
+}
+
 /// 呼出重建路径的分段计时器。创建后各阶段用 `mark(name)` 记录,
 /// `summary()` 输出「呼出阶段 a=12ms, b=8ms, 总 20ms」样式的日志行。
 pub struct StageTimer {
@@ -69,5 +79,28 @@ mod tests {
     fn empty_summary_reports_zero_total() {
         let s = StageTimer::new().summary();
         assert!(s.contains("总 0ms"), "空计时器应报总 0ms: {s}");
+    }
+
+    #[test]
+    fn anchor_prefers_content_at() {
+        let now = Instant::now();
+        let mut content = Some(now);
+        let mut show = Some(now + std::time::Duration::from_secs(1));
+        assert_eq!(first_frame_anchor(&mut content, &mut show), Some(now));
+        assert!(show.is_some(), "未使用 show_at 不得消费");
+    }
+
+    #[test]
+    fn anchor_falls_back_to_show_at() {
+        let now = Instant::now();
+        let mut content = None;
+        let mut show = Some(now);
+        assert_eq!(first_frame_anchor(&mut content, &mut show), Some(now));
+        assert!(show.is_none(), "回退时必须消费 show_at");
+    }
+
+    #[test]
+    fn anchor_both_none_is_none() {
+        assert_eq!(first_frame_anchor(&mut None, &mut None), None);
     }
 }

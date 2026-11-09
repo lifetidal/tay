@@ -602,6 +602,10 @@ impl Renderer {
                     core.wallpaper = None;
                     core.background_checked = None;
                     core.glyph_buffers.clear();
+                    // 缓存帧纹理/bind/实例缓冲属于旧 device,必须作废:
+                    // 否则跨 device 提交被 wgpu 静默丢弃,呼出第一帧
+                    // 是垃圾画面且缓存永远无法自愈。
+                    core.cached_frame = None;
                 }
                 let (format, alpha_mode) = negotiate_configure(
                     &surface,
@@ -2114,10 +2118,7 @@ fn build_fresh(
     let preedit_buffer = Buffer::new(&mut font_system, Metrics::new(size_px, cell.1));
     let (uv_quad, img_sampler, unit_quad, instance_buf, locals_buf, locals_bind) =
         build_buffers(&device);
-
-    device.on_uncaptured_error(std::sync::Arc::new(|e| {
-        log::error!("wgpu 校验错误: {e:?}");
-    }));
+    // uncaptured error 处理器已在 request_adapter_device 统一注册。
 
     let core = GpuCore {
         adapter: Some(adapter),

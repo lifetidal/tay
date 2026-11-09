@@ -3488,7 +3488,10 @@ impl TayApp {
                         // commit 才会被 KWin 响应(pre_present 的空 commit
                         // 注册不触发 done,会导致帧循环停摆)。
                         ctx.arm_frame_after_present();
-                        if let Some(at) = self.content_at.take() {
+                        if let Some(at) = crate::summon_timing::first_frame_anchor(
+                            &mut self.content_at,
+                            &mut self.show_at,
+                        ) {
                             self.shown_once = true;
                             let summary = self
                                 .summon_timer
@@ -4754,6 +4757,13 @@ impl Handler for TayApp {
                 // 幂等:快速连按/portal 缓冲投递可产生连续 SurfaceReplaced,
                 // 第二次到达时渲染器已被取走 —— 跳过即可(旧代码
                 // renderer = None 同样幂等),不得 panic。
+                // 生命周期不变量:延后 drop 依赖窗口层在每个
+                // SurfaceReplaced 后必推 OutputChanged(tay-window
+                // rebind_layer 内成对入队),使本渲染器总在同一轮 drain
+                // 内、retired.clear() 销毁旧 wl_surface 之前被释放。
+                // 若将来窗口层允许"裸" SurfaceReplaced,此处必须先
+                // 恢复同步 drop,否则复现 hardening-notes 10-16 的
+                // Mesa WSI 段错误。
                 if let Some(renderer) = &mut self.renderer {
                     self.gpu_core = Some(renderer.take_core());
                     // 暂存延后释放:同步 swapchain 销毁(vkDeviceWaitIdle)
