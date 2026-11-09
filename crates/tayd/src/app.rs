@@ -4751,13 +4751,16 @@ impl Handler for TayApp {
                     t.mark("remap 到达");
                     t.mark("drop 旧渲染器 开始");
                 }
+                // 幂等:快速连按/portal 缓冲投递可产生连续 SurfaceReplaced,
+                // 第二次到达时渲染器已被取走 —— 跳过即可(旧代码
+                // renderer = None 同样幂等),不得 panic。
                 if let Some(renderer) = &mut self.renderer {
                     self.gpu_core = Some(renderer.take_core());
+                    // 暂存延后释放:同步 swapchain 销毁(vkDeviceWaitIdle)
+                    // 不占呼出关键路径;retired 保活顺序不变(延后只会更安全)。
+                    self.retired_renderer
+                        .replace(self.renderer.take().expect("刚取出"));
                 }
-                // 暂存延后释放:同步 swapchain 销毁(vkDeviceWaitIdle)
-                // 不占呼出关键路径;retired 保活顺序不变(延后只会更安全)。
-                self.retired_renderer
-                    .replace(self.renderer.take().expect("渲染器存在"));
                 if let Some(t) = &mut self.summon_timer {
                     t.mark("drop 旧渲染器 完成");
                 }
