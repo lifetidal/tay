@@ -23,16 +23,13 @@ impl<T> RetiredSlot<T> {
         self.slot = None;
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.slot.is_none()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct DropT(Arc<AtomicUsize>);
 
@@ -57,7 +54,6 @@ mod tests {
         let mut slot = RetiredSlot::default();
         slot.replace(DropT(drops.clone()));
         slot.take_and_drop();
-        assert!(slot.is_empty());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
@@ -65,6 +61,5 @@ mod tests {
     fn take_and_drop_on_empty_is_noop() {
         let mut slot = RetiredSlot::<DropT>::default();
         slot.take_and_drop();
-        assert!(slot.is_empty());
     }
 }
