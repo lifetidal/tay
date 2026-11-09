@@ -23,6 +23,7 @@ use crate::session::{
     SessionSnapshot, SessionState, SessionUpdate,
 };
 use tay_config::{Config, Rgb};
+use tay_render::GpuCore;
 use tay_render::wgpu;
 use tay_window::{Ctx, Event as WEvent, Handler, ImeEvent, KeyKind, Mods, MouseButtonIdx};
 
@@ -305,6 +306,8 @@ pub struct TayApp {
     bench: Option<u32>,
 
     instance: Option<wgpu::Instance>,
+    /// SurfaceReplaced 时从渲染器抽出的常驻 GPU 资源,rebind 复用。
+    gpu_core: Option<GpuCore>,
     renderer: Option<tay_render::Renderer>,
     dims: Option<(usize, usize)>,
     /// 隔离测试用的滚动条事件阶段。
@@ -471,6 +474,7 @@ impl TayApp {
             shot,
             bench,
             instance: None,
+            gpu_core: None,
             renderer: None,
             sessions,
             layouts: vec![PaneTab {
@@ -676,9 +680,14 @@ impl TayApp {
     /// 窗口层 retired 保活,GPU 销毁 swapchain 时仍需 marshal 它)。
     fn create_renderer(&mut self, ctx: &mut Ctx<'_>) -> Result<(usize, usize), String> {
         let (disp_ptr, surf_ptr) = ctx.raw_wayland().ok_or("取 Wayland 句柄失败")?;
-        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        instance_desc.backends = wgpu::Backends::PRIMARY | wgpu::Backends::GL;
-        let instance = wgpu::Instance::new(instance_desc);
+        let instance = if let Some(instance) = &self.instance {
+            instance
+        } else {
+            let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+            instance_desc.backends = wgpu::Backends::PRIMARY | wgpu::Backends::GL;
+            self.instance = Some(wgpu::Instance::new(instance_desc));
+            self.instance.as_ref().expect("刚创建")
+        };
         let raw_display =
             wgpu::rwh::RawDisplayHandle::Wayland(wgpu::rwh::WaylandDisplayHandle::new(
                 std::ptr::NonNull::new(disp_ptr as *mut _).expect("display 指针非空"),
@@ -697,8 +706,9 @@ impl TayApp {
         ctx.set_background_blur(self.config.background_blur);
         let size = ctx.surface_size();
         let shot = self.shot.as_ref().map(|(p, n)| (p.as_str(), *n));
-        let renderer = tay_render::Renderer::new(
-            &instance,
+        let renderer = tay_render::Renderer::bind(
+            self.gpu_core.take(),
+            instance,
             surface,
             &self.config,
             size,
@@ -716,7 +726,6 @@ impl TayApp {
         let mut renderer = renderer;
         renderer.update_colors(&self.config);
         self.renderer = Some(renderer);
-        self.instance = Some(instance);
         Ok((cols, rows))
     }
 
@@ -2317,11 +2326,13 @@ impl TayApp {
     /// 窗格当前的鼠标上报编码:未启用任何鼠标模式 → None。
     fn pane_mouse_encoding(&self, id: PaneId) -> Option<crate::mouse::MouseEncoding> {
         let snap = self.sessions[id].snapshot.as_ref()?;
-        snap.mode.intersects(TermMode::MOUSE_MODE).then_some(if snap.mode.contains(TermMode::SGR_MOUSE) {
-            crate::mouse::MouseEncoding::Sgr
-        } else {
-            crate::mouse::MouseEncoding::X10
-        })
+        snap.mode.intersects(TermMode::MOUSE_MODE).then_some(
+            if snap.mode.contains(TermMode::SGR_MOUSE) {
+                crate::mouse::MouseEncoding::Sgr
+            } else {
+                crate::mouse::MouseEncoding::X10
+            },
+        )
     }
 
     /// 清鼠标按下追踪(松开被本地消费/模态打开/隐藏/切换时)。
@@ -2343,7 +2354,12 @@ impl TayApp {
     /// 写进 PTY,本地拖选让位。消费返回 true。
     fn mouse_report(&mut self, event: &WEvent, ctx: &mut Ctx<'_>) -> bool {
         match event {
-            WEvent::PointerButton { button, pressed, x, y } => {
+            WEvent::PointerButton {
+                button,
+                pressed,
+                x,
+                y,
+            } => {
                 self.last_pointer = Some((*x, *y));
                 let Some(code) = crate::mouse::button_code(*button) else {
                     return false;
@@ -2435,7 +2451,12 @@ impl TayApp {
                 self.send_input(id, bytes, ctx);
                 true
             }
-            WEvent::Scroll { lines_y, lines_x, pixel_y, .. } => {
+            WEvent::Scroll {
+                lines_y,
+                lines_x,
+                pixel_y,
+                ..
+            } => {
                 let (x, y) = self.last_pointer.unwrap_or_default();
                 let Some((id, col, row)) = self.pane_cell_at(x, y) else {
                     return false;
@@ -3215,7 +3236,9 @@ impl TayApp {
         // 固定字节数收走 PTY 输入写进 TAY_MOUSE_OUT;等模式在
         // 快照中就绪后注入,再比对文件内容。
         if self.mouse_smoke == Some(0) && (21..=60).contains(&self.frames) {
-            let Some(renderer) = &self.renderer else { return };
+            let Some(renderer) = &self.renderer else {
+                return;
+            };
             if self.pane_mouse_encoding(self.active_pane).is_none() {
                 return;
             }
@@ -3223,7 +3246,8 @@ impl TayApp {
             let pad = renderer.padding() as f64;
             let bar = crate::chrome::rows(&self.config, self.settings_visible()) as f64 * ch as f64;
             // 网格单元 (1,4) 与 (9,4) → 上报 (2,5) 与 (10,5)。
-            let at = |col: f64, row: f64| (pad + (col + 0.5) * cw as f64, bar + (row + 0.5) * ch as f64);
+            let at =
+                |col: f64, row: f64| (pad + (col + 0.5) * cw as f64, bar + (row + 0.5) * ch as f64);
             let (x0, y0) = at(1.0, 4.0);
             let (x1, y1) = at(9.0, 4.0);
             let mods = Mods::default();
@@ -3258,12 +3282,15 @@ impl TayApp {
                     y: y1,
                 },
             );
-            self.on_event(ctx, WEvent::Scroll {
-                lines_x: 0.0,
-                lines_y: 1.0,
-                pixel_x: 0.0,
-                pixel_y: 0.0,
-            });
+            self.on_event(
+                ctx,
+                WEvent::Scroll {
+                    lines_x: 0.0,
+                    lines_y: 1.0,
+                    pixel_x: 0.0,
+                    pixel_y: 0.0,
+                },
+            );
             self.mouse_smoke_expected = Some(expected);
             self.mouse_smoke = Some(1);
         }
@@ -4687,8 +4714,10 @@ impl Handler for TayApp {
                     t.mark("remap 到达");
                     t.mark("drop 旧渲染器 开始");
                 }
+                if let Some(renderer) = &mut self.renderer {
+                    self.gpu_core = Some(renderer.take_core());
+                }
                 self.renderer = None;
-                self.instance = None;
                 if let Some(t) = &mut self.summon_timer {
                     t.mark("drop 旧渲染器 完成");
                 }

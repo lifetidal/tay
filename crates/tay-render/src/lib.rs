@@ -3,6 +3,8 @@
 //! 输入是设备无关的 [`Grid`](Grid 为终端网格快照,tayd 从 alacritty_terminal
 //! 提取),输出一个 wgpu 渲染帧。本 crate 不依赖 alacritty_terminal。
 
+mod gpu_core;
+pub use crate::gpu_core::GpuCore;
 mod wallpaper;
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -17,6 +19,8 @@ use glyphon::cosmic_text::{
 use glyphon::{Cache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use tay_config::{Config, Rgb};
 use wgpu::util::DeviceExt;
+
+use crate::gpu_core::{CacheDecision, FontKey, FormatCache, GlyphSet};
 
 /// 一个终端单元格的渲染快照。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,29 +299,19 @@ struct Locals {
 
 /// 终端渲染器:持有 wgpu 设备与 glyphon 状态。
 pub struct Renderer {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
     pub format: wgpu::TextureFormat,
     alpha_mode: wgpu::CompositeAlphaMode,
     surface: wgpu::Surface<'static>,
+    /// device 级资源:由 TayApp 在 SurfaceReplaced 时抽出保留,
+    /// bind 时重新挂回。None 仅在 take_core 与 bind 之间短暂出现。
+    core: Option<GpuCore>,
 
-    font_system: FontSystem,
-    swash_cache: SwashCache,
-    atlas: TextAtlas,
-    text: TextRenderer,
-    viewport: Viewport,
-    /// 一行一个终端行的文本缓冲。
-    glyph_buffers: std::collections::HashMap<GlyphKey, CachedGlyph>,
     glyph_draws: Vec<GlyphDraw>,
     tab_bar_rows: usize,
     tab_panel_rows: usize,
-    font_metrics: Metrics,
-    preedit_buffer: Buffer,
     preedit_pos: Option<(usize, usize)>,
     preedit_right: Option<usize>,
 
-    family: String,
-    font_weight: u16,
     /// 单元格尺寸(物理像素)。
     pub cell: (f32, f32),
     padding: f32,
@@ -326,34 +320,15 @@ pub struct Renderer {
 
     fg_default: Color,
     bg_default: Rgb,
-    wallpaper: Option<RenderImage>,
-    wallpaper_config: (String, f32, f32),
-    background_checked: Option<std::time::Instant>,
     /// 光标/选区色(config colors.cursor / colors.selection,
     /// 热重载即时生效 —— 此前硬编码,用户在 Lua 里改这两个
     /// 颜色不生效,2026-10-19 修复)。
     cursor_color: Rgb,
     selection_color: Rgb,
     search_hit_color: Rgb,
-    /// surface 为 sRGB 格式时,自绘颜色需先转 linear(硬件写入时自动编码)。
-    srgb: bool,
 
-    // —— 自绘 bg 管线 ——
-    bg_pipeline: wgpu::RenderPipeline,
-    // —— 图像管线(kitty graphics) ——
-    img_pipeline: wgpu::RenderPipeline,
-    uv_quad: wgpu::Buffer,
-    img_sampler: wgpu::Sampler,
-    /// (图像 id, 像素数据指针)→ (纹理, bind group, w, h, 实例缓冲)。
-    /// 每图独立实例缓冲:共用一个会在单帧多图时发生写-读竞态。
-    /// 键 = 数据身份(共享句柄指针),同一数据零哈希零上传。
-    img_cache: ImageCache,
     /// 当前帧图像实例((id, ptr), rect, z)。
     current_images: Vec<ImageDraw>,
-    unit_quad: wgpu::Buffer,
-    instance_buf: wgpu::Buffer,
-    locals_buf: wgpu::Buffer,
-    locals_bind: wgpu::BindGroup,
     quads: Vec<Quad>,
 
     /// TAY_SHOT:渲染 N 帧后把当前帧存为 PNG 并退出。
@@ -370,7 +345,7 @@ struct ShotState {
 
 /// FNV-1a(图像内容 hash,避免逐帧重传纹理)。
 /// 图像纹理缓存条目。
-type ImageCache = std::collections::HashMap<
+pub(crate) type ImageCache = std::collections::HashMap<
     (u32, usize),
     (wgpu::Texture, wgpu::BindGroup, u32, u32, wgpu::Buffer),
 >;
@@ -415,9 +390,9 @@ struct GlyphDraw {
     row: usize,
     width: usize,
 }
-type GlyphKey = (char, Option<Arc<str>>, u32, u8);
+pub(crate) type GlyphKey = (char, Option<Arc<str>>, u32, u8);
 
-struct CachedGlyph {
+pub(crate) struct CachedGlyph {
     buffer: Buffer,
     ink: Option<GlyphInk>,
 }
@@ -598,8 +573,10 @@ fn attrs_for(
 }
 
 impl Renderer {
-    /// 创建渲染器:`surface` 由调用方从窗口原始句柄建立(见 tayd)。
-    pub fn new(
+    /// bind:core 为 None 时全新构建(首次初始化);Some 时复用常驻资源,
+    /// 仅字体键或 surface format 变化时重建对应部分。
+    pub fn bind(
+        core_in: Option<GpuCore>,
         instance: &wgpu::Instance,
         surface: wgpu::Surface<'static>,
         config: &Config,
@@ -607,310 +584,78 @@ impl Renderer {
         scale_factor: f64,
         shot_path: Option<(&str, u32)>,
     ) -> Result<Self, String> {
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::None,
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-            apply_limit_buckets: false,
-        }))
-        .map_err(|e| format!("找不到可用的 GPU 适配器: {e}"))?;
+        let (mut core, format, alpha_mode) = match core_in {
+            Some(mut core) => {
+                log::info!("GpuCore 复用(Instance/Device 不重建)");
+                if core.ensure_device(instance, &surface)? {
+                    // 混合 GPU 迁移:device 已重建,全部 device 级缓冲与缓存
+                    // 必须同步重建,否则跨 device 校验 panic。
+                    let (uv_quad, img_sampler, unit_quad, instance_buf, locals_buf, locals_bind) =
+                        build_buffers(&core.device);
+                    core.uv_quad = uv_quad;
+                    core.img_sampler = img_sampler;
+                    core.unit_quad = unit_quad;
+                    core.instance_buf = instance_buf;
+                    core.locals_buf = locals_buf;
+                    core.locals_bind = locals_bind;
+                    core.img_cache.clear();
+                    core.wallpaper = None;
+                    core.background_checked = None;
+                    core.glyph_buffers.clear();
+                }
+                let (format, alpha_mode) = negotiate_configure(
+                    &surface,
+                    core.adapter.as_ref().expect("adapter 已就绪"),
+                    &core.device,
+                    size,
+                )?;
+                if core.font_key != font_key_of(config, scale_factor) {
+                    let (font_system, swash_cache, metrics, size_px, _cell) =
+                        build_fonts(config, scale_factor);
+                    core.font_system = font_system;
+                    core.swash_cache = swash_cache;
+                    core.font_metrics = metrics;
+                    core.font_key = FontKey {
+                        family: config.font.family.clone(),
+                        weight: config.font.weight,
+                        size_px,
+                    };
+                    core.glyph_buffers.clear();
+                    core.glyph_sets = FormatCache::default();
+                }
+                match core.glyph_sets.decide(format) {
+                    CacheDecision::Reuse => {}
+                    _ => {
+                        core.glyph_sets.current =
+                            Some((format, build_glyph_set(&core.device, &core.queue, format)?));
+                    }
+                }
+                (core, format, alpha_mode)
+            }
+            None => build_fresh(instance, &surface, config, size, scale_factor)?,
+        };
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("tay device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::default(),
-            memory_hints: wgpu::MemoryHints::default(),
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|e| format!("请求 GPU 设备失败: {e}"))?;
-
-        let caps = surface.get_capabilities(&adapter);
-        // 优先选 sRGB 格式(与 glyphon 的默认一致),否则取第一个。
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| f.is_srgb())
-            .or_else(|| caps.formats.first().copied())
-            .ok_or("surface 无可用格式")?;
-
-        let alpha_mode = [
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::PostMultiplied,
-        ]
-        .into_iter()
-        .find(|m| caps.alpha_modes.contains(m))
-        .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
-        log::info!("Surface alpha mode: {alpha_mode:?}");
-        surface.configure(
-            &device,
-            &wgpu::SurfaceConfiguration {
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                format,
-                width: size.0.max(1),
-                height: size.1.max(1),
-                present_mode: wgpu::PresentMode::AutoNoVsync,
-                alpha_mode,
-                color_space: wgpu::SurfaceColorSpace::Auto,
-                view_formats: vec![],
-                desired_maximum_frame_latency: 2,
-            },
-        );
-
-        // —— 字体与单元格测量 ——
-        let mut font_system = FontSystem::new();
-        let font_size_px = config.font.size * 96.0 / 72.0 * scale_factor as f32;
-        let metrics = Metrics::new(font_size_px, (font_size_px * 1.25).round());
-        let mut probe = Buffer::new(&mut font_system, metrics);
-        probe.set_size(None, None);
-        let probe_attrs = attrs_for(
-            &config.font.family,
-            config.font.weight,
-            config.colors.foreground,
-            false,
-            false,
-            false,
-        );
-        probe.set_text("M", &probe_attrs, Shaping::Advanced, None);
-        probe.shape_until_scroll(&mut font_system, false);
-        let mut cell_w = font_size_px * 0.6; // 兜底:等宽近似
-        let mut cell_h = metrics.line_height;
-        if let Some(run) = probe.layout_runs().next() {
-            cell_w = run.glyphs.iter().map(|g| g.w).sum::<f32>().round().max(1.0);
-            cell_h = run.line_height.max(1.0);
-        }
-        log::info!(
-            "字体 {} @ {font_size_px:.1}px → 单元格 {cell_w:.2}×{cell_h:.2}px,surface 格式 {format:?}",
-            config.font.family
-        );
-
-        let mut preedit_buffer = Buffer::new(&mut font_system, Metrics::new(font_size_px, cell_h));
+        // —— 表面层字段(字体 probe 复用常驻 FontSystem,仅测单元格) ——
+        let (cell_w, cell_h) =
+            probe_cell(&mut core.font_system, config, scale_factor, Some(format));
+        let font_size_px = core.font_key.size_px;
+        let mut preedit_buffer =
+            Buffer::new(&mut core.font_system, Metrics::new(font_size_px, cell_h));
         preedit_buffer.set_wrap(glyphon::cosmic_text::Wrap::None);
         preedit_buffer.set_hinting(glyphon::cosmic_text::Hinting::Enabled);
         preedit_buffer.set_monospace_width(Some(cell_w));
-        let swash_cache = SwashCache::new();
+        core.preedit_buffer = preedit_buffer;
 
-        // —— glyphon ——
-        let cache = Cache::new(&device);
-        let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
-        let text = TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let viewport = Viewport::new(&device, &cache);
-
-        // —— 自绘 bg 管线 ——
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tay quads"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("quad.wgsl"))),
-        });
-        let locals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("tay locals"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-        let bg_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("tay quads layout"),
-            bind_group_layouts: &[Some(&locals_layout)],
-            immediate_size: 0,
-        });
-        let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("tay quads pipeline"),
-            layout: Some(&bg_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    // 单位 quad 角点
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 8,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
-                    }),
-                    // 实例:rect + color
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Quad>() as u64,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4],
-                    }),
-                ],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        // —— 图像管线 ——
-        let img_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("tay image"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let img_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("tay image layout"),
-            bind_group_layouts: &[Some(&img_layout)],
-            immediate_size: 0,
-        });
-        let img_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tay image"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "image.wgsl"
-            ))),
-        });
-        let img_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("tay image pipeline"),
-            layout: Some(&img_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &img_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 16,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
-                    }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 16,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x4],
-                    }),
-                ],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &img_shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-        let uv_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tay image quad"),
-            // (pos, uv) × 4 顶点。
-            contents: bytemuck::cast_slice(&[
-                0.0f32, 0.0, 0.0, 0.0, //
-                1.0, 0.0, 1.0, 0.0, //
-                1.0, 1.0, 1.0, 1.0, //
-                0.0, 0.0, 0.0, 0.0, //
-                1.0, 1.0, 1.0, 1.0, //
-                0.0, 1.0, 0.0, 1.0, //
-            ]),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let img_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("tay image sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let unit_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tay unit quad"),
-            contents: bytemuck::cast_slice(&[
-                0.0f32, 0.0, 1.0, 0.0, 1.0, 1.0, //
-                0.0, 0.0, 1.0, 1.0, 0.0, 1.0, //
-            ]),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tay quad instances"),
-            size: (std::mem::size_of::<Quad>() * 4096) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let locals_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tay locals"),
-            size: std::mem::size_of::<Locals>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let locals_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("tay locals bind"),
-            layout: &locals_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: locals_buf.as_entire_binding(),
-            }],
-        });
-
-        device.on_uncaptured_error(std::sync::Arc::new(|e| {
-            log::error!("wgpu 校验错误: {e:?}");
-        }));
         let mut renderer = Self {
-            device,
-            queue,
             format,
             alpha_mode,
             surface,
-            font_system,
-            swash_cache,
-            atlas,
-            text,
-            viewport,
-            glyph_buffers: Default::default(),
+            core: Some(core),
             glyph_draws: Vec::new(),
             tab_bar_rows: 0,
             tab_panel_rows: 0,
-            font_metrics: Metrics::new(font_size_px, cell_h),
-            preedit_buffer,
             preedit_pos: None,
             preedit_right: None,
-            family: config.font.family.clone(),
-            font_weight: config.font.weight,
             cell: (cell_w, cell_h),
             padding: config.padding * scale_factor as f32,
             size,
@@ -920,23 +665,10 @@ impl Renderer {
                 config.colors.foreground.2,
             ),
             bg_default: config.colors.background,
-            wallpaper: None,
-            wallpaper_config: (String::new(), -1.0, -1.0),
-            background_checked: None,
             cursor_color: config.colors.cursor,
             selection_color: config.colors.selection,
             search_hit_color: mix(config.colors.cursor, config.colors.background, 0.55),
-            srgb: format.is_srgb(),
-            bg_pipeline,
-            img_pipeline,
-            uv_quad,
-            img_sampler,
-            img_cache: Default::default(),
             current_images: Vec::new(),
-            unit_quad,
-            instance_buf,
-            locals_buf,
-            locals_bind,
             quads: Vec::new(),
             shot: shot_path.map(|(p, n)| ShotState {
                 path: p.into(),
@@ -947,6 +679,15 @@ impl Renderer {
         };
         renderer.apply_locals();
         Ok(renderer)
+    }
+
+    fn core(&mut self) -> &mut GpuCore {
+        self.core.as_mut().expect("GpuCore 未挂载")
+    }
+
+    /// 抽出常驻资源(SurfaceReplaced 前调用;旧 surface 资源随本 Renderer drop)。
+    pub fn take_core(&mut self) -> GpuCore {
+        self.core.take().expect("GpuCore 未挂载")
     }
 
     pub fn padding(&self) -> f32 {
@@ -973,8 +714,11 @@ impl Renderer {
         // 滑条每步都会换 key:保留旧壁纸作陈旧回退,worker 解码新 key
         // 期间不闪屏(poll_background 的 loaded.or_else(wallpaper) 兜底);
         // img_cache 是 kitty 内联图,与壁纸无关,清掉会让它们每步重传。
-        self.wallpaper_config = background;
-        self.background_checked = None;
+        self.core.as_mut().expect("GpuCore 未挂载").wallpaper_config = background;
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .background_checked = None;
         self.poll_background();
         self.cursor_color = config.colors.cursor;
         self.selection_color = config.colors.selection;
@@ -982,38 +726,45 @@ impl Renderer {
     }
 
     pub fn poll_background(&mut self) -> bool {
-        if self
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        if core
             .background_checked
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(250))
         {
             return false;
         }
-        self.background_checked = Some(std::time::Instant::now());
+        core.background_checked = Some(std::time::Instant::now());
         let loaded = wallpaper::request(
-            &self.wallpaper_config.0,
-            self.wallpaper_config.1,
-            self.wallpaper_config.2,
+            &core.wallpaper_config.0,
+            core.wallpaper_config.1,
+            core.wallpaper_config.2,
         );
-        let next = if self.wallpaper_config.0.is_empty() {
+        let next = if core.wallpaper_config.0.is_empty() {
             None
         } else {
             // A busy cache or pending retry must not flash a loaded background away.
-            loaded.or_else(|| self.wallpaper.clone())
+            loaded.or_else(|| core.wallpaper.clone())
         };
-        let changed = match (&self.wallpaper, &next) {
+        let changed = match (&core.wallpaper, &next) {
             (Some(a), Some(b)) => !Arc::ptr_eq(&a.rgba, &b.rgba),
             (None, None) => false,
             _ => true,
         };
         if changed {
-            self.wallpaper = next;
+            core.wallpaper = next;
             // img_cache(kitty 内联图,按图像 id 缓存)与壁纸无关:
             // 不清 —— 滑条每步换壁纸时内联图不用重传。
         }
         changed
     }
-    pub fn has_background_image(&self) -> bool {
-        !self.wallpaper_config.0.is_empty()
+    pub fn has_background_image(&mut self) -> bool {
+        !self
+            .core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .wallpaper_config
+            .0
+            .is_empty()
     }
 
     /// 最近一次背景图片解码失败原因(设置面板显示;成功或无图时为 None)。
@@ -1025,7 +776,10 @@ impl Renderer {
     pub fn update_font(&mut self, config: &Config, scale: f64) {
         let px = config.font.size * 96.0 / 72.0 * scale as f32;
         let metrics = Metrics::new(px, (px * 1.25).round());
-        let mut probe = Buffer::new(&mut self.font_system, metrics);
+        let mut probe = Buffer::new(
+            &mut self.core.as_mut().expect("GpuCore 未挂载").font_system,
+            metrics,
+        );
         probe.set_size(None, None);
         probe.set_text(
             "M",
@@ -1040,7 +794,10 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
-        probe.shape_until_scroll(&mut self.font_system, false);
+        probe.shape_until_scroll(
+            &mut self.core.as_mut().expect("GpuCore 未挂载").font_system,
+            false,
+        );
         let width = probe
             .layout_runs()
             .next()
@@ -1049,12 +806,25 @@ impl Renderer {
             .round()
             .max(1.0);
         self.cell = (width, metrics.line_height);
-        self.family = config.font.family.clone();
-        self.font_weight = config.font.weight;
-        self.font_metrics = metrics;
-        self.glyph_buffers.clear();
-        self.preedit_buffer.set_metrics(metrics);
-        self.preedit_buffer.set_monospace_width(Some(width));
+        self.core.as_mut().expect("GpuCore 未挂载").font_key.family = config.font.family.clone();
+        self.core.as_mut().expect("GpuCore 未挂载").font_key.weight = config.font.weight;
+        self.core.as_mut().expect("GpuCore 未挂载").font_key.size_px = px;
+        self.core.as_mut().expect("GpuCore 未挂载").font_metrics = metrics;
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .glyph_buffers
+            .clear();
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .preedit_buffer
+            .set_metrics(metrics);
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .preedit_buffer
+            .set_monospace_width(Some(width));
     }
 
     /// 热重载单元格内边距(不重建字形系统;网格列数由调用方按新
@@ -1091,7 +861,7 @@ impl Renderer {
         }
         self.size = (w, h);
         self.surface.configure(
-            &self.device,
+            &self.core.as_mut().expect("GpuCore 未挂载").device,
             &wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
                 format: self.format,
@@ -1112,10 +882,12 @@ impl Renderer {
         let locals = Locals {
             resolution: [self.size.0 as f32, self.size.1 as f32],
         };
-        self.queue
-            .write_buffer(&self.locals_buf, 0, bytemuck::cast_slice(&[locals]));
-        self.viewport.update(
-            &self.queue,
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        core.queue
+            .write_buffer(&core.locals_buf, 0, bytemuck::cast_slice(&[locals]));
+        let set = core.glyph_sets.current.as_mut().expect("glyph 集未构建");
+        set.1.viewport.update(
+            &core.queue,
             glyphon::Resolution {
                 width: self.size.0,
                 height: self.size.1,
@@ -1135,7 +907,8 @@ impl Renderer {
     /// 上传新图像纹理(架构 §6:数据身份 = Arc 指针,零哈希零
     /// 上传;缓存按当前可见集保留,删除/替换的图像纹理随帧释放)。
     fn rebuild_images(&mut self, grid: &Grid) {
-        let images: Vec<_> = self.wallpaper.iter().chain(grid.images.iter()).collect();
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        let images: Vec<_> = core.wallpaper.iter().chain(grid.images.iter()).collect();
         self.current_images = images
             .iter()
             .copied()
@@ -1143,7 +916,7 @@ impl Renderer {
             .map(|(index, img)| {
                 ImageDraw::new(
                     img,
-                    self.wallpaper.is_some() && index == 0,
+                    core.wallpaper.is_some() && index == 0,
                     self.cell,
                     self.padding,
                     self.size,
@@ -1153,25 +926,25 @@ impl Renderer {
         // 只保留本帧可见图像的缓存项(删除/替换 → 旧纹理随帧释放)。
         let visible: std::collections::HashSet<(u32, usize)> =
             self.current_images.iter().map(|image| image.key).collect();
-        self.img_cache.retain(|k, _| visible.contains(k));
+        core.img_cache.retain(|k, _| visible.contains(k));
         for img in images {
             let key = (
                 img.id,
                 std::sync::Arc::as_ptr(&img.rgba) as *const () as usize,
             );
-            if self.img_cache.contains_key(&key) {
+            if core.img_cache.contains_key(&key) {
                 continue;
             }
-            if self.img_cache.len() > 64 {
+            if core.img_cache.len() > 64 {
                 // 缓存上限:移除不在可见集里的最旧项(可见集已保留)。
-                let keys: Vec<(u32, usize)> = self.img_cache.keys().copied().take(32).collect();
+                let keys: Vec<(u32, usize)> = core.img_cache.keys().copied().take(32).collect();
                 for k in keys {
                     if !visible.contains(&k) {
-                        self.img_cache.remove(&k);
+                        core.img_cache.remove(&k);
                     }
                 }
             }
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = core.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("tay kitty image"),
                 size: wgpu::Extent3d {
                     width: img.w,
@@ -1185,7 +958,7 @@ impl Renderer {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            self.queue.write_texture(
+            core.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
                     mip_level: 0,
@@ -1205,13 +978,14 @@ impl Renderer {
                 },
             );
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let set = core.glyph_sets.current.as_ref().expect("glyph 集未构建");
+            let bind = core.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tay kitty image bind"),
-                layout: &self.img_pipeline.get_bind_group_layout(0),
+                layout: &set.1.img_pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.locals_buf.as_entire_binding(),
+                        resource: core.locals_buf.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1219,17 +993,17 @@ impl Renderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.img_sampler),
+                        resource: wgpu::BindingResource::Sampler(&core.img_sampler),
                     },
                 ],
             });
-            let inst = self.device.create_buffer(&wgpu::BufferDescriptor {
+            let inst = core.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tay image inst"),
                 size: 16,
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.img_cache
+            core.img_cache
                 .insert(key, (texture, bind, img.w, img.h, inst));
         }
     }
@@ -1237,16 +1011,17 @@ impl Renderer {
     /// Shape each distinct styled character once; placement always uses the
     /// terminal cell, never accumulated font advances (including fallback fonts).
     fn rebuild_text(&mut self, grid: &Grid) {
-        if self.glyph_buffers.len() > 4096 {
-            self.glyph_buffers.clear();
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        if core.glyph_buffers.len() > 4096 {
+            core.glyph_buffers.clear();
         }
         self.glyph_draws = text_cells(grid, self.cursor_color);
         for draw in &self.glyph_draws {
             let key = draw.key();
-            if self.glyph_buffers.contains_key(&key) {
+            if core.glyph_buffers.contains_key(&key) {
                 continue;
             }
-            let mut buffer = Buffer::new(&mut self.font_system, self.font_metrics);
+            let mut buffer = Buffer::new(&mut core.font_system, core.font_metrics);
             buffer.set_wrap(glyphon::cosmic_text::Wrap::None);
             buffer.set_hinting(glyphon::cosmic_text::Hinting::Enabled);
             let mut cluster = draw.cell.c.to_string();
@@ -1256,8 +1031,8 @@ impl Renderer {
             buffer.set_text(
                 &cluster,
                 &attrs_for(
-                    &self.family,
-                    self.font_weight,
+                    &core.font_key.family,
+                    core.font_key.weight,
                     draw.cell.fg,
                     draw.cell.bold,
                     draw.cell.italic,
@@ -1266,14 +1041,14 @@ impl Renderer {
                 Shaping::Advanced,
                 None,
             );
-            buffer.shape_until_scroll(&mut self.font_system, false);
+            buffer.shape_until_scroll(&mut core.font_system, false);
             let mut ink: Option<GlyphInk> = None;
             for run in buffer.layout_runs() {
                 for glyph in run.glyphs {
                     let physical = glyph.physical((0.0, 0.0), 1.0);
-                    if let Some(image) = self
+                    if let Some(image) = core
                         .swash_cache
-                        .get_image(&mut self.font_system, physical.cache_key)
+                        .get_image(&mut core.font_system, physical.cache_key)
                     {
                         let p = image.placement;
                         if p.width == 0 || p.height == 0 {
@@ -1299,7 +1074,7 @@ impl Renderer {
                     }
                 }
             }
-            self.glyph_buffers.insert(key, CachedGlyph { buffer, ink });
+            core.glyph_buffers.insert(key, CachedGlyph { buffer, ink });
         }
         self.preedit_right = grid.preedit.as_ref().and_then(|p| p.clip_right);
         self.preedit_pos = grid
@@ -1307,11 +1082,11 @@ impl Renderer {
             .as_ref()
             .filter(|p| p.row < grid.rows && p.col < grid.cols)
             .map(|p| (p.col, p.row));
-        self.preedit_buffer.set_text(
+        core.preedit_buffer.set_text(
             grid.preedit.as_ref().map(|p| p.text.as_str()).unwrap_or(""),
             &attrs_for(
-                &self.family,
-                self.font_weight,
+                &core.font_key.family,
+                core.font_key.weight,
                 grid_default_fg(grid),
                 false,
                 false,
@@ -1320,8 +1095,8 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
-        self.preedit_buffer
-            .shape_until_scroll(&mut self.font_system, false);
+        core.preedit_buffer
+            .shape_until_scroll(&mut core.font_system, false);
     }
 
     /// 单元格底色 + 选区 + 光标 → 四边形实例。
@@ -1351,7 +1126,7 @@ impl Renderer {
                         (col - start + 1) as f32 * cw,
                         ch,
                     ],
-                    color: to_linear(bg, self.srgb),
+                    color: to_linear(bg, self.core.as_mut().expect("GpuCore 未挂载").srgb()),
                 });
                 col += 1;
             }
@@ -1380,7 +1155,10 @@ impl Renderer {
                 ch * 0.28
             }
             .min(w * 0.5);
-            let mask = to_linear(panel.background, self.srgb);
+            let mask = to_linear(
+                panel.background,
+                self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+            );
             for rect in [[x, y, w, inset], [x, y + ch - inset, w, inset]] {
                 self.quads.push(Quad { rect, color: mask });
             }
@@ -1422,7 +1200,7 @@ impl Renderer {
                         .max(0.0),
                         2.0,
                     ],
-                    color: to_linear(color, self.srgb),
+                    color: to_linear(color, self.core.as_mut().expect("GpuCore 未挂载").srgb()),
                 });
             }
         }
@@ -1446,7 +1224,10 @@ impl Renderer {
                         (x1 - x0) as f32 * cw,
                         ch,
                     ],
-                    color: to_linear(self.selection_color, self.srgb),
+                    color: to_linear(
+                        self.selection_color,
+                        self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+                    ),
                 });
             }
         }
@@ -1473,7 +1254,10 @@ impl Renderer {
                         (x1 - x0) as f32 * cw,
                         ch,
                     ],
-                    color: to_linear(self.search_hit_color, self.srgb),
+                    color: to_linear(
+                        self.search_hit_color,
+                        self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+                    ),
                 });
             }
         }
@@ -1487,7 +1271,10 @@ impl Renderer {
                     o.text.chars().count() as f32 * cw,
                     ch,
                 ],
-                color: to_linear(Rgb::new(0x00, 0x8b, 0x74), self.srgb),
+                color: to_linear(
+                    Rgb::new(0x00, 0x8b, 0x74),
+                    self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+                ),
             });
         }
 
@@ -1522,7 +1309,10 @@ impl Renderer {
             };
             self.quads.push(Quad {
                 rect: [x, y, w, h],
-                color: to_linear(self.cursor_color, self.srgb),
+                color: to_linear(
+                    self.cursor_color,
+                    self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+                ),
             });
         }
 
@@ -1537,7 +1327,10 @@ impl Renderer {
                     geometry.width * 0.4,
                     geometry.height,
                 ],
-                color: to_linear(self.bg_default, self.srgb),
+                color: to_linear(
+                    self.bg_default,
+                    self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+                ),
             });
             self.quads.push(Quad {
                 rect: [
@@ -1546,7 +1339,10 @@ impl Renderer {
                     geometry.width * 0.4,
                     geometry.thumb_height,
                 ],
-                color: to_linear(self.cursor_color, self.srgb),
+                color: to_linear(
+                    self.cursor_color,
+                    self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+                ),
             });
         }
 
@@ -1561,7 +1357,10 @@ impl Renderer {
             let x = (pad + (icon.start + icon.end) as f32 * cw * 0.5 - side * 0.5).round();
             let y = (pad + icon.row as f32 * ch + (icon_height - side) * 0.5).round();
             let stroke = (ch * 0.05).round().max(1.0);
-            let color = to_linear(grid.cells[icon.row * grid.cols + icon.start].fg, self.srgb);
+            let color = to_linear(
+                grid.cells[icon.row * grid.cols + icon.start].fg,
+                self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+            );
             let mut line = |x1: f32, y1: f32, x2: f32, y2: f32| {
                 let count = ((x2 - x1).abs().max((y2 - y1).abs())).ceil().max(1.0) as usize;
                 for i in 0..=count {
@@ -1628,16 +1427,17 @@ impl Renderer {
 
         // 上传实例(超出容量则扩容)。
         let needed = (self.quads.len().max(1) * std::mem::size_of::<Quad>()) as u64;
-        if needed > self.instance_buf.size() {
-            self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        if needed > core.instance_buf.size() {
+            core.instance_buf = core.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("tay quad instances"),
                 size: needed.next_power_of_two(),
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
         }
-        self.queue
-            .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.quads));
+        core.queue
+            .write_buffer(&core.instance_buf, 0, bytemuck::cast_slice(&self.quads));
     }
 
     /// 渲染一帧到 `texture`(当前 surface 纹理)并 present。
@@ -1647,7 +1447,10 @@ impl Renderer {
         } else {
             alpha.clamp(0.0, 1.0)
         };
-        let mut background = to_linear(self.bg_default, self.srgb);
+        let mut background = to_linear(
+            self.bg_default,
+            self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+        );
         if self.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
             for channel in &mut background[..3] {
                 *channel *= alpha;
@@ -1656,27 +1459,45 @@ impl Renderer {
         let view = texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("tay frame"),
-            });
+        let mut encoder =
+            self.core()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("tay frame"),
+                });
 
-        let mut areas: Vec<TextArea<'_>> = self
+        // 拷贝本帧绘制描述:areas 持 core 内缓冲的不可变借用,
+        // 与 prepare 对 core 其他字段的可变借用需在同一个 core
+        // 借用内做字段拆分(每帧几 KB 拷贝,可忽略)。
+        let descs: Vec<(usize, usize, usize, char, GlyphKey)> = self
             .glyph_draws
             .iter()
-            .map(|draw| {
-                let left = self.padding + draw.col as f32 * self.cell.0;
-                let top = self.padding
-                    + draw.row as f32 * self.cell.1
-                    + if draw.row == 0 {
-                        self.tab_panel_rows.saturating_sub(1) as f32 * self.cell.1 * 0.5
+            .map(|d| (d.col, d.row, d.width, d.cell.c, d.key()))
+            .collect();
+        let (cell, padding, tab_panel_rows, fg_default) = (
+            self.cell,
+            self.padding,
+            self.tab_panel_rows,
+            self.fg_default,
+        );
+        let (preedit_pos, preedit_right, size_w) =
+            (self.preedit_pos, self.preedit_right, self.size.0);
+        {
+            let core = self.core.as_mut().expect("GpuCore 未挂载");
+            let set = &mut core.glyph_sets.current.as_mut().expect("glyph 集未构建").1;
+            let mut areas: Vec<TextArea<'_>> = Vec::new();
+            for (col, row, width, c, key) in &descs {
+                let left = padding + *col as f32 * cell.0;
+                let top = padding
+                    + *row as f32 * cell.1
+                    + if *row == 0 {
+                        tab_panel_rows.saturating_sub(1) as f32 * cell.1 * 0.5
                     } else {
                         0.0
                     };
-                let cached = &self.glyph_buffers[&draw.key()];
-                let (dx, dy, scale) = fit_glyph(cached.ink, draw.cell.c, draw.width, self.cell);
-                TextArea {
+                let cached = &core.glyph_buffers[key];
+                let (dx, dy, scale) = fit_glyph(cached.ink, *c, *width, cell);
+                areas.push(TextArea {
                     buffer: &cached.buffer,
                     left: left + dx,
                     top: top + dy,
@@ -1684,47 +1505,46 @@ impl Renderer {
                     bounds: TextBounds {
                         left: left.floor() as i32,
                         top: top.floor() as i32,
-                        right: (left + draw.width as f32 * self.cell.0).ceil() as i32,
-                        bottom: (top + self.cell.1).ceil() as i32,
+                        right: (left + *width as f32 * cell.0).ceil() as i32,
+                        bottom: (top + cell.1).ceil() as i32,
                     },
-                    default_color: self.fg_default,
+                    default_color: fg_default,
                     custom_glyphs: &[],
-                }
-            })
-            .collect();
-        if let Some((col, row)) = self.preedit_pos {
-            let left = self.padding + col as f32 * self.cell.0;
-            let top = self.padding + row as f32 * self.cell.1;
-            areas.push(TextArea {
-                buffer: &self.preedit_buffer,
-                left,
-                top,
-                scale: 1.0,
-                bounds: TextBounds {
-                    left: left.floor() as i32,
-                    top: top.floor() as i32,
-                    right: self
-                        .preedit_right
-                        .map(|col| (self.padding + col as f32 * self.cell.0).ceil() as i32)
-                        .unwrap_or(self.size.0 as i32)
-                        .min(self.size.0 as i32),
-                    bottom: (top + self.cell.1).ceil() as i32,
-                },
-                default_color: self.fg_default,
-                custom_glyphs: &[],
-            });
+                });
+            }
+            if let Some((col, row)) = preedit_pos {
+                let left = padding + col as f32 * cell.0;
+                let top = padding + row as f32 * cell.1;
+                areas.push(TextArea {
+                    buffer: &core.preedit_buffer,
+                    left,
+                    top,
+                    scale: 1.0,
+                    bounds: TextBounds {
+                        left: left.floor() as i32,
+                        top: top.floor() as i32,
+                        right: preedit_right
+                            .map(|col| (padding + col as f32 * cell.0).ceil() as i32)
+                            .unwrap_or(size_w as i32)
+                            .min(size_w as i32),
+                        bottom: (top + cell.1).ceil() as i32,
+                    },
+                    default_color: fg_default,
+                    custom_glyphs: &[],
+                });
+            }
+            set.text
+                .prepare(
+                    &core.device,
+                    &core.queue,
+                    &mut core.font_system,
+                    &mut set.atlas,
+                    &set.viewport,
+                    areas,
+                    &mut core.swash_cache,
+                )
+                .map_err(|e| format!("文本准备失败: {e}"))?;
         }
-        self.text
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.atlas,
-                &self.viewport,
-                areas,
-                &mut self.swash_cache,
-            )
-            .map_err(|e| format!("文本准备失败: {e}"))?;
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1750,17 +1570,17 @@ impl Renderer {
             });
             self.draw_images(&mut pass, false, true);
             if !self.quads.is_empty() {
-                pass.set_pipeline(&self.bg_pipeline);
-                pass.set_bind_group(0, &self.locals_bind, &[]);
-                pass.set_vertex_buffer(0, self.unit_quad.slice(..));
-                pass.set_vertex_buffer(1, self.instance_buf.slice(..));
-                pass.draw(0..6, 0..self.quads.len() as u32);
+                self.draw_quads(&mut pass);
             }
             // 图像:z<=0 在文本之下。
             self.draw_images(&mut pass, false, false);
-            self.text
-                .render(&self.atlas, &self.viewport, &mut pass)
-                .map_err(|e| format!("文本渲染失败: {e}"))?;
+            {
+                let core = self.core.as_mut().expect("GpuCore 未挂载");
+                let set = core.glyph_set_mut();
+                set.text
+                    .render(&set.atlas, &set.viewport, &mut pass)
+                    .map_err(|e| format!("文本渲染失败: {e}"))?;
+            }
             // 图像:z>0 在文本之上。
             self.draw_images(&mut pass, true, false);
         }
@@ -1776,13 +1596,33 @@ impl Renderer {
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
-        self.queue.present(texture);
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .queue
+            .submit(Some(encoder.finish()));
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .queue
+            .present(texture);
         Ok(())
     }
 
     /// 画 kitty 图像(`above` = 文本之上)。
+    /// 四边形实例(单元格底色/选区/光标)绘制:core 借用与 self 方法
+    /// 调用互斥,单独成方法。
+    fn draw_quads(&mut self, pass: &mut wgpu::RenderPass<'_>) {
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        pass.set_pipeline(core.bg_pipeline());
+        pass.set_bind_group(0, &core.locals_bind, &[]);
+        pass.set_vertex_buffer(0, core.unit_quad.slice(..));
+        pass.set_vertex_buffer(1, core.instance_buf.slice(..));
+        pass.draw(0..6, 0..self.quads.len() as u32);
+    }
+
     fn draw_images(&mut self, pass: &mut wgpu::RenderPass<'_>, above: bool, wallpaper: bool) {
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
         for image in self
             .current_images
             .iter()
@@ -1795,14 +1635,14 @@ impl Renderer {
                 continue;
             }
             pass.set_scissor_rect(x, y, w, h);
-            let Some((_, bind, _, _, inst)) = self.img_cache.get(&key) else {
+            let Some((_, bind, _, _, inst)) = core.img_cache.get(&key) else {
                 continue;
             };
-            self.queue
+            core.queue
                 .write_buffer(inst, 0, bytemuck::cast_slice(&[rect]));
-            pass.set_pipeline(&self.img_pipeline);
+            pass.set_pipeline(core.img_pipeline());
             pass.set_bind_group(0, bind, &[]);
-            pass.set_vertex_buffer(0, self.uv_quad.slice(..));
+            pass.set_vertex_buffer(0, core.uv_quad.slice(..));
             pass.set_vertex_buffer(1, inst.slice(..));
             pass.draw(0..6, 0..1);
         }
@@ -1815,12 +1655,17 @@ impl Renderer {
         let (w, h) = (size.width, size.height);
         // BGRA 每行 256 字节对齐。
         let bpr = (w * 4).next_multiple_of(256);
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("tay shot"),
-            size: bpr as u64 * h as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
+        let buf = self
+            .core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .device
+            .create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tay shot"),
+                size: bpr as u64 * h as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -1842,13 +1687,22 @@ impl Renderer {
                 depth_or_array_layers: 1,
             },
         );
-        self.queue.submit(Some(encoder.finish()));
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .queue
+            .submit(Some(encoder.finish()));
         let slice = buf.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        self.core
+            .as_mut()
+            .expect("GpuCore 未挂载")
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .ok();
         if rx.recv().is_err() {
             log::error!("截图读回失败");
             return;
@@ -1893,6 +1747,405 @@ impl Renderer {
             log::info!("截图已保存: {path}");
         }
     }
+}
+
+/// 协商 surface 格式/alpha 并完成 configure。
+fn negotiate_configure(
+    surface: &wgpu::Surface,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    size: (u32, u32),
+) -> Result<(wgpu::TextureFormat, wgpu::CompositeAlphaMode), String> {
+    let caps = surface.get_capabilities(adapter);
+    // 优先选 sRGB 格式(与 glyphon 的默认一致),否则取第一个。
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|f| f.is_srgb())
+        .or_else(|| caps.formats.first().copied())
+        .ok_or("surface 无可用格式")?;
+    let alpha_mode = [
+        wgpu::CompositeAlphaMode::PreMultiplied,
+        wgpu::CompositeAlphaMode::PostMultiplied,
+    ]
+    .into_iter()
+    .find(|m| caps.alpha_modes.contains(m))
+    .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+    log::info!("Surface alpha mode: {alpha_mode:?}");
+    surface.configure(
+        device,
+        &wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format,
+            width: size.0.max(1),
+            height: size.1.max(1),
+            present_mode: wgpu::PresentMode::AutoNoVsync,
+            alpha_mode,
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        },
+    );
+    Ok((format, alpha_mode))
+}
+
+fn font_key_of(config: &Config, scale_factor: f64) -> FontKey {
+    FontKey {
+        family: config.font.family.clone(),
+        weight: config.font.weight,
+        size_px: config.font.size * 96.0 / 72.0 * scale_factor as f32,
+    }
+}
+
+/// 在给定 FontSystem 上 probe "M" 测量单元格尺寸(probe 廉价,复用字体栈时也执行)。
+fn probe_cell(
+    font_system: &mut FontSystem,
+    config: &Config,
+    scale_factor: f64,
+    format: Option<wgpu::TextureFormat>,
+) -> (f32, f32) {
+    let font_size_px = config.font.size * 96.0 / 72.0 * scale_factor as f32;
+    let metrics = Metrics::new(font_size_px, (font_size_px * 1.25).round());
+    let mut probe = Buffer::new(font_system, metrics);
+    probe.set_size(None, None);
+    let probe_attrs = attrs_for(
+        &config.font.family,
+        config.font.weight,
+        config.colors.foreground,
+        false,
+        false,
+        false,
+    );
+    probe.set_text("M", &probe_attrs, Shaping::Advanced, None);
+    probe.shape_until_scroll(font_system, false);
+    let mut cell_w = font_size_px * 0.6; // 兜底:等宽近似
+    let mut cell_h = metrics.line_height;
+    if let Some(run) = probe.layout_runs().next() {
+        cell_w = run.glyphs.iter().map(|g| g.w).sum::<f32>().round().max(1.0);
+        cell_h = run.line_height.max(1.0);
+    }
+    if let Some(format) = format {
+        log::info!(
+            "字体 {} @ {font_size_px:.1}px → 单元格 {cell_w:.2}×{cell_h:.2}px,surface 格式 {format:?}",
+            config.font.family
+        );
+    }
+    (cell_w, cell_h)
+}
+
+/// 全新字体栈(首次初始化 / 字体键变化时)。
+fn build_fonts(
+    config: &Config,
+    scale_factor: f64,
+) -> (FontSystem, SwashCache, Metrics, f32, (f32, f32)) {
+    log::info!("字体栈构建(FontSystem::new,首次或字体键变化)");
+    let font_size_px = config.font.size * 96.0 / 72.0 * scale_factor as f32;
+    let mut font_system = FontSystem::new();
+    let (cell_w, cell_h) = probe_cell(&mut font_system, config, scale_factor, None);
+    let swash_cache = SwashCache::new();
+    (
+        font_system,
+        swash_cache,
+        Metrics::new(font_size_px, cell_h),
+        font_size_px,
+        (cell_w, cell_h),
+    )
+}
+
+/// 按 surface format 构建 glyphon 集与两条自绘管线(device 级资源,format 绑定)。
+fn build_glyph_set(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> Result<GlyphSet, String> {
+    // —— glyphon ——
+    let cache = Cache::new(device);
+    let mut atlas = TextAtlas::new(device, queue, &cache, format);
+    let text = TextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
+    let viewport = Viewport::new(device, &cache);
+
+    // —— 自绘 bg 管线 ——
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("tay quads"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("quad.wgsl"))),
+    });
+    let locals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tay locals"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let bg_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("tay quads layout"),
+        bind_group_layouts: &[Some(&locals_layout)],
+        immediate_size: 0,
+    });
+    let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("tay quads pipeline"),
+        layout: Some(&bg_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[
+                // 单位 quad 角点
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: 8,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                }),
+                // 实例:rect + color
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Quad>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x4, 3 => Float32x4],
+                }),
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // —— 图像管线 ——
+    let img_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tay image"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let img_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("tay image layout"),
+        bind_group_layouts: &[Some(&img_layout)],
+        immediate_size: 0,
+    });
+    let img_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("tay image"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("image.wgsl"))),
+    });
+    let img_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("tay image pipeline"),
+        layout: Some(&img_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &img_shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2],
+                }),
+                Some(wgpu::VertexBufferLayout {
+                    array_stride: 16,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &wgpu::vertex_attr_array![2 => Float32x4],
+                }),
+            ],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &img_shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    Ok(GlyphSet {
+        cache,
+        atlas,
+        text,
+        viewport,
+        bg_pipeline,
+        img_pipeline,
+        srgb: format.is_srgb(),
+    })
+}
+
+/// 首次初始化:Adapter/Device/字体/glyph 集/统一缓冲(Instance 由调用方持有)。
+fn build_fresh(
+    instance: &wgpu::Instance,
+    surface: &wgpu::Surface,
+    config: &Config,
+    size: (u32, u32),
+    scale_factor: f64,
+) -> Result<(GpuCore, wgpu::TextureFormat, wgpu::CompositeAlphaMode), String> {
+    let (adapter, device, queue) = crate::gpu_core::request_adapter_device(instance, surface)?;
+    let (format, alpha_mode) = negotiate_configure(surface, &adapter, &device, size)?;
+    let (mut font_system, swash_cache, metrics, size_px, cell) = build_fonts(config, scale_factor);
+    let glyph_set = build_glyph_set(&device, &queue, format)?;
+    let preedit_buffer = Buffer::new(&mut font_system, Metrics::new(size_px, cell.1));
+    let (uv_quad, img_sampler, unit_quad, instance_buf, locals_buf, locals_bind) =
+        build_buffers(&device);
+
+    device.on_uncaptured_error(std::sync::Arc::new(|e| {
+        log::error!("wgpu 校验错误: {e:?}");
+    }));
+
+    let core = GpuCore {
+        adapter: Some(adapter),
+        device,
+        queue,
+        font_system,
+        swash_cache,
+        glyph_sets: FormatCache {
+            current: Some((format, glyph_set)),
+        },
+        glyph_buffers: Default::default(),
+        font_metrics: metrics,
+        preedit_buffer,
+        font_key: FontKey {
+            family: config.font.family.clone(),
+            weight: config.font.weight,
+            size_px,
+        },
+        wallpaper: None,
+        wallpaper_config: (String::new(), -1.0, -1.0),
+        background_checked: None,
+        img_cache: Default::default(),
+        uv_quad,
+        img_sampler,
+        unit_quad,
+        instance_buf,
+        locals_buf,
+        locals_bind,
+    };
+    Ok((core, format, alpha_mode))
+}
+
+/// device 级统一缓冲与采样器(首次构建与混合 GPU 重建共用)。
+fn build_buffers(
+    device: &wgpu::Device,
+) -> (
+    wgpu::Buffer,
+    wgpu::Sampler,
+    wgpu::Buffer,
+    wgpu::Buffer,
+    wgpu::Buffer,
+    wgpu::BindGroup,
+) {
+    let uv_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("tay image quad"),
+        // (pos, uv) × 4 顶点。
+        contents: bytemuck::cast_slice(&[
+            0.0f32, 0.0, 0.0, 0.0, //
+            1.0, 0.0, 1.0, 0.0, //
+            1.0, 1.0, 1.0, 1.0, //
+            0.0, 0.0, 0.0, 0.0, //
+            1.0, 1.0, 1.0, 1.0, //
+            0.0, 1.0, 0.0, 1.0, //
+        ]),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let img_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("tay image sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    let unit_quad = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("tay unit quad"),
+        contents: bytemuck::cast_slice(&[
+            0.0f32, 0.0, 1.0, 0.0, 1.0, 1.0, //
+            0.0, 0.0, 1.0, 1.0, 0.0, 1.0, //
+        ]),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tay quad instances"),
+        size: (std::mem::size_of::<Quad>() * 4096) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let locals_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("tay locals"),
+        size: std::mem::size_of::<Locals>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let locals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("tay locals"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let locals_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tay locals bind"),
+        layout: &locals_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: locals_buf.as_entire_binding(),
+        }],
+    });
+    (
+        uv_quad,
+        img_sampler,
+        unit_quad,
+        instance_buf,
+        locals_buf,
+        locals_bind,
+    )
 }
 
 /// 网格首格的默认前景色(空行 span 用)。
