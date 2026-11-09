@@ -69,10 +69,26 @@ impl GlyphSet {
     }
 }
 
-/// 收起时捕获的最后一帧(remap 后先上屏,有界 1 张)。
+/// 缓存帧在新 surface 内的居中 aspect-fit 矩形 (x, y, w, h)。
+/// 任一维为 0 → None(调用方跳过 blit)。
+pub fn cached_fit_rect(src: (u32, u32), dst: (u32, u32)) -> Option<(f32, f32, f32, f32)> {
+    if src.0 == 0 || src.1 == 0 || dst.0 == 0 || dst.1 == 0 {
+        return None;
+    }
+    let scale = ((dst.0 as f32) / (src.0 as f32)).min((dst.1 as f32) / (src.1 as f32));
+    let w = src.0 as f32 * scale;
+    let h = src.1 as f32 * scale;
+    Some(((dst.0 as f32 - w) * 0.5, (dst.1 as f32 - h) * 0.5, w, h))
+}
+
+/// 缓存帧:收起时捕获的最后一帧 + 其上屏所需资源(有界 1 张)。
 pub struct CachedFrame {
     pub texture: wgpu::Texture,
     pub size: (u32, u32),
+    /// 以缓存纹理为源的 bind group(remap 后 blit 用)。
+    pub bind: wgpu::BindGroup,
+    /// blit 实例缓冲(rect 写入)。
+    pub inst: wgpu::Buffer,
 }
 
 /// 跨 remap 常驻的 device 级资源:Adapter/Device/Queue、
@@ -199,22 +215,57 @@ impl GpuCore {
     ) {
         if self.cached_frame.as_ref().map(|c| c.size) != Some(size) {
             let format = self.glyph_sets.current.as_ref().expect("glyph 集未构建").0;
-            self.cached_frame = Some(CachedFrame {
-                texture: self.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("tay cached frame"),
-                    size: wgpu::Extent3d {
-                        width: size.0.max(1),
-                        height: size.1.max(1),
-                        depth_or_array_layers: 1,
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tay cached frame"),
+                size: wgpu::Extent3d {
+                    width: size.0.max(1),
+                    height: size.1.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("tay cached frame bind"),
+                layout: &self
+                    .glyph_sets
+                    .current
+                    .as_ref()
+                    .expect("glyph 集未构建")
+                    .1
+                    .img_pipeline
+                    .get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.locals_buf.as_entire_binding(),
                     },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                }),
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.img_sampler),
+                    },
+                ],
+            });
+            let inst = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tay cached frame inst"),
+                size: 16,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.cached_frame = Some(CachedFrame {
+                texture,
                 size,
+                bind,
+                inst,
             });
         }
         if let Some(cached) = &self.cached_frame {
@@ -304,5 +355,37 @@ mod tests {
         };
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn fit_rect_same_size_fills_dst() {
+        assert_eq!(
+            cached_fit_rect((400, 400), (400, 400)),
+            Some((0.0, 0.0, 400.0, 400.0))
+        );
+    }
+
+    #[test]
+    fn fit_rect_narrower_src_centers_horizontally() {
+        // src 200×100 → dst 400×400:等比放大到 400×200,上下留边。
+        assert_eq!(
+            cached_fit_rect((200, 100), (400, 400)),
+            Some((0.0, 100.0, 400.0, 200.0))
+        );
+    }
+
+    #[test]
+    fn fit_rect_wider_src_centers_vertically() {
+        // src 400×100 → dst 100×400:scale 0.25 → 100×25,上下留边。
+        assert_eq!(
+            cached_fit_rect((400, 100), (100, 400)),
+            Some((0.0, 187.5, 100.0, 25.0))
+        );
+    }
+
+    #[test]
+    fn fit_rect_zero_dimension_is_none() {
+        assert_eq!(cached_fit_rect((0, 100), (400, 400)), None);
+        assert_eq!(cached_fit_rect((200, 0), (400, 400)), None);
     }
 }

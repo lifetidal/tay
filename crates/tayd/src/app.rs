@@ -323,6 +323,9 @@ pub struct TayApp {
     layer_h: i32,
     shown_once: bool,
     show_at: Option<Instant>,
+    /// 内容帧计时起点:缓存 blit 上屏时刻(无 blit 时 = show_at,
+    /// 与 209ms 基线口径一致)。
+    content_at: Option<Instant>,
     /// 呼出重建路径的分段计时(仅 remap 驱动的呼出打点)。
     summon_timer: Option<crate::summon_timing::StageTimer>,
     ipc_listener: Option<std::os::unix::net::UnixListener>,
@@ -518,6 +521,7 @@ impl TayApp {
             layer_h: 480,
             shown_once: false,
             show_at: None,
+            content_at: None,
             summon_timer: None,
             ipc_listener,
             ipc_tx,
@@ -3484,7 +3488,7 @@ impl TayApp {
                         // commit 才会被 KWin 响应(pre_present 的空 commit
                         // 注册不触发 done,会导致帧循环停摆)。
                         ctx.arm_frame_after_present();
-                        if let Some(at) = self.show_at.take() {
+                        if let Some(at) = self.content_at.take() {
                             self.shown_once = true;
                             let summary = self
                                 .summon_timer
@@ -3495,7 +3499,7 @@ impl TayApp {
                                 })
                                 .unwrap_or_default();
                             log::info!(
-                                "首帧已提交 {}ms（实际可见性由合成器决定）{}",
+                                "内容帧已提交 {}ms（实际可见性由合成器决定）{}",
                                 at.elapsed().as_millis(),
                                 summary
                             );
@@ -3883,6 +3887,34 @@ impl Handler for TayApp {
                     // 新 surface 上 margin 为全离屏,重新对齐。
                     let m = self.vis.margin();
                     ctx.set_top_margin(m);
+                    // 缓存帧同步上屏:用户第一眼画面(TAY_SHOT 跳过,
+                    // 截图必须真实内容)。
+                    let blitted = if self.shot.is_none() {
+                        if let Some(renderer) = &mut self.renderer {
+                            ctx.pre_present_notify();
+                            if renderer.blit_cached().is_ok() {
+                                ctx.arm_frame_after_present();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if blitted {
+                        if let Some(at) = self.show_at.take() {
+                            log::info!(
+                                "缓存首帧已提交 {}ms（实际可见性由合成器决定）",
+                                at.elapsed().as_millis()
+                            );
+                        }
+                        self.content_at = Some(Instant::now());
+                    } else {
+                        self.content_at = self.show_at.take();
+                    }
                     ctx.request_redraw();
                     return;
                 }

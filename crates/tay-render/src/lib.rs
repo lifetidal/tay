@@ -1626,6 +1626,72 @@ impl Renderer {
         core.capture_frame(src, encoder, self.size);
     }
 
+    /// remap 后第一帧:把缓存帧同步 blit 上屏(不等字体/网格重建)。
+    /// 无缓存帧 / surface 未就绪 → Err(调用方走正常渲染路径)。
+    /// 调用方负责 pre_present_notify / arm_frame_after_present 时序。
+    pub fn blit_cached(&mut self) -> Result<(), String> {
+        let frame = match self.acquire_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            _ => return Err("surface 未就绪".into()),
+        };
+        let (bg, alpha_mode) = (self.bg_default, self.alpha_mode);
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        let Some(cached) = &core.cached_frame else {
+            return Err("无缓存帧".into());
+        };
+        let Some((x, y, w, h)) = crate::gpu_core::cached_fit_rect(cached.size, self.size) else {
+            return Err("缓存帧尺寸无效".into());
+        };
+        let mut background = to_linear(bg, core.srgb());
+        if alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied {
+            for channel in &mut background[..3] {
+                *channel *= 1.0;
+            }
+        }
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = core
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tay cached blit"),
+            });
+        core.queue
+            .write_buffer(&cached.inst, 0, bytemuck::cast_slice(&[x, y, w, h]));
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tay cached blit pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: background[0] as f64,
+                            g: background[1] as f64,
+                            b: background[2] as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&core.img_pipeline());
+            pass.set_bind_group(0, &cached.bind, &[]);
+            pass.set_vertex_buffer(0, core.uv_quad.slice(..));
+            pass.set_vertex_buffer(1, cached.inst.slice(..));
+            pass.draw(0..6, 0..1);
+        }
+        core.queue.submit(Some(encoder.finish()));
+        core.queue.present(frame);
+        Ok(())
+    }
+
     /// 画 kitty 图像(`above` = 文本之上)。
     /// 四边形实例(单元格底色/选区/光标)绘制:core 借用与 self 方法
     /// 调用互斥,单独成方法。
