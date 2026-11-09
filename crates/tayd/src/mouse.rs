@@ -46,25 +46,13 @@ pub(crate) fn modifier_bits(mods: &Mods) -> u8 {
 }
 
 /// 按下:cb = 按键码 | 修饰位,final 字母 M。
-pub(crate) fn press(
-    enc: MouseEncoding,
-    button: u8,
-    mods: &Mods,
-    col: u32,
-    row: u32,
-) -> Vec<u8> {
+pub(crate) fn press(enc: MouseEncoding, button: u8, mods: &Mods, col: u32, row: u32) -> Vec<u8> {
     report(enc, button | modifier_bits(mods), col, row, true)
 }
 
 /// 松开:SGR 带按键码(X10 固定 3,无按键位),无移动位,
 /// final 字母 m。
-pub(crate) fn release(
-    enc: MouseEncoding,
-    button: u8,
-    mods: &Mods,
-    col: u32,
-    row: u32,
-) -> Vec<u8> {
+pub(crate) fn release(enc: MouseEncoding, button: u8, mods: &Mods, col: u32, row: u32) -> Vec<u8> {
     let cb = match enc {
         MouseEncoding::Sgr => button | modifier_bits(mods),
         MouseEncoding::X10 => 3 | modifier_bits(mods),
