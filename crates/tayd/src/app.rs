@@ -309,6 +309,9 @@ pub struct TayApp {
     /// SurfaceReplaced 时从渲染器抽出的常驻 GPU 资源,rebind 复用。
     gpu_core: Option<GpuCore>,
     renderer: Option<tay_render::Renderer>,
+    /// SurfaceReplaced 时暂存的旧渲染器(surface 层):延后到事件循环
+    /// 空闲点释放,把同步 GPU 销毁移出呼出热路径。
+    retired_renderer: crate::retired_slot::RetiredSlot<tay_render::Renderer>,
     dims: Option<(usize, usize)>,
     /// 隔离测试用的滚动条事件阶段。
     scrollbar_smoke: Option<u8>,
@@ -476,6 +479,7 @@ impl TayApp {
             instance: None,
             gpu_core: None,
             renderer: None,
+            retired_renderer: Default::default(),
             sessions,
             layouts: vec![PaneTab {
                 root: Layout::leaf(active_pane),
@@ -3555,6 +3559,7 @@ impl Drop for TayApp {
 
 impl Handler for TayApp {
     fn on_event(&mut self, ctx: &mut Ctx<'_>, event: WEvent) {
+        self.retired_renderer.take_and_drop();
         self.retiring.retain_mut(|worker| !worker.reap());
         if !self.retiring.is_empty() {
             ctx.request_wake_at(Instant::now() + Duration::from_millis(100));
@@ -4717,7 +4722,10 @@ impl Handler for TayApp {
                 if let Some(renderer) = &mut self.renderer {
                     self.gpu_core = Some(renderer.take_core());
                 }
-                self.renderer = None;
+                // 暂存延后释放:同步 swapchain 销毁(vkDeviceWaitIdle)
+                // 不占呼出关键路径;retired 保活顺序不变(延后只会更安全)。
+                self.retired_renderer
+                    .replace(self.renderer.take().expect("渲染器存在"));
                 if let Some(t) = &mut self.summon_timer {
                     t.mark("drop 旧渲染器 完成");
                 }
