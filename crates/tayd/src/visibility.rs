@@ -80,6 +80,12 @@ impl VisibilityController {
         matches!(self.vis, Vis::Animating { .. })
     }
 
+    /// 收起方向的动画中(缓存帧捕获窗口:只有这个阶段的渲染帧
+    /// 是「用户最后看到的画面」;呼出方向与静止状态都不是)。
+    pub fn hiding_anim(&self) -> bool {
+        matches!(self.vis, Vis::Animating { target: false, .. })
+    }
+
     pub fn pinned(&self) -> bool {
         self.pinned
     }
@@ -395,5 +401,48 @@ mod tests {
         v.step_at(t0 + Duration::from_millis(500), 150);
         assert!(v.is_hidden());
         assert_eq!(v.margin, -300);
+    }
+
+    #[test]
+    fn hiding_anim_true_during_hide_animation() {
+        let mut v = VisibilityController::new(400);
+        let t0 = Instant::now();
+        v.show(0);
+        v.hide(150);
+        assert!(v.hiding_anim(), "收起动画中应为 true");
+        v.step_at(t0 + Duration::from_millis(30), 150);
+        assert!(v.hiding_anim());
+    }
+
+    #[test]
+    fn hiding_anim_false_when_hide_finished() {
+        let mut v = VisibilityController::new(400);
+        let t0 = Instant::now();
+        v.show(0);
+        v.hide(150);
+        v.step_at(t0 + Duration::from_millis(500), 150);
+        assert!(v.is_hidden());
+        assert!(!v.hiding_anim(), "收起完成应为 false");
+    }
+
+    #[test]
+    fn hiding_anim_false_when_reversed_to_showing() {
+        let mut v = VisibilityController::new(400);
+        let t0 = Instant::now();
+        v.show(0);
+        v.hide(150);
+        assert!(v.hiding_anim());
+        v.step_at(t0 + Duration::from_millis(30), 150);
+        v.toggle(150);
+        assert!(!v.hiding_anim(), "动画中反向(呼出方向)不得继续捕获半程帧");
+    }
+
+    #[test]
+    fn hiding_anim_false_on_instant_hide() {
+        let mut v = VisibilityController::new(400);
+        v.show(0);
+        v.hide(0);
+        assert!(v.is_hidden());
+        assert!(!v.hiding_anim(), "无动画直达收起应为 false");
     }
 }

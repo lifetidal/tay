@@ -1441,7 +1441,12 @@ impl Renderer {
     }
 
     /// 渲染一帧到 `texture`(当前 surface 纹理)并 present。
-    pub fn render(&mut self, texture: wgpu::SurfaceTexture, alpha: f32) -> Result<(), String> {
+    pub fn render(
+        &mut self,
+        texture: wgpu::SurfaceTexture,
+        alpha: f32,
+        capture: bool,
+    ) -> Result<(), String> {
         let alpha = if self.alpha_mode == wgpu::CompositeAlphaMode::Opaque {
             1.0
         } else {
@@ -1585,6 +1590,12 @@ impl Renderer {
             self.draw_images(&mut pass, true, false);
         }
 
+        // 收起动画帧捕获:这是用户最后看到的画面,remap 后先上屏。
+        // 必须在 TAY_SHOT 块之前(shot 按值消耗 encoder)。
+        if capture {
+            self.capture_last_frame(&texture.texture, &mut encoder);
+        }
+
         // TAY_SHOT:渲染 N 帧后抓取当前帧并退出(capture 消耗 encoder)。
         if let Some(shot) = &mut self.shot {
             shot.frames += 1;
@@ -1607,6 +1618,12 @@ impl Renderer {
             .queue
             .present(texture);
         Ok(())
+    }
+
+    /// 把当前交换链帧拷入 GpuCore 常驻缓存(有界 1 张)。
+    fn capture_last_frame(&mut self, src: &wgpu::Texture, encoder: &mut wgpu::CommandEncoder) {
+        let core = self.core.as_mut().expect("GpuCore 未挂载");
+        core.capture_frame(src, encoder, self.size);
     }
 
     /// 画 kitty 图像(`above` = 文本之上)。
@@ -2063,6 +2080,7 @@ fn build_fresh(
         instance_buf,
         locals_buf,
         locals_bind,
+        cached_frame: None,
     };
     Ok((core, format, alpha_mode))
 }

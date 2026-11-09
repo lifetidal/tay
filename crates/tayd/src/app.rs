@@ -3477,7 +3477,7 @@ impl TayApp {
                 wgpu::CurrentSurfaceTexture::Success(texture)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
                     ctx.pre_present_notify();
-                    if let Err(e) = renderer.render(texture, alpha) {
+                    if let Err(e) = renderer.render(texture, alpha, self.vis.hiding_anim()) {
                         log::error!("渲染失败: {e}");
                     } else {
                         // present 完成后再请求下一帧回调:带 buffer 的

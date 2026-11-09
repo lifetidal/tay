@@ -69,6 +69,12 @@ impl GlyphSet {
     }
 }
 
+/// 收起时捕获的最后一帧(remap 后先上屏,有界 1 张)。
+pub struct CachedFrame {
+    pub texture: wgpu::Texture,
+    pub size: (u32, u32),
+}
+
 /// 跨 remap 常驻的 device 级资源:Adapter/Device/Queue、
 /// 字体栈、按 format 缓存的 glyphon 集、图像缓存与统一缓冲。
 /// Instance 由调用方(TayApp)持有 —— surface 与 device 必须来自
@@ -94,6 +100,7 @@ pub struct GpuCore {
     pub instance_buf: wgpu::Buffer,
     pub locals_buf: wgpu::Buffer,
     pub locals_bind: wgpu::BindGroup,
+    pub cached_frame: Option<CachedFrame>,
 }
 
 /// 请求 adapter/device/queue(ensure_device 与首次构建共用)。
@@ -181,6 +188,57 @@ impl GpuCore {
 
     pub fn viewport_mut(&mut self) -> &mut Viewport {
         &mut self.glyph_set_mut().viewport
+    }
+
+    /// 把当前交换链帧拷入常驻缓存纹理(有界 1 张;尺寸变化时重建)。
+    pub fn capture_frame(
+        &mut self,
+        src: &wgpu::Texture,
+        encoder: &mut wgpu::CommandEncoder,
+        size: (u32, u32),
+    ) {
+        if self.cached_frame.as_ref().map(|c| c.size) != Some(size) {
+            let format = self.glyph_sets.current.as_ref().expect("glyph 集未构建").0;
+            self.cached_frame = Some(CachedFrame {
+                texture: self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("tay cached frame"),
+                    size: wgpu::Extent3d {
+                        width: size.0.max(1),
+                        height: size.1.max(1),
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                }),
+                size,
+            });
+        }
+        if let Some(cached) = &self.cached_frame {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: src,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &cached.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: size.0.max(1),
+                    height: size.1.max(1),
+                    depth_or_array_layers: 1,
+                },
+            );
+            log::info!("缓存帧已捕获 {w}x{h}", w = size.0, h = size.1);
+        }
     }
 }
 
