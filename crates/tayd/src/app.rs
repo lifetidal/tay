@@ -317,6 +317,8 @@ pub struct TayApp {
     layer_h: i32,
     shown_once: bool,
     show_at: Option<Instant>,
+    /// 呼出重建路径的分段计时(仅 remap 驱动的呼出打点)。
+    summon_timer: Option<crate::summon_timing::StageTimer>,
     ipc_listener: Option<std::os::unix::net::UnixListener>,
     ipc_tx: mpsc::SyncSender<crate::ipc::IpcRequest>,
     ipc_rx: mpsc::Receiver<crate::ipc::IpcRequest>,
@@ -508,6 +510,7 @@ impl TayApp {
             layer_h: 480,
             shown_once: false,
             show_at: None,
+            summon_timer: None,
             ipc_listener,
             ipc_tx,
             ipc_rx,
@@ -569,6 +572,7 @@ impl TayApp {
         }
         ctx.request_keyboard(true, true);
         self.show_at = Some(Instant::now());
+        self.summon_timer = Some(crate::summon_timing::StageTimer::new());
         // 呼出即渲染首帧(内容可能已过时;同时完成热呼出延迟测量)。
         ctx.request_redraw();
         // 设计 A:首次呼出提示一次常用快捷键(toast,4s 消失;不占栏行)。
@@ -616,6 +620,7 @@ impl TayApp {
                     ctx.request_keyboard(true, true);
                     // 无动画直达呼出:同样要延迟测量与首帧。
                     self.show_at = Some(Instant::now());
+                    self.summon_timer = Some(crate::summon_timing::StageTimer::new());
                     ctx.request_redraw();
                 }
             }
@@ -624,6 +629,7 @@ impl TayApp {
                     ctx.request_keyboard(true, true);
                     // 呼出侧转换:启动热呼出测量并渲染首帧。
                     self.show_at = Some(Instant::now());
+                    self.summon_timer = Some(crate::summon_timing::StageTimer::new());
                     ctx.request_redraw();
                 }
             }
@@ -3449,9 +3455,18 @@ impl TayApp {
                         ctx.arm_frame_after_present();
                         if let Some(at) = self.show_at.take() {
                             self.shown_once = true;
+                            let summary = self
+                                .summon_timer
+                                .take()
+                                .map(|mut t| {
+                                    t.mark("首帧");
+                                    t.summary()
+                                })
+                                .unwrap_or_default();
                             log::info!(
-                                "首帧已提交 {}ms（实际可见性由合成器决定）",
-                                at.elapsed().as_millis()
+                                "首帧已提交 {}ms（实际可见性由合成器决定）{}",
+                                at.elapsed().as_millis(),
+                                summary
                             );
                         }
                     }
@@ -3824,6 +3839,9 @@ impl Handler for TayApp {
                         return;
                     }
                     log::info!("configure 握手完成(高度 {height}),重建渲染器");
+                    if let Some(t) = &mut self.summon_timer {
+                        t.mark("configure 握手");
+                    }
                     if let Err(e) = self.create_renderer(ctx) {
                         log::error!("重建渲染器失败: {e}");
                         ctx.exit();
@@ -4665,8 +4683,15 @@ impl Handler for TayApp {
             // 段错误(10-16 六个 coredump 复现)。
             WEvent::SurfaceReplaced => {
                 log::info!("输出回退:重建 GPU surface,等待 configure");
+                if let Some(t) = &mut self.summon_timer {
+                    t.mark("remap 到达");
+                    t.mark("drop 旧渲染器 开始");
+                }
                 self.renderer = None;
                 self.instance = None;
+                if let Some(t) = &mut self.summon_timer {
+                    t.mark("drop 旧渲染器 完成");
+                }
                 self.gpu_phase = GpuPhase::AwaitingConfigure { rebuild: true };
                 // 初始化前也可能重建(首轮 configure 与尺寸握手之间
                 // 输出闪断):此时 OutputChanged 被 initialized 守卫

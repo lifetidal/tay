@@ -22,6 +22,7 @@ mod visibility;
 
 mod runtime;
 mod shutdown;
+mod summon_timing;
 
 /// Start the daemon with process environment and platform services.
 pub fn run() {
