@@ -86,7 +86,9 @@ impl Default for Font {
     fn default() -> Self {
         Self {
             family: "monospace".into(),
-            size: 12.0,
+            // HiDPI(4K/2x)下 12pt 观感偏小(产品反馈 2026-11-10),
+            // 默认 13pt;1080p 用户可 Ctrl+- 一步调回。
+            size: 13.0,
             weight: 400,
         }
     }
@@ -286,6 +288,54 @@ fn default_keys() -> Vec<KeyBinding> {
     keys
 }
 
+/// 栏装饰图案(设计 C,2026-11-10):图案与渲染解耦,随时可热切换;
+/// 新增图案 = 加一个变体 + chrome.rs 里一个绘制函数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BarPattern {
+    /// EKG 心电波形(动画 8fps;P/R/T 波,R 峰强调色)。
+    #[default]
+    Wave,
+    /// 静态连续线。
+    Line,
+    /// 稀疏点线。
+    Dots,
+    /// 留白。
+    None,
+}
+
+impl BarPattern {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "wave" => Some(Self::Wave),
+            "line" => Some(Self::Line),
+            "dots" => Some(Self::Dots),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Wave => "wave",
+            Self::Line => "line",
+            Self::Dots => "dots",
+            Self::None => "none",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wave => "波形",
+            Self::Line => "线条",
+            Self::Dots => "点线",
+            Self::None => "无",
+        }
+    }
+    /// 动画图案需要周期性重绘(8fps),静态图案零唤醒成本。
+    pub fn animated(self) -> bool {
+        matches!(self, Self::Wave)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct TabBar {
@@ -294,6 +344,8 @@ pub struct TabBar {
     pub visible: bool,
     pub compact: bool,
     pub tab_width: u32,
+    /// 标签右侧余宽的装饰图案(见 [`BarPattern`]);热重载即时生效。
+    pub pattern: BarPattern,
     pub background: Rgb,
     pub active_background: Rgb,
     pub active_foreground: Rgb,
@@ -327,6 +379,7 @@ impl TabBar {
             visible: true,
             compact: true,
             tab_width: 24,
+            pattern: BarPattern::Wave,
             background: bar,
             active_background: blend(colors.cursor, bar, 0.68),
             active_foreground: colors.foreground,
@@ -691,6 +744,10 @@ impl Config {
             if let Some(v) = get_uint(&tb, "tab_width")? {
                 cfg.tab_bar.tab_width = v;
             }
+            if let Some(v) = get_str(&tb, "pattern")? {
+                cfg.tab_bar.pattern = BarPattern::from_name(&v)
+                    .ok_or_else(|| format!("tab_bar.pattern 需为 wave/line/dots/none,得到: {v}"))?;
+            }
             if let Some(v) = get_color(&tb, "background")? {
                 cfg.tab_bar.background = v;
             }
@@ -886,7 +943,7 @@ impl Config {
 -- 界面外观调整也写入本文件；原始脚本、注释和逻辑保留。
 
 return {{
-  tab_bar = {{visible={visible}, compact={compact}, tab_width={tw}, background={tb_background:?}, active_background={tb_active_background:?}, active_foreground={tb_active_foreground:?}, inactive_foreground={tb_inactive_foreground:?}, hover_background={tb_hover_background:?}, accent={tb_accent:?}, icon_foreground={tb_icon_foreground:?}, icon_hover_foreground={tb_icon_hover_foreground:?}, danger_foreground={tb_danger_foreground:?}, clock_background={tb_clock_background:?}, clock_foreground={tb_clock_foreground:?}}},
+  tab_bar = {{visible={visible}, compact={compact}, tab_width={tw}, pattern = "{pattern_name}", background={tb_background:?}, active_background={tb_active_background:?}, active_foreground={tb_active_foreground:?}, inactive_foreground={tb_inactive_foreground:?}, hover_background={tb_hover_background:?}, accent={tb_accent:?}, icon_foreground={tb_icon_foreground:?}, icon_hover_foreground={tb_icon_hover_foreground:?}, danger_foreground={tb_danger_foreground:?}, clock_background={tb_clock_background:?}, clock_foreground={tb_clock_foreground:?}}},
   theme = {theme:?},
   global_shortcut = {shortcut:?},
   disable_default_key_bindings = {disable},
@@ -932,6 +989,7 @@ return {{
             visible = self.tab_bar.visible,
             compact = self.tab_bar.compact,
             tw = self.tab_bar.tab_width,
+            pattern_name = self.tab_bar.pattern.name(),
             tb_background = format!(
                 "#{:02x}{:02x}{:02x}",
                 self.tab_bar.background.0, self.tab_bar.background.1, self.tab_bar.background.2
@@ -1655,6 +1713,30 @@ mod tests {
     }
 
     #[test]
+    fn tab_bar_pattern_parses_roundtrips_and_rejects_unknown() {
+        // 默认 EKG 波形。
+        assert_eq!(Config::default().tab_bar.pattern, BarPattern::Wave);
+        for (name, pattern) in [
+            ("wave", BarPattern::Wave),
+            ("line", BarPattern::Line),
+            ("dots", BarPattern::Dots),
+            ("none", BarPattern::None),
+        ] {
+            let cfg = Config::from_lua(&format!("return {{ tab_bar={{pattern='{name}'}} }}")).unwrap();
+            assert_eq!(cfg.tab_bar.pattern, pattern);
+            // roundtrip:生成的 Lua 模板再解析回同一图案。
+            let back = Config::from_lua(&cfg.to_lua()).unwrap();
+            assert_eq!(back.tab_bar.pattern, pattern);
+        }
+        assert!(Config::from_lua("return { tab_bar={pattern='sparkle'} }").is_err());
+        // 动画判定:wave 需要相位唤醒,其余零唤醒。
+        assert!(BarPattern::Wave.animated());
+        assert!(!BarPattern::Line.animated());
+        assert!(!BarPattern::Dots.animated());
+        assert!(!BarPattern::None.animated());
+    }
+
+    #[test]
     fn lua_integer_fields_reject_nan_negative_and_fractions() {
         for value in ["0/0", "-1", "1.5", "math.huge"] {
             for field in ["animation_ms", "height_percent"] {
@@ -1848,7 +1930,7 @@ mod tests {
         std::fs::write(&path, "return {theme='midnight'}").unwrap();
         let mut c = Config::try_load_at(&dir).unwrap();
         c.tab_bar.clock_background = Rgb(0x12, 0x34, 0x56);
-        c.font.size = 13.0;
+        c.font.size = 14.0;
         c.save_appearance_at(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         // 真正变化的字段被钉写。

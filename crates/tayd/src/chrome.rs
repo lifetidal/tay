@@ -1,9 +1,146 @@
 //! 可见操作栏。布局与点击共享同一组范围，避免画面与命中不一致。
 //!
 //! 标签条支持 Lua 配色、单行布局与按显示列截断的 Unicode 标题。
-use tay_config::{Config, Rgb};
+use tay_config::{BarPattern, Config, Rgb};
 use tay_render::{Cell, Grid};
 use unicode_width::UnicodeWidthChar;
+
+/// EKG 波形周期(列)与滚动速度(列/秒;8fps 唤醒)。
+const WAVE_LEN: usize = 48;
+const WAVE_SPEED: f32 = 16.0;
+
+/// EKG 波形形状:关键点(周期内列, 相对基线高度;正 = 基线之上)。
+/// P 波(6–10)、QRS(14–18:R 峰 + S 谷)、T 波(18–26)。
+const WAVE_KEYS: [(f32, f32); 11] = [
+    (0.0, 0.0),
+    (6.0, 0.0),
+    (8.0, 0.30),
+    (10.0, 0.0),
+    (14.0, 0.0),
+    (15.5, 1.0),
+    (16.5, -0.25),
+    (18.0, 0.0),
+    (22.0, 0.42),
+    (26.0, 0.0),
+    (48.0, 0.0),
+];
+
+/// 波形区域着色:R/S 段强调色,P/T 段亮一级,平坦段弱化色。
+fn wave_color(pc: f32, style: &tay_config::TabBar) -> Rgb {
+    let pc = pc.rem_euclid(WAVE_LEN as f32);
+    if (14.0..18.0).contains(&pc) {
+        style.accent
+    } else if (5.5..10.5).contains(&pc) || (18.5..26.5).contains(&pc) {
+        blend(style.background, style.inactive_foreground, 0.72)
+    } else {
+        blend(style.background, style.inactive_foreground, 0.45)
+    }
+}
+
+/// EKG 波形:矢量折线(亚格坐标,渲染器 Quad 管线绘制),基线在栏底
+/// 0.5 格处,连续相位向左滚动;平坦段合并为长线段。
+fn draw_wave(
+    grid: &mut Grid,
+    end: usize,
+    rows: usize,
+    start: usize,
+    style: &tay_config::TabBar,
+    phase: f32,
+) {
+    let offset = phase * WAVE_SPEED;
+    let shape = |x: f32| -> f32 {
+        let x = x.rem_euclid(WAVE_LEN as f32);
+        let mut i = 0;
+        while i + 1 < WAVE_KEYS.len() && x > WAVE_KEYS[i + 1].0 {
+            i += 1;
+        }
+        let (x0, y0) = WAVE_KEYS[i];
+        let (x1, y1) = WAVE_KEYS[i + 1];
+        if x1 <= x0 {
+            return y0;
+        }
+        y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    };
+    // R 峰振幅随栏高;P/T/S 按关键点比例缩放到同一基准。
+    let amplitude = 0.62 * rows as f32;
+    let baseline = rows as f32 - 0.5;
+    let step = 0.5;
+    let mut runs: Vec<(f32, f32, f32, f32, Rgb)> = Vec::new();
+    let mut prev: Option<(f32, f32, Rgb)> = None;
+    let mut x = start as f32;
+    while x < end as f32 + step {
+        let pc = x - start as f32 + offset;
+        let y = baseline - shape(pc) * amplitude;
+        let color = wave_color(pc, style);
+        if let Some((px, py, pc_prev)) = prev {
+            let slope = (y - py) / step;
+            match runs.last() {
+                Some(&(rx1, ry1, rx2, ry2, rc))
+                    if (slope - (ry2 - ry1) / (rx2 - rx1).max(1e-6)).abs() < 1e-3
+                        && rc == pc_prev =>
+                {
+                    let idx = runs.len() - 1;
+                    runs[idx] = (rx1, ry1, x, y, rc);
+                }
+                _ => runs.push((px, py, x, y, pc_prev)),
+            }
+        }
+        prev = Some((x, y, color));
+        x += step;
+    }
+    for (x1, y1, x2, y2, color) in runs {
+        grid.wave.push(tay_render::WaveSeg {
+            x1,
+            y1,
+            x2,
+            y2,
+            color,
+        });
+    }
+}
+
+/// 静态连续线(基线行)。
+fn draw_rule(
+    header: &mut [Cell],
+    cols: usize,
+    end: usize,
+    row: usize,
+    start: usize,
+    style: &tay_config::TabBar,
+) {
+    let fg = blend(style.background, style.inactive_foreground, 0.45);
+    for col in start..end {
+        let cell = &mut header[row * cols + col];
+        cell.c = '─';
+        cell.fg = fg;
+        cell.bold = false;
+        cell.wide_spacer = false;
+        cell.zerowidth = None;
+    }
+}
+
+/// 稀疏点线(基线行,每 4 列一点)。
+fn draw_dots(
+    header: &mut [Cell],
+    cols: usize,
+    end: usize,
+    row: usize,
+    start: usize,
+    style: &tay_config::TabBar,
+) {
+    let fg = blend(style.background, style.inactive_foreground, 0.45);
+    for col in start..end {
+        if !(col - start).is_multiple_of(4) {
+            continue;
+        }
+        let cell = &mut header[row * cols + col];
+        cell.c = '·';
+        cell.fg = fg;
+        cell.bold = false;
+        cell.wide_spacer = false;
+        cell.zerowidth = None;
+    }
+}
 
 pub fn rows(config: &Config, settings: bool) -> usize {
     if !config.tab_bar.visible {
@@ -63,6 +200,8 @@ pub enum Action {
     Maximize,
     CloseWindow,
     Edit(Field),
+    /// 循环切换栏装饰图案(wave → line → dots → none)。
+    Pattern,
     /// 时钟(右对齐,非交互;点击无操作)。
     Clock,
 }
@@ -111,8 +250,24 @@ pub fn layout(
     } else {
         0
     };
-    let reserved = window_reserved + extra + clock_width;
-    let usable = cols.saturating_sub(reserved);
+    // 设计 B(2026-11-11,用户拍板):标签 + 图标在左,时钟/窗口按钮
+    // 锚右,装饰带(图案)填中间、随标签数伸缩;两侧固定预留 +
+    // 图案最小宽计入标签预算,图案带永不越界。
+    let controls_drawn = cols >= window_reserved;
+    let right_reserved = if controls_drawn { window_reserved } else { 0 } + clock_width;
+    // 图案最小宽仅在宽栏预留:窄栏标签优先,decorate 仍有自己的
+    // 下限守卫(zone 不足时留白)。
+    let pattern_min = if cols >= window_reserved + extra + 64 {
+        match config.tab_bar.pattern {
+            BarPattern::Wave => 12,
+            BarPattern::Line => 4,
+            BarPattern::Dots => 6,
+            BarPattern::None => 0,
+        }
+    } else {
+        0
+    };
+    let usable = cols.saturating_sub(extra + right_reserved + pattern_min);
     // 浏览器式收缩:标签多到一页放不下时,按总数均分宽度让
     // **全部标签始终可见**(标题截断);均分后仍不足 4 列才
     // 退回分页(活动标签所在页)。此前固定 tab_width 分页且
@@ -120,11 +275,14 @@ pub fn layout(
     let count = titles.len().max(1);
     let mut tab_w = config.tab_bar.tab_width as usize;
     let page = (usable / tab_w).max(1);
+    let mut text_budget = tab_w.saturating_sub(3); // close_w 恒为 3(" × ")
     if count > page {
-        // 每标签预算 =(可用宽 − 关闭钮 3 列 − 芯片间隔 2 列)/ 总数。
-        let per = usable.saturating_sub(5 * count) / count;
+        // 每标签文字预算(含首尾 2 列内边距)=(可用宽 − 关闭 3 −
+        // 间隙 2 − 内边距 2)/ 总数。
+        let per = usable.saturating_sub(7 * count) / count;
         if per >= 4 {
-            tab_w = per + 5;
+            tab_w = per + 7;
+            text_budget = per + 2;
         }
     }
     let page = (usable / tab_w).max(1);
@@ -139,11 +297,13 @@ pub fn layout(
         let mut tab_text = format!(" {label} ");
         let close_text = " × ".to_string();
         let close_w = close_text.chars().count();
-        let available = cols.saturating_sub(reserved + x + close_w);
+        // +2:芯片尾隙(标签与图标簇的间隔)也计入预算。
+        let available =
+            cols.saturating_sub(extra + right_reserved + pattern_min + x + close_w + 2);
         if available == 0 {
             break;
         }
-        tab_text = truncate(&tab_text, available.min(tab_w - close_w));
+        tab_text = truncate(&tab_text, available.min(text_budget));
         let tab_w = width(&tab_text);
         items.push(Item {
             row: 0,
@@ -167,26 +327,23 @@ pub fn layout(
         x += 2;
     }
     if extra > 0 {
-        for (n, (text, action)) in [("   ", Action::New), ("   ", Action::Settings)]
+        for (n, action) in [(Action::New), (Action::Settings)]
             .into_iter()
             .enumerate()
         {
-            let start = if n == 0 {
-                x.min(cols - reserved)
-            } else {
-                cols - window_reserved - clock_width - 3
-            };
+            let start = x + n * 3;
             items.push(Item {
                 row: 0,
                 start,
                 end: start + 3,
-                text: text.into(),
+                text: "   ".into(),
                 action,
                 selected: settings && action == Action::Settings,
             });
         }
     }
-    if cols >= window_reserved {
+    // 装饰带不产布局项:decorate 按两侧簇的边界绘制。
+    if controls_drawn {
         if clock_width > 0 {
             let start = cols - window_reserved - clock_width;
             items.push(Item {
@@ -228,6 +385,8 @@ pub fn hit(items: &[Item], bar_rows: usize, row: usize, col: usize) -> Option<Ac
 }
 
 /// 按实际栏高平移终端内容、光标、选区、预编辑与图像。
+/// `phase`:动画图案的相位(秒,动画图案启用时由调用方提供)。
+#[allow(clippy::too_many_arguments)]
 pub fn decorate(
     grid: &mut Grid,
     items: &[Item],
@@ -236,6 +395,7 @@ pub fn decorate(
     hovered: Option<Action>,
     maximized: bool,
     settings: bool,
+    phase: Option<f32>,
 ) {
     let rows = rows(config, settings);
     grid.tab_bar_rows = rows;
@@ -301,37 +461,6 @@ pub fn decorate(
         }
         for col in item.start..item.end.min(grid.cols) {
             header[item.row * grid.cols + col] = style_cell.clone();
-        }
-        let mut col = item.start;
-        // 设计审查:标签编号 "N:" 用弱化前景,标题保持项前景 —— 编号是
-        // Alt+n 的索引提示,不该与标题抢视线(非活动标签整体已是弱化色,
-        // 无可见变化;活动/悬停标签编号弱于标题)。
-        let number_end = matches!(item.action, Action::Tab(_))
-            .then(|| {
-                item.text
-                    .char_indices()
-                    .position(|(_, c)| c == ':')
-                    .map(|i| i + 1)
-            })
-            .flatten();
-        for (index, c) in item.text.chars().enumerate() {
-            let w = c.width().unwrap_or(0);
-            if w == 0 {
-                continue;
-            }
-            if col + w > item.end.min(grid.cols) {
-                break;
-            }
-            header[item.row * grid.cols + col].c = c;
-            if let Some(end) = number_end
-                && index < end
-            {
-                header[item.row * grid.cols + col].fg = dim;
-            }
-            for offset in 1..w {
-                header[item.row * grid.cols + col + offset].wide_spacer = true;
-            }
-            col += w;
         }
     }
     for item in items
@@ -406,6 +535,7 @@ pub fn decorate(
     }
     if rows >= 2 {
         // 把首行样式复制到其余行(消息行除外,它已被整行弱化覆盖)。
+        // 复制先于文字绘制:文字行(展开栏居中于行 1)先铺底色再写字。
         let copy_until = message_row.unwrap_or(rows);
         for col in 0..grid.cols {
             let mut cell = header[col].clone();
@@ -415,6 +545,50 @@ pub fn decorate(
             for row in 1..copy_until {
                 header[row * grid.cols + col] = cell.clone();
             }
+        }
+    }
+    // 文字行:展开栏(3 行)无消息时垂直居中 —— 与窗口图标一致
+    // (图标本就以 tab_panel_rows 为高居中);compact 2 行时行 1
+    // 是消息行/预留行,文字留在行 0 即视觉居中。
+    let text_row = if message_row.is_none() && rows >= 3 {
+        rows / 2
+    } else {
+        0
+    };
+    for item in items {
+        if item.row >= rows {
+            continue;
+        }
+        let mut col = item.start;
+        // 设计审查:标签编号 "N:" 用弱化前景,标题保持项前景 —— 编号是
+        // Alt+n 的索引提示,不该与标题抢视线(非活动标签整体已是弱化色,
+        // 无可见变化;活动/悬停标签编号弱于标题)。
+        let number_end = matches!(item.action, Action::Tab(_))
+            .then(|| {
+                item.text
+                    .char_indices()
+                    .position(|(_, c)| c == ':')
+                    .map(|i| i + 1)
+            })
+            .flatten();
+        for (index, c) in item.text.chars().enumerate() {
+            let w = c.width().unwrap_or(0);
+            if w == 0 {
+                continue;
+            }
+            if col + w > item.end.min(grid.cols) {
+                break;
+            }
+            header[text_row * grid.cols + col].c = c;
+            if let Some(end) = number_end
+                && index < end
+            {
+                header[text_row * grid.cols + col].fg = dim;
+            }
+            for offset in 1..w {
+                header[text_row * grid.cols + col + offset].wide_spacer = true;
+            }
+            col += w;
         }
     }
     for item in items.iter().filter(|i| i.row == 0) {
@@ -439,6 +613,57 @@ pub fn decorate(
             end: item.end,
             kind,
         });
+    }
+    // 设计 B(2026-11-11):装饰带 = 左侧簇(标签 + 图标)与右侧簇
+    // (时钟 + 窗口按钮)之间的区域,随标签数伸缩;图案与布局解耦,
+    // 热重载随时换,动画图案由调用方按 8fps 唤醒。
+    // 有消息行或余宽不足时留白。
+    let zone_start = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.action,
+                Action::Tab(_) | Action::Close(_) | Action::New | Action::Settings
+            )
+        })
+        .map(|i| i.end)
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let zone_end = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i.action,
+                Action::Clock | Action::Hide | Action::Maximize | Action::CloseWindow
+            )
+        })
+        .map(|i| i.start)
+        .min()
+        .unwrap_or(grid.cols)
+        .saturating_sub(2);
+    if message_row.is_none() && rows >= 2 && zone_end > zone_start {
+        let zone = zone_end - zone_start;
+        match config.tab_bar.pattern {
+            BarPattern::Wave => {
+                if let Some(phase) = phase
+                    && zone >= 12
+                {
+                    draw_wave(grid, zone_end, rows, zone_start, style, phase);
+                }
+            }
+            BarPattern::Line => {
+                if zone >= 4 {
+                    draw_rule(&mut header, grid.cols, zone_end, rows - 1, zone_start, style);
+                }
+            }
+            BarPattern::Dots => {
+                if zone >= 6 {
+                    draw_dots(&mut header, grid.cols, zone_end, rows - 1, zone_start, style);
+                }
+            }
+            BarPattern::None => {}
+        }
     }
     header.append(&mut grid.cells);
     grid.cells = header;
@@ -475,7 +700,13 @@ mod tests {
             for active in [0, 5, 23] {
                 let items = layout(cols, &titles, active, false, &Config::default(), "18:42");
                 for (index, a) in items.iter().enumerate() {
-                    assert!(a.end <= cols);
+                    assert!(
+                        a.end <= cols,
+                        "cols={cols} active={active} {:?} start={} end={}",
+                        a.action,
+                        a.start,
+                        a.end
+                    );
                     for b in items.iter().skip(index + 1) {
                         if a.row == b.row {
                             assert!(
@@ -546,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn standard_window_controls_have_separate_hit_targets() {
+    fn window_controls_follow_tabs_as_a_left_cluster() {
         for cols in [24, 80, 200] {
             let items = layout(cols, &["shell".into()], 0, false, &Config::default(), "");
             let mut previous = 0;
@@ -560,7 +791,16 @@ mod tests {
                 assert_eq!(hit(&items, 2, 0, item.end - 1), Some(action));
                 previous = item.end;
             }
-            assert_eq!(previous, cols);
+            // 设计 B:控件簇紧随标签/图标,不孤悬右缘;永不越界。
+            let last_close = items
+                .iter()
+                .filter(|i| matches!(i.action, Action::Close(_)))
+                .map(|i| i.end)
+                .max()
+                .unwrap();
+            let hide = items.iter().find(|i| i.action == Action::Hide).unwrap();
+            assert!(hide.start >= last_close, "cols={cols}");
+            assert!(previous <= cols, "cols={cols} previous={previous}");
         }
     }
 
@@ -646,6 +886,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -660,6 +901,7 @@ mod tests {
             None,
             false,
             true,
+            None,
         );
         assert_eq!(grid.rows, 3);
         assert_eq!(grid.cells.len(), 6);
@@ -695,6 +937,7 @@ mod tests {
                 overlays: vec![],
                 images: vec![],
                 window_icons: vec![],
+                wave: vec![],
                 chrome_panels: vec![],
                 tab_bar_rows: 0,
                 tab_panel_rows: 0,
@@ -713,6 +956,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         );
         // compact 栏 2 行:消息占据最后一行,终端内容从其后开始。
         assert_eq!(with_message.rows, 3);
@@ -726,10 +970,113 @@ mod tests {
         assert_eq!(with_message.tab_panel_rows, 1);
         // 无消息时最后一行仍是首行样式的延伸(可点击高亮)。
         let mut plain = grid();
-        decorate(&mut plain, &items, "", &config, None, false, false);
+        decorate(&mut plain, &items, "", &config, None, false, false, None);
         assert_eq!(plain.cells[40].c, ' ');
         assert_eq!(plain.cells[80].c, 'z');
         assert_eq!(plain.tab_panel_rows, 2);
+    }
+
+    #[test]
+    fn bar_patterns_draw_in_the_zone_and_respect_config() {
+        fn grid() -> Grid {
+            let cell = Cell {
+                c: 'z',
+                fg: Rgb(255, 255, 255),
+                bg: Rgb(0, 0, 0),
+                bold: false,
+                italic: false,
+                underline: false,
+                wide_spacer: false,
+                zerowidth: None,
+            };
+            Grid {
+                cols: 120,
+                rows: 1,
+                cells: vec![cell; 120],
+                cursor: (0, 0),
+                cursor_shape: tay_render::CursorShape::Beam,
+                selection: None,
+                search_hit: None,
+                preedit: None,
+                badges: vec![],
+                overlays: vec![],
+                images: vec![],
+                window_icons: vec![],
+                wave: vec![],
+                chrome_panels: vec![],
+                tab_bar_rows: 0,
+                tab_panel_rows: 0,
+                opaque_background: false,
+                scrollbar: None,
+            }
+        }
+        let config = Config::default();
+        let items = layout(120, &["shell".into()], 0, false, &config, "");
+        // 设计 B:标签 + 图标在左(图标终点 20),时钟/窗口按钮锚右
+        // (Hide 起 108);装饰带 = 22..106。compact 2 行基线 = 行 1。
+        let zone = 22;
+        // wave:矢量折线;基线 y = rows-0.5 = 1.5(compact 2 行),
+        // QRS 段强调色,相位推进波形整体左移。
+        let mut g = grid();
+        decorate(&mut g, &items, "", &config, None, false, false, Some(0.0));
+        assert!(!g.wave.is_empty());
+        assert!((g.wave[0].y1 - 1.5).abs() < 1e-3, "基线在栏底 0.5 格");
+        let peak = g
+            .wave
+            .iter()
+            .find(|s| s.color == config.tab_bar.accent)
+            .expect("QRS 段强调色");
+        // phase=0:R 峰区域 pc ∈ [14,18) → 屏幕列 [zone+14, zone+18) = [36,40)。
+        assert!(
+            (36.0..40.0).contains(&peak.x1),
+            "R 段起点 x1={}",
+            peak.x1
+        );
+        // R 峰顶高于基线约 1.24 格(振幅 0.62×2 行)。
+        assert!(g.wave.iter().any(|s| s.color == config.tab_bar.accent && s.y1 < 0.4));
+        // 相位推进 1/16s → 波形左移 1 格。
+        let mut g2 = grid();
+        decorate(&mut g2, &items, "", &config, None, false, false, Some(1.0 / 16.0));
+        let peak2 = g2
+            .wave
+            .iter()
+            .find(|s| s.color == config.tab_bar.accent)
+            .unwrap();
+        assert!(
+            (peak2.x1 - (peak.x1 - 1.0)).abs() < 0.5,
+            "左移 1 格:x1 {} → {}",
+            peak.x1,
+            peak2.x1
+        );
+        // 无相位(动画未启用)不画波形。
+        let mut g3 = grid();
+        decorate(&mut g3, &items, "", &config, None, false, false, None);
+        assert!(g3.wave.is_empty());
+        // line:字形静态线(基线行),无矢量波形。
+        let mut c = config.clone();
+        c.tab_bar.pattern = BarPattern::Line;
+        let mut g4 = grid();
+        decorate(&mut g4, &items, "", &c, None, false, false, None);
+        assert!(g4.wave.is_empty());
+        assert_eq!(g4.cells[120 + zone].c, '─');
+        // dots:每 4 列一点。
+        let mut c = config.clone();
+        c.tab_bar.pattern = BarPattern::Dots;
+        let mut g5 = grid();
+        decorate(&mut g5, &items, "", &c, None, false, false, None);
+        assert_eq!(g5.cells[120 + zone].c, '·');
+        assert_eq!(g5.cells[120 + 23].c, ' ');
+        // none:留白。
+        let mut c = config.clone();
+        c.tab_bar.pattern = BarPattern::None;
+        let mut g6 = grid();
+        decorate(&mut g6, &items, "", &c, None, false, false, None);
+        assert_eq!(g6.cells[120 + zone].c, ' ');
+        // 消息行存在时不画图案(消息行即基线行)。
+        let mut g7 = grid();
+        decorate(&mut g7, &items, "msg", &config, None, false, false, Some(0.0));
+        assert!(g7.wave.is_empty());
+        assert_eq!(g7.cells[120 + zone].c, ' ');
     }
 
     #[test]
@@ -766,13 +1113,14 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
             opaque_background: false,
             scrollbar: None,
         };
-        decorate(&mut grid, &items, "", &config, None, false, false);
+        decorate(&mut grid, &items, "", &config, None, false, false, None);
         // 时钟格:独立高对比配色,而不是标签栏背景 + 图标前景。
         for col in clock.start..clock.end {
             assert_eq!(grid.cells[col].bg, config.tab_bar.clock_background);
@@ -817,6 +1165,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -826,7 +1175,7 @@ mod tests {
         // 活动标签:编号弱化、标题保持活动前景。
         let items = layout(120, &["shell".into()], 0, false, &config, "");
         let mut grid = make_grid();
-        decorate(&mut grid, &items, "", &config, None, false, false);
+        decorate(&mut grid, &items, "", &config, None, false, false, None);
         let tab = items.iter().find(|i| i.action == Action::Tab(0)).unwrap();
         assert_eq!(grid.cells[tab.start + 1].c, '1');
         assert_eq!(
@@ -846,7 +1195,7 @@ mod tests {
         // 非活动标签:整体弱化,编号与标题无差异。
         let items = layout(120, &["one".into(), "two".into()], 0, false, &config, "");
         let mut grid = make_grid();
-        decorate(&mut grid, &items, "", &config, None, false, false);
+        decorate(&mut grid, &items, "", &config, None, false, false, None);
         let inactive = items.iter().find(|i| i.action == Action::Tab(1)).unwrap();
         assert_eq!(grid.cells[inactive.start + 1].c, '2');
         assert_eq!(grid.cells[inactive.start + 3].c, 't');

@@ -1458,6 +1458,17 @@ impl TayApp {
                 self.settings_drag = None;
                 self.settings_feedback.clear();
             }
+            Action::Pattern => {
+                let previous = self.config.clone();
+                use tay_config::BarPattern;
+                self.config.tab_bar.pattern = match self.config.tab_bar.pattern {
+                    BarPattern::Wave => BarPattern::Line,
+                    BarPattern::Line => BarPattern::Dots,
+                    BarPattern::Dots => BarPattern::None,
+                    BarPattern::None => BarPattern::Wave,
+                };
+                self.refresh_appearance(ctx, &previous);
+            }
             Action::Theme(index) => {
                 if let Some(theme) = ["default", "midnight", "light", "wezterm"].get(index as usize)
                 {
@@ -2126,6 +2137,7 @@ impl TayApp {
             overlays,
             images,
             window_icons: vec![],
+            wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -3433,6 +3445,13 @@ impl TayApp {
                 .unwrap_or_default();
             let next_min = Duration::from_secs(61 - since.as_secs() % 60);
             ctx.request_wake_at(Instant::now() + next_min);
+            // 动画图案(EKG 波形):8fps 相位唤醒;隐藏/静态图案零唤醒。
+            let phase = if self.config.tab_bar.pattern.animated() {
+                ctx.request_wake_at(Instant::now() + Duration::from_millis(125));
+                Some((since.as_millis() % 3000) as f32 / 1000.0)
+            } else {
+                None
+            };
             crate::chrome::decorate(
                 &mut grid,
                 &items,
@@ -3441,6 +3460,7 @@ impl TayApp {
                 self.chrome_hover,
                 self.maximized,
                 self.settings_visible(),
+                phase,
             );
         }
         // 面板开合动画:90ms 平滑步进(开=从栏向下展开,关=向上收起);
@@ -4488,6 +4508,14 @@ impl Handler for TayApp {
                 self.render(ctx);
             }
 
+            // 波形动画心跳:render 只由 RedrawRequested 驱动,
+            // wake 到期经 Timer 事件转成一次重绘(8fps)。
+            WEvent::Timer
+                if self.config.tab_bar.pattern.animated() && !self.vis.is_hidden() =>
+            {
+                ctx.request_redraw();
+            }
+
             WEvent::ProxyWake => {
                 for id in self.background_exits() {
                     self.remove_session(id);
@@ -4900,13 +4928,19 @@ impl Handler for TayApp {
                 // 呼出/收起动画步进。
                 self.step_animation(ctx);
                 // toast 到期:清除并重绘一帧(否则残留到旧画面里)。
+                // 注意:比较 take **之前**的长度 —— 曾误与已清空的
+                // 队列比较,只要队列非空每轮 AboutToWait 都重绘,
+                // 与帧回调共振成 ~50Hz 热循环(2026-11-10 波形打磨
+                // 实测 129% 单核)。
                 {
                     let toasts = &mut self.sessions[self.active_pane].ui.status_msg;
-                    let popped = std::mem::take(toasts)
-                        .into_iter()
+                    let taken = std::mem::take(toasts);
+                    let popped = taken
+                        .iter()
                         .skip_while(|(_, at, for_ms)| at.elapsed() >= *for_ms)
+                        .cloned()
                         .collect::<Vec<_>>();
-                    if popped.len() != toasts.len() {
+                    if popped.len() != taken.len() {
                         ctx.request_redraw();
                     }
                     *toasts = popped;

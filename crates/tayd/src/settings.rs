@@ -168,6 +168,14 @@ pub(crate) fn layout(cols: usize, rows: usize, page: u8, c: &Config) -> Vec<Item
                 Action::ResetAppearance,
                 false,
             );
+            add(
+                y + base + 4 * step,
+                left,
+                right,
+                format!(" 栏装饰: {} ⟳", c.tab_bar.pattern.label()),
+                Action::Pattern,
+                false,
+            );
         }
         1 => {
             add(
@@ -342,7 +350,9 @@ pub(crate) fn paint(
     // 语义,绝不能把空面板当标签面板画。
     let visible_h = ((h as f32 * reveal).ceil() as usize).min(h);
     let fg = c.colors.foreground;
-    let backdrop = c.tab_bar.background;
+    // 面板底色取终端配色而非 tab_bar:栏可能被手写定制成与主题无关
+    // 的颜色(亮色终端配深色栏时面板深底深字,产品反馈 2026-11-10)。
+    let backdrop = c.colors.background;
     let bg = mix(backdrop, fg, 0.06);
     let muted = mix(fg, bg, 0.35);
     let raised = mix(bg, fg, 0.10);
@@ -381,6 +391,22 @@ pub(crate) fn paint(
             bg,
             true,
         );
+        // 标题与「关闭」钮之间补一条弱化分隔线(与栏内装饰线同一语言;
+        // 关闭钮稍后在 item 循环里绘制,会覆盖线尾,无需预留边界)。
+        let rule_start = x + 6;
+        let rule_end = (x + w).saturating_sub(8);
+        if rule_start + 2 < rule_end {
+            let rule_fg = mix(muted, bg, 0.5);
+            for col in rule_start..rule_end {
+                let cell = &mut grid.cells[y * grid.cols + col];
+                cell.c = '─';
+                cell.fg = rule_fg;
+                cell.bg = bg;
+                cell.bold = false;
+                cell.wide_spacer = false;
+                cell.zerowidth = None;
+            }
+        }
     }
     // 设计 A:设置提示从栏消息行移进面板内(标题与页签之间的一行):
     // 常驻提示跟随设置上下文,编辑字段时同位置切换为编辑帮助。
@@ -411,14 +437,18 @@ pub(crate) fn paint(
         }
         let unavailable = matches!(item.action, Action::UndoAppearance) && !info.undo_available;
         let active = item.selected || (focus == Some(item.action) && !unavailable);
-        let color = if unavailable {
+        let mut color = if unavailable {
             mix(raised, bg, 0.5)
         } else if active {
             mix(bg, accent, 0.35)
         } else {
             raised
         };
-        let (button_fg, button_bg) = if let Action::Theme(index) = item.action {
+        // 「关闭」钮:悬停/聚焦转危险色(与栏内 × 一致),不涂强调色。
+        if item.action == Action::Settings && active {
+            color = mix(bg, c.tab_bar.danger_foreground, 0.30);
+        }
+        let (button_fg, button_bg, text_start) = if let Action::Theme(index) = item.action {
             let palette = tay_config::Colors::preset(
                 ["default", "midnight", "light", "wezterm"][index as usize],
             )
@@ -430,15 +460,47 @@ pub(crate) fn paint(
                 } else {
                     palette.background
                 },
+                item.start + 2,
             )
         } else if unavailable {
-            (muted, color)
+            (muted, color, item.start)
         } else {
-            (fg, color)
+            (fg, color, item.start)
         };
         put(
-            grid, item.row, item.start, item.end, &item.text, button_fg, button_bg, active,
+            grid, item.row, text_start, item.end, &item.text, button_fg, button_bg, active,
         );
+        if let Action::Theme(index) = item.action {
+            // 主题瓷砖:名称前加光标色圆点 —— 一眼看出主题的强调色。
+            let palette = tay_config::Colors::preset(
+                ["default", "midnight", "light", "wezterm"][index as usize],
+            )
+            .unwrap_or_else(|| c.colors.clone());
+            let dot = item.start + 1;
+            if dot < item.end.min(grid.cols) {
+                let cell = &mut grid.cells[item.row * grid.cols + dot];
+                cell.c = '●';
+                cell.fg = palette.cursor;
+                cell.bg = button_bg;
+                cell.bold = false;
+                cell.wide_spacer = false;
+                cell.zerowidth = None;
+            }
+        }
+        if let Action::SettingsPage(_) = item.action
+            && item.selected
+        {
+            // 活动页签:与栏内活动标签同语言的圆角芯片 + 强调边。
+            grid.chrome_panels.push(tay_render::ChromePanel {
+                row: item.row,
+                rows: 1,
+                start: item.start,
+                end: item.end,
+                background: mix(bg, accent, 0.35),
+                accent: Some(accent),
+                corners: tay_render::PanelCorners::All,
+            });
+        }
     }
     if page == 2 && h >= 5 {
         // 全局快捷键授权状态固定 y+3;窗口内快捷键清单从 y+5 起,
@@ -636,6 +698,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -715,6 +778,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -779,6 +843,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -796,7 +861,8 @@ mod tests {
         let mut grid = make_grid();
         paint(&mut grid, &c, 0, None, None, 0.5, &info);
         let visible_h = ((h as f32 * 0.5).ceil() as usize).min(h);
-        assert_eq!(grid.chrome_panels.len(), 1);
+        // 活动页签的芯片面板可能随半开面板出现;首个面板必须是包围面板。
+        assert!(!grid.chrome_panels.is_empty());
         assert_eq!(grid.chrome_panels[0].rows, visible_h);
         assert_eq!(grid.cells[(y + visible_h) * cols].c, 'z');
         // reveal=0:不推面板(rows:0 是「铺满整栏」语义,不能误用)。

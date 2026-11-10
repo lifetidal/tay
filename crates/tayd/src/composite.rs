@@ -69,6 +69,7 @@ pub(crate) fn compose(
         cursor: (0, 0),
         cursor_shape: CursorShape::Hidden,
         window_icons: vec![],
+            wave: vec![],
         chrome_panels: vec![],
         tab_bar_rows: 0,
         tab_panel_rows: 0,

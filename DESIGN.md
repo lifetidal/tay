@@ -241,6 +241,8 @@ Wayland 上「全局热键」和「窗口定位」都没有统一答案,必须�
 | **M3 体验差异化** ✅ | OSC 133 命令块(徽章/跳转/按块复制/折叠,bash/zsh/fish 钩子集成)、QuickSelect、vi 复制模式 + 增量搜索、主题热重载 | 全部验收,2026-10-16 实测 |
 | **M4 生态**(进行中) | ~~kitty graphics~~ ✅(PNG/RGBA/RGB、多图、滚动锚定)、sixel/iTerm2、打包、配置向导 | kitty graphics 实测通过;其余进行中 |
 
+> 设计 B(2026-11-10):标签栏左右分簇 + 栏装饰图案系统(EKG 波形等),见 [docs/ui-design-b-notes.md](docs/ui-design-b-notes.md)。
+
 ## 10. 风险与对策
 
 | 风险 | 影响 | 对策 |

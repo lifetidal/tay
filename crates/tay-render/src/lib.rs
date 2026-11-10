@@ -61,6 +61,16 @@ pub struct WindowIcon {
     pub kind: WindowIconKind,
 }
 
+/// 栏装饰波形的一条线段(格坐标,亚格精度;y 向下)。
+#[derive(Clone, Copy, Debug)]
+pub struct WaveSeg {
+    pub x1: f32,
+    pub y1: f32,
+    pub x2: f32,
+    pub y2: f32,
+    pub color: Rgb,
+}
+
 /// 选区(单元格坐标,col,row,含两端)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectionRange {
@@ -198,6 +208,8 @@ pub struct Grid {
     pub cursor_shape: CursorShape,
     pub window_icons: Vec<WindowIcon>,
     pub chrome_panels: Vec<ChromePanel>,
+    /// 栏装饰波形(矢量折线,格坐标 0..cols / 0..rows,亚格精度)。
+    pub wave: Vec<WaveSeg>,
     /// 顶部标签栏占用的网格行数；文字与图标在此高度内居中。
     pub tab_bar_rows: usize,
     /// 行 0 面板/图标/字形实际铺的行数(≤ tab_bar_rows):有消息行时
@@ -330,6 +342,9 @@ pub struct Renderer {
     /// 当前帧图像实例((id, ptr), rect, z)。
     current_images: Vec<ImageDraw>,
     quads: Vec<Quad>,
+    /// 上次 rebuild_text 的网格状态哈希:波形动画帧内容不变时
+    /// 跳过文本重建,只更新 quad 层(8fps × 全量 shaping = 129% 单核)。
+    text_state: u64,
 
     /// TAY_SHOT:渲染 N 帧后把当前帧存为 PNG 并退出。
     shot: Option<ShotState>,
@@ -449,6 +464,58 @@ fn fit_glyph(ink: Option<GlyphInk>, c: char, columns: usize, cell: (f32, f32)) -
         (cell.1 - ink.bottom).min(0.0)
     };
     (dx, dy, scale)
+}
+
+/// 文本层渲染依赖的网格状态哈希(FNV-1a):cells(字形/颜色/属性/
+/// 宽字符/零宽)+ 光标 + 预编辑 + 徽章 + 覆盖层。波形帧内容不变
+/// 时哈希相同,跳过文本重建;光标/选区/悬停等任一变化都会触发。
+fn text_state_hash(grid: &Grid, cursor_color: Rgb) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    let mut mix = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    for cell in &grid.cells {
+        mix(&(cell.c as u32).to_le_bytes());
+        mix(&[
+            cell.fg.0,
+            cell.fg.1,
+            cell.fg.2,
+            cell.bg.0,
+            cell.bg.1,
+            cell.bg.2,
+            (u8::from(cell.bold)
+                | (u8::from(cell.italic) << 1)
+                | (u8::from(cell.underline) << 2)
+                | (u8::from(cell.wide_spacer) << 3)),
+        ]);
+        if let Some(z) = &cell.zerowidth {
+            mix(z.as_bytes());
+            mix(&[0xff]);
+        }
+    }
+    mix(&grid.cursor.0.to_le_bytes());
+    mix(&grid.cursor.1.to_le_bytes());
+    mix(&[grid.cursor_shape as u8]);
+    if let Some(p) = &grid.preedit {
+        mix(p.text.as_bytes());
+        mix(&p.row.to_le_bytes());
+        mix(&p.col.to_le_bytes());
+    }
+    for b in &grid.badges {
+        mix(b.text.as_bytes());
+        mix(&b.row.to_le_bytes());
+        mix(&[b.color.0, b.color.1, b.color.2]);
+    }
+    for o in &grid.overlays {
+        mix(o.text.as_bytes());
+        mix(&o.row.to_le_bytes());
+        mix(&o.col.to_le_bytes());
+    }
+    mix(&[cursor_color.0, cursor_color.1, cursor_color.2]);
+    h
 }
 
 fn text_cells(grid: &Grid, cursor_color: Rgb) -> Vec<GlyphDraw> {
@@ -674,6 +741,7 @@ impl Renderer {
             search_hit_color: mix(config.colors.cursor, config.colors.background, 0.55),
             current_images: Vec::new(),
             quads: Vec::new(),
+            text_state: u64::MAX,
             shot: shot_path.map(|(p, n)| ShotState {
                 path: p.into(),
                 after_frames: n,
@@ -727,6 +795,7 @@ impl Renderer {
         self.cursor_color = config.colors.cursor;
         self.selection_color = config.colors.selection;
         self.search_hit_color = mix(config.colors.cursor, config.colors.background, 0.55);
+        self.text_state = u64::MAX; // 颜色变化 → 文本层必重建
     }
 
     pub fn poll_background(&mut self) -> bool {
@@ -819,6 +888,7 @@ impl Renderer {
             .expect("GpuCore 未挂载")
             .glyph_buffers
             .clear();
+        self.text_state = u64::MAX; // 字体/度量变化 → 文本层必重建
         self.core
             .as_mut()
             .expect("GpuCore 未挂载")
@@ -835,6 +905,7 @@ impl Renderer {
     /// pad 重算,此处只更新坐标偏移)。
     pub fn update_padding(&mut self, padding: f32) {
         self.padding = padding;
+        self.text_state = u64::MAX; // 内边距变化 → 字形位置必重算
     }
 
     pub fn surface_size(&self) -> (u32, u32) {
@@ -903,7 +974,14 @@ impl Renderer {
     pub fn update(&mut self, grid: &Grid) {
         self.tab_bar_rows = grid.tab_bar_rows;
         self.tab_panel_rows = grid.tab_panel_rows;
-        self.rebuild_text(grid);
+        // 波形动画帧:文本状态未变时跳过 rebuild_text —— 4K 全量
+        // 文本重建(克隆 cells + 逐 draw 键哈希 + 位置计算)是
+        // 8fps 动画 129% 单核的主因(2026-11-10 打磨实测)。
+        let state = text_state_hash(grid, self.cursor_color);
+        if state != self.text_state {
+            self.rebuild_text(grid);
+            self.text_state = state;
+        }
         self.rebuild_quads(grid);
         self.rebuild_images(grid);
     }
@@ -1426,6 +1504,32 @@ impl Renderer {
                     line(x, y + side * 0.5, x + side, y + side * 0.5);
                     line(x + side * 0.5, y, x + side * 0.5, y + side);
                 }
+            }
+        }
+
+        // 栏装饰波形:矢量折线(亚格坐标),细笔画 + 端点共享形成连续曲线。
+        for seg in &grid.wave {
+            let color = to_linear(
+                seg.color,
+                self.core.as_mut().expect("GpuCore 未挂载").srgb(),
+            );
+            let stroke = (ch * 0.055).round().max(1.0);
+            let (x1, y1) = (pad + seg.x1 * cw, pad + seg.y1 * ch);
+            let (x2, y2) = (pad + seg.x2 * cw, pad + seg.y2 * ch);
+            let count = ((x2 - x1).abs().max((y2 - y1).abs()))
+                .ceil()
+                .max(1.0) as usize;
+            for i in 0..=count {
+                let t = i as f32 / count as f32;
+                self.quads.push(Quad {
+                    rect: [
+                        (x1 + (x2 - x1) * t).round(),
+                        (y1 + (y2 - y1) * t).round(),
+                        stroke,
+                        stroke,
+                    ],
+                    color,
+                });
             }
         }
 
@@ -2385,6 +2489,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,
@@ -2440,6 +2545,7 @@ mod tests {
             overlays: vec![],
             images: vec![],
             window_icons: vec![],
+                wave: vec![],
             chrome_panels: vec![],
             tab_bar_rows: 0,
             tab_panel_rows: 0,

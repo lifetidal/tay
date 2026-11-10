@@ -40,16 +40,21 @@ pub(crate) fn apply(config: &mut Config, field: Field, text: &str) -> Result<(),
                 return Err("主题：default / midnight / light / wezterm".into());
             }
             let preset = Config::from_lua(&format!("return {{theme='{theme}'}}"))?;
-            // 基线用**当前 colors 的推导**,而不是主题名预设:颜色本身
-            // 也被 UI 编辑过时(colors.background 等),从主题名推导会
-            // 把颜色驱动的 tab_bar 偏移误判为用户定制,切主题后留下
-            // 深色栏配浅色标签的错配。
-            let old_colors = config.colors.clone();
             config.theme = preset.theme;
             config.colors = preset.colors;
-            // 不先整体替换 tab_bar:rederive 从当前(用户)栏取定制
-            // 字段,再按新颜色推导其余。
-            rederive_tab_bar(config, &old_colors);
+            // 主题切换整体重推导 tab_bar(仅保留布局字段):keep_custom 曾把
+            // 手写的深色栏当「用户定制」跨主题保留,亮色终端配黑栏且无法
+            // 从界面恢复(产品反馈 2026-11-10)。想定制栏配色请切完主题再改
+            // 颜色字段,颜色编辑仍保留定制字段。
+            let visible = config.tab_bar.visible;
+            let compact = config.tab_bar.compact;
+            let tab_width = config.tab_bar.tab_width;
+            let pattern = config.tab_bar.pattern;
+            config.tab_bar = tay_config::TabBar::from_colors(&config.colors);
+            config.tab_bar.visible = visible;
+            config.tab_bar.compact = compact;
+            config.tab_bar.tab_width = tab_width;
+            config.tab_bar.pattern = pattern;
         }
         Field::Background | Field::Foreground => {
             let color = Rgb::from_hex(text).ok_or("请输入 #RRGGBB 颜色")?;
@@ -68,8 +73,8 @@ pub(crate) fn apply(config: &mut Config, field: Field, text: &str) -> Result<(),
 }
 
 /// 从当前 colors 重推导 tab_bar,保留布局字段与用户定制(相对
-/// **旧推导**的偏移)。主题切换与颜色编辑共用:基线来自颜色本身
-/// 而非主题名,颜色驱动的偏移不会误判为定制。
+/// **旧推导**的偏移)。颜色编辑专用:基线来自颜色本身而非主题名,
+/// 颜色驱动的偏移不会误判为定制。
 fn rederive_tab_bar(config: &mut Config, old_colors: &tay_config::Colors) {
     let tab = config.tab_bar.clone();
     let old = tay_config::TabBar::from_colors(old_colors);
@@ -78,6 +83,7 @@ fn rederive_tab_bar(config: &mut Config, old_colors: &tay_config::Colors) {
     config.tab_bar.visible = tab.visible;
     config.tab_bar.compact = tab.compact;
     config.tab_bar.tab_width = tab.tab_width;
+    config.tab_bar.pattern = tab.pattern;
     // 用户定制字段(≠ 旧推导)保留。
     macro_rules! keep_custom {
         ($($field:ident),*) => {$(
@@ -145,27 +151,34 @@ mod tests {
         assert_eq!(c.colors, original.colors);
     }
     #[test]
-    fn theme_switch_preserves_user_customized_tab_bar_fields() {
+    fn theme_switch_rederives_whole_bar_and_keeps_layout_fields() {
         let mut c = Config::from_lua("return {theme='midnight'}").unwrap();
         // 模拟用户手写的定制(Lua 尾部或旧配置):时钟色/强调色。
         c.tab_bar.clock_background = Rgb(1, 2, 3);
         c.tab_bar.accent = Rgb(4, 5, 6);
         c.tab_bar.compact = false;
+        c.tab_bar.tab_width = 30;
         apply(&mut c, Field::Theme, "light").unwrap();
         assert_eq!(c.theme, "light");
         assert_eq!(c.colors, tay_config::Colors::preset("light").unwrap());
-        // 用户定制字段跨主题保留,布局字段也保留。
-        assert_eq!(c.tab_bar.clock_background, Rgb(1, 2, 3));
-        assert_eq!(c.tab_bar.accent, Rgb(4, 5, 6));
-        assert!(!c.tab_bar.compact);
-        // 未定制字段跟随新主题推导。
+        // 主题切换整体重推导:定制颜色字段不跨主题保留(否则深色栏
+        // 配浅色终端、且设置面板深底深字),布局字段保留。
         let light = Config::from_lua("return {theme='light'}").unwrap();
-        assert_eq!(c.tab_bar.background, light.tab_bar.background);
-        assert_eq!(c.tab_bar.danger_foreground, light.tab_bar.danger_foreground);
+        for (a, b) in [
+            (c.tab_bar.background, light.tab_bar.background),
+            (c.tab_bar.active_background, light.tab_bar.active_background),
+            (c.tab_bar.clock_background, light.tab_bar.clock_background),
+            (c.tab_bar.accent, light.tab_bar.accent),
+            (c.tab_bar.danger_foreground, light.tab_bar.danger_foreground),
+        ] {
+            assert_eq!(a, b);
+        }
+        assert!(!c.tab_bar.compact);
+        assert_eq!(c.tab_bar.tab_width, 30);
     }
     #[test]
-    fn color_edits_rederive_the_bar_and_do_not_survive_theme_switches() {
-        // 用户只编辑背景色:栏配色即时跟随新颜色推导。
+    fn color_edits_keep_custom_bar_fields_but_theme_switches_do_not() {
+        // 用户只编辑背景色:栏配色即时跟随新颜色推导,定制字段保留。
         let mut c = Config::from_lua("return {theme='default'}").unwrap();
         apply(&mut c, Field::Background, "#000000").unwrap();
         assert_eq!(c.colors.background, Rgb(0, 0, 0));

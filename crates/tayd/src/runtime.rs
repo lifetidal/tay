@@ -93,10 +93,19 @@ pub(crate) fn run() {
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let mut watcher = match RecommendedWatcher::new(
                 move |event: notify::Result<notify::Event>| {
-                    if event.is_ok() {
+                    // 只对内容修改类事件计数与唤醒:inotify 会把
+                    // **读取 config.lua**(重载线程)报告为 Access
+                    // 事件,若一并计数,「读文件 → 事件 → 再读」自激
+                    // 成无限重载循环(2026-11-10 实测 37477 次/秒级,
+                    // CPU 129% 的最后一环)。
+                    let relevant = matches!(
+                        &event,
+                        Ok(e) if !matches!(e.kind, notify::EventKind::Access(_))
+                    );
+                    if relevant {
                         crate::config::config_file_changed();
+                        let _ = tx.try_send(event);
                     }
-                    let _ = tx.try_send(event);
                 },
                 notify::Config::default(),
             ) {

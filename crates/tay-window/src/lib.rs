@@ -135,6 +135,9 @@ pub enum Event {
         pixel_y: f32,
     },
     RedrawRequested,
+    /// 一次性唤醒点到期(wake_at 触发;波形动画的 8fps 心跳、
+    /// toast 到期清除都经此驱动)。
+    Timer,
     /// 跨线程唤醒(PTY 输出到达)。
     ProxyWake,
     /// 事件循环每轮触发(动画驱动)。
@@ -794,9 +797,11 @@ impl WindowState {
         event_queue: &mut wayland_client::EventQueue<Self>,
     ) -> Result<(), String> {
         while !self.exit {
-            // 一次性唤醒点已到期:清除(否则下轮计算超时恒为 0,热自旋)。
+            // 一次性唤醒点已到期:清除(否则下轮计算超时恒为 0,热自旋),
+            // 并投递 Timer(波形动画帧/toast 清除在此驱动)。
             if self.wake_at.is_some_and(|t| t <= Instant::now()) {
                 self.wake_at = None;
+                self.emit(handler, Event::Timer);
             }
             // 先处理已到达的 Wayland 事件。
             let dispatched = event_queue
