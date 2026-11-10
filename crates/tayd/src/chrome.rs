@@ -5,6 +5,14 @@ use tay_config::{BarPattern, Config, Rgb};
 use tay_render::{Cell, Grid};
 use unicode_width::UnicodeWidthChar;
 
+/// 装饰带波形输入(设计 D):EKG 用相位滚动;监控图案附样本历史。
+pub struct WaveInput<'a> {
+    /// 动画相位(秒;EKG 滚动用,监控用 scroll_frac 平滑插值)。
+    pub phase: f32,
+    /// 监控数据(cpu/net 图案):样本历史 + 归一化峰值。
+    pub samples: Option<(&'a [f32], f32)>,
+}
+
 /// EKG 波形周期(列)与滚动速度(列/秒;8fps 唤醒)。
 const WAVE_LEN: usize = 48;
 const WAVE_SPEED: f32 = 16.0;
@@ -34,6 +42,63 @@ fn wave_color(pc: f32, style: &tay_config::TabBar) -> Rgb {
         blend(style.background, style.inactive_foreground, 0.72)
     } else {
         blend(style.background, style.inactive_foreground, 0.45)
+    }
+}
+
+/// 监控波形(CPU/网络):样本历史折线,最新样本贴右缘,按采样间隔
+/// 相位平滑左移;低/中/高三档着色,高值段染强调色。
+#[allow(clippy::too_many_arguments)]
+fn draw_monitor(
+    grid: &mut Grid,
+    end: usize,
+    rows: usize,
+    start: usize,
+    style: &tay_config::TabBar,
+    samples: &[f32],
+    peak: f32,
+    frac: f32,
+) {
+    let base_fg = blend(style.background, style.inactive_foreground, 0.45);
+    let bump_fg = blend(style.background, style.inactive_foreground, 0.72);
+    let peak_fg = style.accent;
+    let amplitude = 0.62 * rows as f32;
+    let baseline = rows as f32 - 0.5;
+    let n = samples.len();
+    if n < 2 {
+        return;
+    }
+    let step = (end - start) as f32 / (n as f32 - 1.0).max(1.0);
+    let value = |i: usize| (samples[i] / peak.max(1e-3)).clamp(0.0, 1.0);
+    let x_at = |i: usize| end as f32 - (n as f32 - 1.0 - i as f32 + frac) * step;
+    let color = |i: usize| {
+        let v = value(i);
+        if v > 0.75 {
+            peak_fg
+        } else if v > 0.4 {
+            bump_fg
+        } else {
+            base_fg
+        }
+    };
+    for i in 1..n {
+        let (mut x0, mut y0) = (x_at(i - 1), baseline - value(i - 1) * amplitude);
+        let (x1, y1) = (x_at(i), baseline - value(i) * amplitude);
+        if x1 < start as f32 {
+            continue;
+        }
+        if x0 < start as f32 {
+            // 左缘裁剪:进入点插值,避免波形从栏外斜切进来。
+            let t = (start as f32 - x0) / (x1 - x0).max(1e-6);
+            x0 = start as f32;
+            y0 += (y1 - y0) * t;
+        }
+        grid.wave.push(tay_render::WaveSeg {
+            x1: x0,
+            y1: y0,
+            x2: x1.min(end as f32),
+            y2: y1,
+            color: color(i),
+        });
     }
 }
 
@@ -244,22 +309,27 @@ pub fn layout(
     // —— 行 0:标签页(分页;活动标签始终在本页)——
     let control_width = if cols >= 40 { 4 } else { 3 };
     let window_reserved = control_width * 3;
-    let extra = if cols >= 18 { 6 } else { 0 };
-    let clock_width = if !clock.is_empty() && cols >= window_reserved + extra + 14 {
-        width(clock) + 2
-    } else {
-        0
-    };
-    // 设计 B(2026-11-11,用户拍板):标签 + 图标在左,时钟/窗口按钮
-    // 锚右,装饰带(图案)填中间、随标签数伸缩;两侧固定预留 +
-    // 图案最小宽计入标签预算,图案带永不越界。
+    let extra = if cols >= 18 { 3 } else { 0 };
+    // 设计 D(2026-11-10):齿轮随时钟/窗口按钮锚右(产品要求),
+    // 左侧只留新建标签图标。
+    let gear_w = if cols >= 18 { 3 } else { 0 };
+    let clock_width =
+        if !clock.is_empty() && cols >= window_reserved + gear_w + 14 {
+            width(clock) + 2
+        } else {
+            0
+        };
+    // 设计 B(2026-11-11,用户拍板):标签 + 图标在左,时钟/齿轮/
+    // 窗口按钮锚右,装饰带(图案)填中间、随标签数伸缩;两侧固定
+    // 预留 + 图案最小宽计入标签预算,图案带永不越界。
     let controls_drawn = cols >= window_reserved;
-    let right_reserved = if controls_drawn { window_reserved } else { 0 } + clock_width;
+    let right_reserved =
+        if controls_drawn { window_reserved } else { 0 } + gear_w + clock_width;
     // 图案最小宽仅在宽栏预留:窄栏标签优先,decorate 仍有自己的
     // 下限守卫(zone 不足时留白)。
     let pattern_min = if cols >= window_reserved + extra + 64 {
         match config.tab_bar.pattern {
-            BarPattern::Wave => 12,
+            BarPattern::Cpu | BarPattern::Net | BarPattern::Wave => 12,
             BarPattern::Line => 4,
             BarPattern::Dots => 6,
             BarPattern::None => 0,
@@ -327,25 +397,20 @@ pub fn layout(
         x += 2;
     }
     if extra > 0 {
-        for (n, action) in [(Action::New), (Action::Settings)]
-            .into_iter()
-            .enumerate()
-        {
-            let start = x + n * 3;
-            items.push(Item {
-                row: 0,
-                start,
-                end: start + 3,
-                text: "   ".into(),
-                action,
-                selected: settings && action == Action::Settings,
-            });
-        }
+        let start = x;
+        items.push(Item {
+            row: 0,
+            start,
+            end: start + 3,
+            text: "   ".into(),
+            action: Action::New,
+            selected: false,
+        });
     }
     // 装饰带不产布局项:decorate 按两侧簇的边界绘制。
     if controls_drawn {
         if clock_width > 0 {
-            let start = cols - window_reserved - clock_width;
+            let start = cols - window_reserved - gear_w - clock_width;
             items.push(Item {
                 row: 0,
                 start,
@@ -353,6 +418,17 @@ pub fn layout(
                 text: format!(" {clock} "),
                 action: Action::Clock,
                 selected: false,
+            });
+        }
+        if gear_w > 0 {
+            let start = cols - window_reserved - gear_w;
+            items.push(Item {
+                row: 0,
+                start,
+                end: start + gear_w,
+                text: "   ".into(),
+                action: Action::Settings,
+                selected: settings,
             });
         }
         for (index, action) in [Action::Hide, Action::Maximize, Action::CloseWindow]
@@ -385,7 +461,7 @@ pub fn hit(items: &[Item], bar_rows: usize, row: usize, col: usize) -> Option<Ac
 }
 
 /// 按实际栏高平移终端内容、光标、选区、预编辑与图像。
-/// `phase`:动画图案的相位(秒,动画图案启用时由调用方提供)。
+/// `wave`:动画图案输入(EKG 相位;监控图案附样本历史)。
 #[allow(clippy::too_many_arguments)]
 pub fn decorate(
     grid: &mut Grid,
@@ -395,7 +471,7 @@ pub fn decorate(
     hovered: Option<Action>,
     maximized: bool,
     settings: bool,
-    phase: Option<f32>,
+    wave: Option<WaveInput<'_>>,
 ) {
     let rows = rows(config, settings);
     grid.tab_bar_rows = rows;
@@ -621,10 +697,7 @@ pub fn decorate(
     let zone_start = items
         .iter()
         .filter(|i| {
-            matches!(
-                i.action,
-                Action::Tab(_) | Action::Close(_) | Action::New | Action::Settings
-            )
+            matches!(i.action, Action::Tab(_) | Action::Close(_) | Action::New)
         })
         .map(|i| i.end)
         .max()
@@ -635,7 +708,7 @@ pub fn decorate(
         .filter(|i| {
             matches!(
                 i.action,
-                Action::Clock | Action::Hide | Action::Maximize | Action::CloseWindow
+                Action::Clock | Action::Settings | Action::Hide | Action::Maximize | Action::CloseWindow
             )
         })
         .map(|i| i.start)
@@ -645,11 +718,29 @@ pub fn decorate(
     if message_row.is_none() && rows >= 2 && zone_end > zone_start {
         let zone = zone_end - zone_start;
         match config.tab_bar.pattern {
+            BarPattern::Cpu | BarPattern::Net => {
+                if let Some(w) = wave
+                    && zone >= 12
+                    && let Some((samples, peak)) = w.samples
+                    && samples.len() >= 2
+                {
+                    draw_monitor(
+                        grid,
+                        zone_end,
+                        rows,
+                        zone_start,
+                        style,
+                        samples,
+                        peak,
+                        w.phase,
+                    );
+                }
+            }
             BarPattern::Wave => {
-                if let Some(phase) = phase
+                if let Some(w) = wave
                     && zone >= 12
                 {
-                    draw_wave(grid, zone_end, rows, zone_start, style, phase);
+                    draw_wave(grid, zone_end, rows, zone_start, style, w.phase);
                 }
             }
             BarPattern::Line => {
@@ -1010,15 +1101,17 @@ mod tests {
                 scrollbar: None,
             }
         }
-        let config = Config::default();
+        let mut config = Config::default();
+        config.tab_bar.pattern = BarPattern::Wave; // 波形断言段显式用 EKG(默认已是 CPU 监控)
+        let config = config;
         let items = layout(120, &["shell".into()], 0, false, &config, "");
-        // 设计 B:标签 + 图标在左(图标终点 20),时钟/窗口按钮锚右
-        // (Hide 起 108);装饰带 = 22..106。compact 2 行基线 = 行 1。
-        let zone = 22;
+        // 设计 D:标签 + 新建图标在左(图标终点 17),时钟/齿轮/窗口
+        // 按钮锚右(齿轮起 105);装饰带 = 19..103。compact 基线 = 行 1。
+        let zone = 19;
         // wave:矢量折线;基线 y = rows-0.5 = 1.5(compact 2 行),
         // QRS 段强调色,相位推进波形整体左移。
         let mut g = grid();
-        decorate(&mut g, &items, "", &config, None, false, false, Some(0.0));
+        decorate(&mut g, &items, "", &config, None, false, false, Some(WaveInput { phase: 0.0, samples: None }));
         assert!(!g.wave.is_empty());
         assert!((g.wave[0].y1 - 1.5).abs() < 1e-3, "基线在栏底 0.5 格");
         let peak = g
@@ -1026,9 +1119,9 @@ mod tests {
             .iter()
             .find(|s| s.color == config.tab_bar.accent)
             .expect("QRS 段强调色");
-        // phase=0:R 峰区域 pc ∈ [14,18) → 屏幕列 [zone+14, zone+18) = [36,40)。
+        // phase=0:R 峰区域 pc ∈ [14,18) → 屏幕列 [zone+14, zone+18) = [33,37)。
         assert!(
-            (36.0..40.0).contains(&peak.x1),
+            (33.0..37.0).contains(&peak.x1),
             "R 段起点 x1={}",
             peak.x1
         );
@@ -1036,7 +1129,7 @@ mod tests {
         assert!(g.wave.iter().any(|s| s.color == config.tab_bar.accent && s.y1 < 0.4));
         // 相位推进 1/16s → 波形左移 1 格。
         let mut g2 = grid();
-        decorate(&mut g2, &items, "", &config, None, false, false, Some(1.0 / 16.0));
+        decorate(&mut g2, &items, "", &config, None, false, false, Some(WaveInput { phase: 1.0 / 16.0, samples: None }));
         let peak2 = g2
             .wave
             .iter()
@@ -1052,6 +1145,30 @@ mod tests {
         let mut g3 = grid();
         decorate(&mut g3, &items, "", &config, None, false, false, None);
         assert!(g3.wave.is_empty());
+        // cpu/net 监控图案:样本折线,最新样本贴右缘,高值段强调色。
+        let mut c = config.clone();
+        c.tab_bar.pattern = BarPattern::Cpu;
+        let mut gm = grid();
+        let samples = [0.0f32, 0.5, 1.0];
+        decorate(&mut gm, &items, "", &c, None, false, false, Some(WaveInput {
+            phase: 0.0,
+            samples: Some((&samples, 1.0)),
+        }));
+        assert!(!gm.wave.is_empty());
+        let last = gm.wave.last().unwrap();
+        assert!(
+            (last.x2 - (zone as f32 + 84.0)).abs() < 1e-3,
+            "最新样本贴右缘(zone_end=103)x2={}",
+            last.x2
+        );
+        assert!(
+            gm.wave.iter().any(|seg| seg.color == c.tab_bar.accent),
+            "高值段(>0.75)染强调色"
+        );
+        // 无样本数据不画。
+        let mut g0 = grid();
+        decorate(&mut g0, &items, "", &c, None, false, false, Some(WaveInput { phase: 0.0, samples: None }));
+        assert!(g0.wave.is_empty());
         // line:字形静态线(基线行),无矢量波形。
         let mut c = config.clone();
         c.tab_bar.pattern = BarPattern::Line;
@@ -1065,7 +1182,7 @@ mod tests {
         let mut g5 = grid();
         decorate(&mut g5, &items, "", &c, None, false, false, None);
         assert_eq!(g5.cells[120 + zone].c, '·');
-        assert_eq!(g5.cells[120 + 23].c, ' ');
+        assert_eq!(g5.cells[120 + 22].c, ' ');
         // none:留白。
         let mut c = config.clone();
         c.tab_bar.pattern = BarPattern::None;
@@ -1074,7 +1191,7 @@ mod tests {
         assert_eq!(g6.cells[120 + zone].c, ' ');
         // 消息行存在时不画图案(消息行即基线行)。
         let mut g7 = grid();
-        decorate(&mut g7, &items, "msg", &config, None, false, false, Some(0.0));
+        decorate(&mut g7, &items, "msg", &config, None, false, false, Some(WaveInput { phase: 0.0, samples: None }));
         assert!(g7.wave.is_empty());
         assert_eq!(g7.cells[120 + zone].c, ' ');
     }

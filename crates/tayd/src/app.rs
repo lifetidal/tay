@@ -367,6 +367,8 @@ pub struct TayApp {
     slowui_at_start: bool,
     config_mtime: Option<std::time::SystemTime>,
     config_reload: Option<mpsc::Receiver<(u64, Result<Config, String>)>>,
+    /// 本机性能监控(设计 D:CPU/网络波形数据源;1s 采样)。
+    monitor: crate::monitor::Monitor,
     config_generation: u64,
     /// Ctrl 键当前是否按住(键盘事件携带 mods;Ctrl+点击打开
     /// OSC 8 超链接时用 —— 指针事件不带修饰键状态)。
@@ -550,6 +552,7 @@ impl TayApp {
             slowui_at_start,
             config_mtime: None,
             config_reload: None,
+            monitor: crate::monitor::Monitor::new(),
             config_generation: u64::MAX,
             ctrl_held: false,
             pointer_mods: Mods::default(),
@@ -1462,10 +1465,12 @@ impl TayApp {
                 let previous = self.config.clone();
                 use tay_config::BarPattern;
                 self.config.tab_bar.pattern = match self.config.tab_bar.pattern {
+                    BarPattern::Cpu => BarPattern::Net,
+                    BarPattern::Net => BarPattern::Wave,
                     BarPattern::Wave => BarPattern::Line,
                     BarPattern::Line => BarPattern::Dots,
                     BarPattern::Dots => BarPattern::None,
-                    BarPattern::None => BarPattern::Wave,
+                    BarPattern::None => BarPattern::Cpu,
                 };
                 self.refresh_appearance(ctx, &previous);
             }
@@ -3445,13 +3450,28 @@ impl TayApp {
                 .unwrap_or_default();
             let next_min = Duration::from_secs(61 - since.as_secs() % 60);
             ctx.request_wake_at(Instant::now() + next_min);
-            // 动画图案(EKG 波形):8fps 相位唤醒;隐藏/静态图案零唤醒。
-            let phase = if self.config.tab_bar.pattern.animated() {
+            // 动画图案:8fps 相位唤醒(隐藏即停);非动画但栏可见时
+            // 1s 心跳保持监控历史新鲜(切到 CPU/网络立即有数据)。
+            let pattern = self.config.tab_bar.pattern;
+            if pattern.animated() {
                 ctx.request_wake_at(Instant::now() + Duration::from_millis(125));
-                Some((since.as_millis() % 3000) as f32 / 1000.0)
-            } else {
-                None
-            };
+            } else if pattern != tay_config::BarPattern::None {
+                ctx.request_wake_at(Instant::now() + Duration::from_millis(1000));
+            }
+            let wave = pattern.animated().then(|| crate::chrome::WaveInput {
+                phase: match pattern {
+                    tay_config::BarPattern::Cpu | tay_config::BarPattern::Net => {
+                        self.monitor.scroll_frac()
+                    }
+                    _ => (since.as_millis() % 3000) as f32 / 1000.0,
+                },
+                samples: match pattern {
+                    tay_config::BarPattern::Cpu | tay_config::BarPattern::Net => {
+                        Some(self.monitor.data(pattern))
+                    }
+                    _ => None,
+                },
+            });
             crate::chrome::decorate(
                 &mut grid,
                 &items,
@@ -3460,7 +3480,7 @@ impl TayApp {
                 self.chrome_hover,
                 self.maximized,
                 self.settings_visible(),
-                phase,
+                wave,
             );
         }
         // 面板开合动画:90ms 平滑步进(开=从栏向下展开,关=向上收起);
@@ -4508,12 +4528,14 @@ impl Handler for TayApp {
                 self.render(ctx);
             }
 
-            // 波形动画心跳:render 只由 RedrawRequested 驱动,
-            // wake 到期经 Timer 事件转成一次重绘(8fps)。
-            WEvent::Timer
-                if self.config.tab_bar.pattern.animated() && !self.vis.is_hidden() =>
-            {
-                ctx.request_redraw();
+            // 定时心跳:监控采样(1s)+ 动画图案重绘(8fps)。
+            // render 只由 RedrawRequested 驱动,wake 到期经 Timer
+            // 事件转成一次重绘。
+            WEvent::Timer => {
+                self.monitor.tick();
+                if self.config.tab_bar.pattern.animated() && !self.vis.is_hidden() {
+                    ctx.request_redraw();
+                }
             }
 
             WEvent::ProxyWake => {

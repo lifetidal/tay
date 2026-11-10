@@ -293,8 +293,12 @@ fn default_keys() -> Vec<KeyBinding> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BarPattern {
-    /// EKG 心电波形(动画 8fps;P/R/T 波,R 峰强调色)。
+    /// 本机 CPU 占用监控波形(1s 采样,峰值归一化)。
     #[default]
+    Cpu,
+    /// 本机网络流量监控波形(收发合计,峰值归一化)。
+    Net,
+    /// EKG 心电波形(装饰;P/R/T 波,R 峰强调色)。
     Wave,
     /// 静态连续线。
     Line,
@@ -307,6 +311,8 @@ pub enum BarPattern {
 impl BarPattern {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
+            "cpu" => Some(Self::Cpu),
+            "net" => Some(Self::Net),
             "wave" => Some(Self::Wave),
             "line" => Some(Self::Line),
             "dots" => Some(Self::Dots),
@@ -316,6 +322,8 @@ impl BarPattern {
     }
     pub fn name(self) -> &'static str {
         match self {
+            Self::Cpu => "cpu",
+            Self::Net => "net",
             Self::Wave => "wave",
             Self::Line => "line",
             Self::Dots => "dots",
@@ -324,6 +332,8 @@ impl BarPattern {
     }
     pub fn label(self) -> &'static str {
         match self {
+            Self::Cpu => "CPU",
+            Self::Net => "网络",
             Self::Wave => "波形",
             Self::Line => "线条",
             Self::Dots => "点线",
@@ -331,8 +341,9 @@ impl BarPattern {
         }
     }
     /// 动画图案需要周期性重绘(8fps),静态图案零唤醒成本。
+    /// 监控图案同频重绘(1s 采样 + 平滑滚动)。
     pub fn animated(self) -> bool {
-        matches!(self, Self::Wave)
+        matches!(self, Self::Cpu | Self::Net | Self::Wave)
     }
 }
 
@@ -379,7 +390,7 @@ impl TabBar {
             visible: true,
             compact: true,
             tab_width: 24,
-            pattern: BarPattern::Wave,
+            pattern: BarPattern::default(),
             background: bar,
             active_background: blend(colors.cursor, bar, 0.68),
             active_foreground: colors.foreground,
@@ -746,7 +757,7 @@ impl Config {
             }
             if let Some(v) = get_str(&tb, "pattern")? {
                 cfg.tab_bar.pattern = BarPattern::from_name(&v)
-                    .ok_or_else(|| format!("tab_bar.pattern 需为 wave/line/dots/none,得到: {v}"))?;
+                    .ok_or_else(|| format!("tab_bar.pattern 需为 cpu/net/wave/line/dots/none,得到: {v}"))?;
             }
             if let Some(v) = get_color(&tb, "background")? {
                 cfg.tab_bar.background = v;
@@ -1171,9 +1182,12 @@ return {{
         } else {
             format!("{LUA_UI_PREFIX}{source}{LUA_UI_END}{tail}")
         };
-        let base = Self::from_lua(&baseline)?;
+        let base_cfg = Self::from_lua(&baseline)?;
+        let base_cfg_tb = toml::Value::try_from(&base_cfg)
+            .ok()
+            .and_then(|v| v.get("tab_bar").cloned());
         let current = toml::Value::try_from(self).map_err(|e| e.to_string())?;
-        let base = toml::Value::try_from(base).map_err(|e| e.to_string())?;
+        let base = toml::Value::try_from(base_cfg).map_err(|e| e.to_string())?;
         let mut assignments = String::new();
         for key in ["font", "colors"] {
             let mut values = String::new();
@@ -1199,12 +1213,34 @@ return {{
         {
             let derived = toml::Value::try_from(TabBar::from_colors(&self.colors))
                 .map_err(|e| e.to_string())?;
+            // 原文件 fields 区已钉写的 tab_bar 字段(与无 fields 基线
+            // 不同):手写的治愈块/推导值也在此列 —— 保存必须继续钉写,
+            // 否则下一次外观保存会把它整体清除(浅色栏复活,2026-11-10)。
+            let pinned: std::collections::BTreeSet<String> = toml::Value::try_from(parsed)
+                .ok()
+                .and_then(|v| v.get("tab_bar").cloned())
+                .and_then(|p| p.as_table().cloned())
+                .map(|table| {
+                    table
+                        .iter()
+                        .filter(|(f, v)| {
+                            base_cfg_tb
+                                .as_ref()
+                                .and_then(|b| b.get(f))
+                                != Some(v)
+                        })
+                        .map(|(f, _)| f.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             let mut values = String::new();
             for (field, value) in current["tab_bar"].as_table().ok_or("外观表无效")? {
                 let layout = matches!(field.as_str(), "visible" | "compact" | "tab_width");
-                // 布局字段与推导无关,按基线比较;颜色字段 = 用户定制
-                // 且与文件基线不同才钉写。
-                if (layout || derived.get(field) != Some(value))
+                // 布局字段、用户定制(≠推导)、或文件已钉写的字段都保留;
+                // 且与文件基线不同才写(等于基线的字段无需钉)。
+                if (layout
+                    || derived.get(field) != Some(value)
+                    || pinned.contains(field.as_str()))
                     && base["tab_bar"].get(field) != Some(value)
                 {
                     values.push_str(&format!(
@@ -1376,10 +1412,10 @@ fn lua_user_tail(text: &str, config: &Config) -> Result<String, String> {
     ] {
         allowed.insert(format!("__tay_config.{key} = {}", lua_value(&values[key])?));
     }
-    if fields.lines().any(|line| !allowed.contains(line)) {
-        return Err(
-            "Lua 界面字段区含手写代码，请移到 TAY_UI_FIELDS_BEGIN 之前；保留文件不覆盖".into(),
-        );
+    if let Some(bad) = fields.lines().find(|line| !allowed.contains(*line)) {
+        return Err(format!(
+            "Lua 界面字段区含手写代码({bad:?})，请移到 TAY_UI_FIELDS_BEGIN 之前；保留文件不覆盖"
+        ));
     }
     Ok(format!("{before}{after}"))
 }
@@ -1714,9 +1750,11 @@ mod tests {
 
     #[test]
     fn tab_bar_pattern_parses_roundtrips_and_rejects_unknown() {
-        // 默认 EKG 波形。
-        assert_eq!(Config::default().tab_bar.pattern, BarPattern::Wave);
+        // 默认 CPU 监控波形。
+        assert_eq!(Config::default().tab_bar.pattern, BarPattern::Cpu);
         for (name, pattern) in [
+            ("cpu", BarPattern::Cpu),
+            ("net", BarPattern::Net),
             ("wave", BarPattern::Wave),
             ("line", BarPattern::Line),
             ("dots", BarPattern::Dots),
@@ -1729,7 +1767,9 @@ mod tests {
             assert_eq!(back.tab_bar.pattern, pattern);
         }
         assert!(Config::from_lua("return { tab_bar={pattern='sparkle'} }").is_err());
-        // 动画判定:wave 需要相位唤醒,其余零唤醒。
+        // 动画判定:监控与 EKG 需要相位唤醒,静态图案零唤醒。
+        assert!(BarPattern::Cpu.animated());
+        assert!(BarPattern::Net.animated());
         assert!(BarPattern::Wave.animated());
         assert!(!BarPattern::Line.animated());
         assert!(!BarPattern::Dots.animated());
@@ -1917,6 +1957,83 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn opacity_save_preserves_healed_tab_bar_fields() {
+        // 复现产品反馈(2026-11-10):治愈浅色栏(推导值手写进 fields
+        // 区)后改背景透明度 —— 保存必须保留治愈块,透明度落盘。
+        let dir = std::env::temp_dir().join(format!("tay-heal-opacity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.lua");
+        std::fs::write(
+            &path,
+            r##"-- Tay 界面设置：原脚本保留在函数内，界面修改集中在文件末尾；可直接编辑。
+local __tay_config = (function()
+-- TAY_BASE_BEGIN
+return {
+  theme = "midnight",
+  opacity = 0.98,
+  tab_bar = {
+    compact = true, tab_width = 24,
+    background = "#101b29", active_background = "#29445c",
+    active_foreground = "#e5f2fa", inactive_foreground = "#9fb2c8",
+    hover_background = "#1d3044", accent = "#96d7e5",
+    icon_foreground = "#93a8be", icon_hover_foreground = "#a4dce8",
+    danger_foreground = "#ee9fa7",
+    clock_background = "#242f3d", clock_foreground = "#b8c7d6",
+  },
+  colors = { background = "#0b111b", foreground = "#d6e5f5" },
+}
+-- TAY_BASE_END
+end)()
+-- TAY_UI_FIELDS_BEGIN
+__tay_config.colors = __tay_config.colors or {}
+__tay_config.colors.background = "#f5f6fa"
+__tay_config.colors.foreground = "#202632"
+__tay_config.theme = "light"
+__tay_config.opacity = 0.699999988079071
+__tay_config.tab_bar = __tay_config.tab_bar or {}
+__tay_config.tab_bar.visible = true
+__tay_config.tab_bar.compact = true
+__tay_config.tab_bar.tab_width = 24
+__tay_config.tab_bar.pattern = "cpu"
+__tay_config.tab_bar.background = "#e9eaee"
+__tay_config.tab_bar.active_background = "#a9c0e9"
+__tay_config.tab_bar.active_foreground = "#202632"
+__tay_config.tab_bar.inactive_foreground = "#60656e"
+__tay_config.tab_bar.hover_background = "#ebebef"
+__tay_config.tab_bar.accent = "#2266dd"
+__tay_config.tab_bar.icon_foreground = "#4c515b"
+__tay_config.tab_bar.icon_hover_foreground = "#2266dd"
+__tay_config.tab_bar.danger_foreground = "#c52c3e"
+__tay_config.tab_bar.clock_background = "#d5d6db"
+__tay_config.tab_bar.clock_foreground = "#3e434e"
+-- TAY_UI_FIELDS_END
+return __tay_config
+"##,
+        )
+        .unwrap();
+        let mut c = Config::try_load_at(&dir).unwrap();
+        assert_eq!(c.tab_bar.background, Rgb(0xe9, 0xea, 0xee), "治愈块生效");
+        let previous = c.clone();
+        c.opacity = 0.8; // 等价 appearance::apply(Field::Opacity, "80%")
+        c.save_appearance_delta_at(&previous, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("__tay_config.opacity = 0.8"),
+            "透明度落盘:\n{text}"
+        );
+        let reloaded = Config::try_load_at(&dir).unwrap();
+        assert_eq!(reloaded.opacity, 0.8);
+        assert_eq!(
+            reloaded.tab_bar.background,
+            Rgb(0xe9, 0xea, 0xee),
+            "治愈块在保存后不得丢失(深色栏复活 bug)"
+        );
+        assert_eq!(reloaded.tab_bar.pattern, BarPattern::Cpu);
+        assert_eq!(reloaded.tab_bar.accent, Rgb(0x22, 0x66, 0xdd));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
